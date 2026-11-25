@@ -373,6 +373,8 @@ const draftKey = (o: EditOpts) => `helm-annotation:${o.projectId}:${o.source.kin
 function readDraft(key: string): (Doc & { comment: string }) | null {
   try {
     const d = JSON.parse(localStorage.getItem(key) ?? 'null');
+    // Kept 14 days, like every draft (drafts.ts); one written before that was recorded has no date and stays.
+    if (d && typeof d.at === 'number' && Date.now() - d.at > 14 * 24 * 3600 * 1000) return null;
     return d && Array.isArray(d.marks) && Array.isArray(d.notes) ? d : null;
   } catch {
     return null;
@@ -457,7 +459,7 @@ function Editor({ projectId, source, url, title, parent, to, onSent, onClose }: 
 
   // The draft is kept on this device until sent, so closing by accident loses nothing.
   useEffect(() => {
-    if (doc.marks.length || doc.notes.length || comment) localStorage.setItem(key, JSON.stringify({ ...doc, comment }));
+    if (doc.marks.length || doc.notes.length || comment) localStorage.setItem(key, JSON.stringify({ ...doc, comment, at: Date.now() }));
     else localStorage.removeItem(key);
   }, [doc, comment]);
 
@@ -816,7 +818,7 @@ function Editor({ projectId, source, url, title, parent, to, onSent, onClose }: 
       aria-label={`Annotate ${title}`}
       style={vv ? { height: vv.h, top: vv.top } : undefined}
     >
-      <header className="ann-top">
+      <header className="ann-top on-media">
         <button className="icon-btn" onClick={tryClose} aria-label="Close">
           <Icon name="close" />
         </button>
@@ -861,7 +863,7 @@ function Editor({ projectId, source, url, title, parent, to, onSent, onClose }: 
           {!view && !loadError && <div className="ann-loading">Loading the image…</div>}
           {loadError && <div className="ann-loading error-text">{loadError}</div>}
           {notice && <div className="ann-notice" role="status">{notice}</div>}
-          <div className="ann-zoom" onPointerDown={(e) => e.stopPropagation()}>
+          <div className="ann-zoom on-media" onPointerDown={(e) => e.stopPropagation()}>
             <button className="icon-btn" onClick={() => zoomAt(0.8, (stage?.w ?? 0) / 2, (stage?.h ?? 0) / 2)} disabled={!zoomed} aria-label="Zoom out">
               −
             </button>
@@ -892,7 +894,7 @@ function Editor({ projectId, source, url, title, parent, to, onSent, onClose }: 
         )}
       </div>
 
-      <div className="ann-tools" role="toolbar" aria-label="Annotation tools">
+      <div className="ann-tools on-media" role="toolbar" aria-label="Annotation tools">
         <div className="ann-toolset">
           {TOOLS.map((t) => (
             <button key={t.id} className={`ann-tool ${tool === t.id ? 'on' : ''}`} onClick={() => setTool(t.id)} aria-pressed={tool === t.id} aria-label={t.label} title={`${t.label} (${t.key.toUpperCase()})`}>
@@ -912,7 +914,7 @@ function Editor({ projectId, source, url, title, parent, to, onSent, onClose }: 
                 <ToolIcon name="note" size={16} /> {doc.notes.some((n) => n.mark === selected) ? 'Edit note' : 'Add note'}
               </button>
               <button className="btn small quiet danger" onClick={() => deleteMark(selected)}>
-                <Icon name="trash" size={15} /> Delete
+                <Icon name="trash" size={16} /> Delete
               </button>
             </>
           ) : (
@@ -935,7 +937,7 @@ function Editor({ projectId, source, url, title, parent, to, onSent, onClose }: 
       )}
 
       {/* Always mounted, so a tap that drops a note can focus it at once and raise the iOS keyboard. */}
-      <div className={`ann-dock ${activeNote ? 'open' : ''}`} aria-hidden={!activeNote}>
+      <div className={`ann-dock on-media ${activeNote ? 'open' : ''}`} aria-hidden={!activeNote}>
         <span className="ann-num" style={activeNote ? { background: pinColor(activeNote, doc.marks), color: inkOn(pinColor(activeNote, doc.marks)) } : undefined}>
           {activeIndex + 1}
         </span>
@@ -956,7 +958,7 @@ function Editor({ projectId, source, url, title, parent, to, onSent, onClose }: 
           }}
         />
         <button className="icon-btn" tabIndex={activeNote ? 0 : -1} onClick={() => activeNote && deleteNote(activeNote.id)} aria-label="Delete this note">
-          <Icon name="trash" size={17} />
+          <Icon name="trash" size={16} />
         </button>
         <button
           className="btn small primary"
@@ -1143,8 +1145,8 @@ function Viewer({ id, onClose, onContinue }: { id: string; onClose: () => void; 
   }, []);
   const img = a?.original ?? a?.flat;
   return (
-    <div className="ann-viewer" role="dialog" aria-modal="true" aria-label="Feedback">
-      <header className="ann-top">
+    <div className="ann-viewer on-media" role="dialog" aria-modal="true" aria-label="Feedback">
+      <header className="ann-top on-media">
         <button className="icon-btn" onClick={onClose} aria-label="Close">
           <Icon name="close" />
         </button>
@@ -1185,7 +1187,7 @@ function Viewer({ id, onClose, onContinue }: { id: string; onClose: () => void; 
                   ])
                 }
               >
-                <Icon name="external" size={18} />
+                <Icon name="external" size={20} />
               </button>
             </div>
           </div>
@@ -1199,7 +1201,7 @@ function Viewer({ id, onClose, onContinue }: { id: string; onClose: () => void; 
               <span className="spacer" />
               {a.flat && (
                 <a className="btn small quiet" href={a.flat.url} target="_blank" rel="noopener">
-                  <Icon name="external" size={15} /> Marked-up PNG
+                  <Icon name="external" size={16} /> Marked-up PNG
                 </a>
               )}
               {a.original && (
@@ -1244,7 +1246,7 @@ export function FeedbackCard({ att, compact = false }: { att: Attachment; compac
     <div className={`ann-card ${compact ? 'compact' : ''}`}>
       <button type="button" className="ann-card-shot" onClick={() => att.annotation && openFeedback(att.annotation.id)} aria-label="Open the feedback">
         <img src={att.url} alt="Marked-up image" loading="lazy" />
-        <span className="ann-badge">
+        <span className="media-label ann-label">
           <ToolIcon name="annotate" size={14} /> Feedback{a && a.notes.length ? ` · ${a.notes.length} ${a.notes.length === 1 ? 'note' : 'notes'}` : ''}
         </span>
       </button>
@@ -1278,7 +1280,7 @@ export function AnnotateButton({ onClick, label = 'Annotate', className = '' }: 
   return (
     <button
       type="button"
-      className={`ann-open-btn ${className}`}
+      className={`btn small ann-open ${className}`}
       onClick={(e) => {
         e.stopPropagation();
         e.preventDefault();

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { api, useLive } from './api';
 import { InstallGuide, isIos, standalone } from './install';
 import { Icon, ago, useAction } from './ui';
+import { hhmm } from './time';
 
 /**
  * Phone notifications (server/notify.ts sends them; web/public/sw.js shows them).
@@ -33,12 +34,12 @@ export type Device = {
 type PushInfo = { publicKey: string; devices: Device[]; settings: NotifySettings };
 
 const KINDS: { id: NotifyKind; label: string; detail: string }[] = [
-  { id: 'needs', label: 'Something needs you', detail: 'A question, a permission request or a plan to approve. Blocking ones come even in quiet hours.' },
-  { id: 'done', label: 'A task finished', detail: 'Several within a minute become one notification.' },
-  { id: 'away', label: 'Work stopped while you were away', detail: 'The queue is worked through, or the director stopped, with a short summary.' },
-  { id: 'agent', label: 'An agent failed or stalled', detail: 'It stopped with an error, or has worked for 20 minutes without any activity.' },
-  { id: 'update', label: 'Helm updated or rolled back', detail: 'The result of an update started from the Helm page.' },
-  { id: 'disk', label: 'The disk is nearly full', detail: 'Free space fell below the critical level: Helm stops starting agents and updates until it is freed.' },
+  { id: 'needs', label: 'Something needs you', detail: 'Blocking ones come even in quiet hours.' },
+  { id: 'done', label: 'A task finished', detail: '' },
+  { id: 'away', label: 'Work stopped while you were away', detail: '' },
+  { id: 'agent', label: 'An agent failed or stalled', detail: '' },
+  { id: 'update', label: 'Helm updated or rolled back', detail: '' },
+  { id: 'disk', label: 'The disk is nearly full', detail: '' },
 ];
 
 // ---------- this device ----------
@@ -301,11 +302,11 @@ export function NotificationsCard() {
   return (
     <div className="card install-entry install-home notify-card">
       <span className="notify-glyph" aria-hidden="true">
-        <Icon name="bell" size={22} />
+        <Icon name="bell" size={20} />
       </span>
       <span className="install-text">
         <strong>Get notified on this device</strong>
-        <span className="muted small">{denied ? 'Notifications are blocked for Helm here. Allow them in the browser’s or the system’s settings, then try again.' : 'When something needs you or a task finishes. You choose what in Setup.'}</span>
+        <span className="muted small">{denied ? 'Notifications are blocked for Helm here. Allow them in the browser’s or the system’s settings, then try again.' : 'When something needs you or a task finishes.'}</span>
         {error && <span className="error-text small">{error}</span>}
       </span>
       <button
@@ -399,7 +400,7 @@ export function NotificationsSetup({ projectId, projectName }: { projectId?: str
           </div>
         ) : (
           <div className="row wrap">
-            <span className="grow">Get a notification on this device when something needs you or a task finishes.</span>
+            <span className="grow notify-intro">Get a notification on this device when something needs you or a task finishes.</span>
             <button className="btn small primary" disabled={busy} onClick={enable}>
               Enable notifications
             </button>
@@ -422,7 +423,7 @@ export function NotificationsSetup({ projectId, projectName }: { projectId?: str
 
       <h3>What to send</h3>
       <div className="card notify-kinds">
-        <Switch label="Mute all notifications" detail="Nothing is sent, to any device, until this is off." checked={settings.muted} onChange={(muted) => save({ ...settings, muted })} />
+        <Switch label="Mute all notifications" checked={settings.muted} onChange={(muted) => save({ ...settings, muted })} />
         {KINDS.map((k) => (
           <div key={k.id} className={settings.muted ? 'notify-muted' : ''}>
             <Switch label={k.label} detail={k.detail} checked={settings.kinds[k.id]} onChange={(v) => save({ ...settings, kinds: { ...settings.kinds, [k.id]: v } })} />
@@ -450,7 +451,7 @@ export function NotificationsSetup({ projectId, projectName }: { projectId?: str
                 <Switch
                   key={k.id}
                   label={k.label}
-                  detail={project.kinds?.[k.id] === undefined ? 'As set for all projects' : 'Set for this project'}
+                  detail={project.kinds?.[k.id] === undefined ? undefined : 'Set for this project'}
                   checked={kindValue(k.id)}
                   onChange={(v) => setProject({ ...project, kinds: { ...(project.kinds ?? {}), [k.id]: v } })}
                 />
@@ -519,7 +520,7 @@ function DeviceRow({ d, mine, onChange }: { d: Device; mine: boolean; onChange: 
   );
 }
 
-function Switch({ label, detail, checked, onChange, aria }: { label: string; detail?: string; checked: boolean; onChange: (v: boolean) => void; aria?: string }) {
+export function Switch({ label, detail, checked, onChange, aria }: { label: string; detail?: string; checked: boolean; onChange: (v: boolean) => void; aria?: string }) {
   return (
     <label className={`switch-row ${label ? '' : 'bare'}`}>
       {label && (
@@ -546,7 +547,7 @@ function QuietHours({ value, onChange }: { value: NotifySettings['quiet']; onCha
   const commit = (s: string, e: string) => s && e && onChange({ start: s, end: e, tz });
   return (
     <div>
-      <Switch label="Quiet hours" detail={value ? `Held until ${value.end} (${value.tz}), then sent as one summary. Blocking requests still come.` : 'Hold notifications overnight; blocking requests still come.'} checked={!!value} onChange={(on) => onChange(on ? { start, end, tz } : null)} />
+      <Switch label="Quiet hours" detail={value ? `Held from ${hhmm(value.start)} until ${hhmm(value.end)} (${value.tz}), then sent as one summary. Blocking requests still come.` : 'Hold notifications overnight; blocking requests still come.'} checked={!!value} onChange={(on) => onChange(on ? { start, end, tz } : null)} />
       {value && (
         <div className="row notify-sub">
           <label>

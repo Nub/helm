@@ -69,9 +69,13 @@ in
       cp -r package.json server node_modules $root/
       cp -r web/dist $root/web/
       echo ${lib.escapeShellArg (builtins.toJSON {inherit rev shortRev lastModified;})} > $root/version.json
+      # The runner's code as one hash, and its files (server/closure.ts): an update whose build has the same hash
+      # restarts only the web service, and agents keep working (nix/live-update.sh).
+      ${lib.getExe nodejs} server/closure.ts . --out $root/runner.json
 
       # APP_ROOT (server/config.ts) is the folder above server/, so web/dist is found next to it. Everything Helm
       # writes goes to HELM_DATA, which defaults to ~/.helm, never here.
+      # `helm` runs everything in one process; `helm runner` and `helm web` are the two halves (server/main.ts).
       makeWrapper ${lib.getExe nodejs} $out/bin/helm \
         --chdir $root \
         --add-flags $root/server/main.ts

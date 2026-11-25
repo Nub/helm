@@ -1,25 +1,30 @@
 import { useEffect, useState } from 'react';
-import { api } from './api';
+import { ShareButton } from './share';
+import { clearDraft, useStoredForm, useStoredText } from './drafts';
+import { api, useLive } from './api';
 import type { Discussion, DiscussionState, ProjectState, Task, TaskDetail, ThreadLink } from './api';
-import { Menu, TaskStateTag, toThreadLines } from './tasks';
+import { Menu, TaskStateTag, focusThreadBox, toThreadLines } from './tasks';
 import type { TaskState } from './api';
 import { Thread } from './thread';
-import { ClipCount, References } from './attachments';
+import { References } from './attachments';
 import { TaskSpecBlock } from './spec';
 import { SpecEntryCard } from './specdiscuss';
+import { SpecWorkBar } from './specwork';
 import { Chips, Empty, Icon, Markdown, Sheet, Tag, ago, go, href, useAction , PlainRefs } from './ui';
-import { NeedsGroup, needsResponse } from './needs';
+import { openChat } from './chat';
 import { ProposalArea, ProposalStrip, pinCtx } from './proposal';
+import { Fold, FoldHead, StickyHead, useFold } from './fold';
 
 /**
  * Discussions: questions, ideas and open topics kept as findable threads. The director
- * files exchanges from the conversation into them; the owner can search them, settle
+ * files exchanges from the conversation into them; the owner can search them, close
  * or reopen them, start one, and turn one into a task (in place: it leaves this list and
- * its thread becomes the start of the task's history). Open ones nobody has touched for
- * the project's cold period show as cold, grouped and collapsed at the bottom.
+ * its thread becomes the start of the task's history). A quiet one gets a reminder, then goes stale
+ * (server/discrevisit.ts); archived ones leave the list except under their filter. The list comes sorted: waiting on
+ * the user first, open by activity, stale, closed.
  */
 
-export const DISCUSSION_STATE_LABEL: Record<DiscussionState, string> = { open: 'Open', settled: 'Settled' };
+export const DISCUSSION_STATE_LABEL: Record<DiscussionState, string> = { open: 'Open', stale: 'Stale', settled: 'Closed', archived: 'Archived' };
 
 export function DiscussionStateTag({ state }: { state: DiscussionState }) {
   return <Tag tone={`task-st ds-${state}`}>{DISCUSSION_STATE_LABEL[state]}</Tag>;
@@ -44,14 +49,10 @@ export function ThreadLinks({ pid, label, links }: { pid: string; label: string;
   );
 }
 
-const daysAgo = (ts: number) => {
-  const d = Math.floor((Date.now() - ts) / 86_400_000);
-  return d < 1 ? 'today' : d === 1 ? 'a day ago' : `${d} days ago`;
-};
 
-function DiscussionRow({ d, pid, full = false }: { d: Discussion; pid: string; full?: boolean }) {
-  const { busy, error, run } = useAction();
-  const [settled, setSettled] = useState(false);
+function DiscussionRow({ d, pid, full = false, selecting = false, selected = false, onSelect }: { d: Discussion; pid: string; full?: boolean; selecting?: boolean; selected?: boolean; onSelect?: (id: string, start?: boolean) => void }) {
+  // Long-press on touch starts selecting with this row (DiscussionsPage).
+  const [press, setPress] = useState<number | null>(null);
   // Found by a search after it became a task: still findable, and it opens as the task.
   if (d.kind === 'task') {
     return (
@@ -61,66 +62,52 @@ function DiscussionRow({ d, pid, full = false }: { d: Discussion; pid: string; f
           <Tag tone="disc-became">Now a task</Tag>
           <TaskStateTag state={d.state as unknown as TaskState} />
         </div>
-        <span className="muted small">
-          Was a discussion · {d.messages} {d.messages === 1 ? 'message' : 'messages'} · {ago(d.updated_at)}
-        </span>
       </a>
     );
   }
-  const line = d.state === 'settled' && d.conclusion ? d.conclusion : d.status_summary;
-  // One tap: settled without a conclusion, the director writes it from the thread.
-  const settle = () =>
-    void run(async () => {
-      await api(`/api/tasks/${d.id}/settle`, { body: {} });
-      setSettled(true);
-    });
+  const summary = d.state === 'settled' && d.conclusion ? d.conclusion : d.status_summary;
+  // A thread with another project's director (server/crossproject.ts) says who with first.
+  const peer = d.peer ? `${d.peer.from ? 'From' : 'With'} ${d.peer.name}` : '';
+  const line = peer && summary && summary !== peer ? `${peer} · ${summary}` : summary || peer;
+  const startPress = () => onSelect && setPress(window.setTimeout(() => onSelect(d.id, true), 500));
+  const endPress = () => {
+    if (press) clearTimeout(press);
+    setPress(null);
+  };
   return (
-    <div className={`card disc-row disc-${d.state} ${d.cold ? 'disc-cold' : ''}`}>
+    <div
+      className={`card disc-row disc-${d.state} ${d.awaiting ? 'disc-awaiting' : ''} ${selecting ? 'selecting' : ''} ${selected ? 'selected' : ''}`}
+      data-kctx={`discussion:${d.id}`}
+      onTouchStart={selecting ? undefined : startPress}
+      onTouchEnd={endPress}
+      onTouchMove={endPress}
+      onClickCapture={(e) => {
+        if (!selecting || !onSelect) return;
+        e.preventDefault();
+        e.stopPropagation();
+        onSelect(d.id);
+      }}
+    >
+      {selecting && <input type="checkbox" className="disc-check" checked={selected} readOnly aria-label={`Select ${d.title}`} />}
       <a className="disc-row-link" href={href('p', pid, 'discussions', d.id)}>
         <div className="task-title-row">
           <h3>{d.title}</h3>
-          {d.cold ? <Tag tone="disc-cold-tag">Cold</Tag> : (full || d.state === 'settled') && <DiscussionStateTag state={d.state} />}
+          {(full || d.state !== 'open') && d.state !== 'open' && <DiscussionStateTag state={d.state} />}
         </div>
-        {line && <p className={`small disc-line ${full ? '' : 'one-line'}`}>{d.state === 'settled' && d.conclusion ? <b>Concluded: </b> : null}<PlainRefs text={line} strip /></p>}
+        {(d.awaiting || line) && (
+          <p className="small muted disc-line one-line">
+            {d.awaiting && <b className="disc-awaiting-word">{line ? 'Waiting on you · ' : 'Waiting on you'}</b>}
+            {line && <PlainRefs text={line} strip />}
+          </p>
+        )}
         <ProposalStrip p={d.proposal} />
-        <span className="muted small">
-          {d.messages} {d.messages === 1 ? 'message' : 'messages'} · {d.cold ? `last active ${daysAgo(d.last_active)}` : ago(d.updated_at)}
-          {d.needs_response > 0 && <span className="task-asks"> · needs response</span>}
-          {!!d.attach_count && <> · <ClipCount n={d.attach_count} /></>}
-          {d.tasks.length > 0 && <> · led to {d.tasks.length === 1 ? 'a task' : `${d.tasks.length} tasks`}</>}
-        </span>
       </a>
-      {d.cold && d.state === 'open' && (
-        <div className="disc-row-actions">
-          <button className="btn small" disabled={busy || settled} onClick={settle}>
-            <Icon name="check" size={14} /> {settled ? 'Settled' : 'Settle'}
-          </button>
-          {error && <span className="error-text small">{error}</span>}
-        </div>
-      )}
     </div>
   );
 }
 
-/** Cold discussions, collapsed at the bottom of a list. */
-function ColdGroup({ list, pid, full = false }: { list: Discussion[]; pid: string; full?: boolean }) {
-  const [open, setOpen] = useState(false);
-  if (!list.length) return null;
-  return (
-    <div className="task-group group-closed disc-cold-group">
-      <button className="group-toggle" onClick={() => setOpen(!open)} aria-expanded={open}>
-        <Icon name="chevron" size={14} /> Cold <span className="muted">{list.length}</span>
-      </button>
-      {open && (
-        <div className="stack">
-          {list.map((d) => (
-            <DiscussionRow key={d.id} d={d} pid={pid} full={full} />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
+/** One call for many discussions (server/discrevisit.ts batchDiscussions). */
+export const batchDiscussions = (pid: string, ids: string[], action: 'stale' | 'archive' | 'close' | 'reopen') => api<{ changed: number }>(`/api/projects/${pid}/discussions/batch`, { body: { ids, action } });
 
 // ---------- the full list with search ----------
 
@@ -151,14 +138,41 @@ export function DiscussionsPage({ s, embedded = false }: { s: ProjectState; embe
     };
   }, [query, pid, s.discussions]);
 
-  const base = query ? found ?? [] : s.discussions;
-  // A search also lists discussions that became tasks; they count under All only.
+  // Archived ones are not in the project's list: their filter asks the server.
+  const archived = useLive<{ discussions: Discussion[] }>(filter === 'archived' && !query ? `/api/projects/${pid}/discussions?state=archived` : null, (m) => m.type === 'project' && m.projectId === pid);
+  const base = query ? found ?? [] : filter === 'archived' ? archived.data?.discussions ?? [] : s.discussions;
+  // A search also lists discussions that became tasks; they count under All only. The server sorts the list.
   const list = base.filter((d) => filter === 'all' || (d.kind !== 'task' && d.state === filter));
-  const count = (f: DiscFilter) => base.filter((d) => f === 'all' || (d.kind !== 'task' && d.state === f)).length;
-  // Searching shows everything that matches in one list; otherwise cold ones wait, collapsed, at the bottom.
-  const needs = query ? [] : list.filter((d) => d.kind !== 'task' && needsResponse(d));
-  const warm = query ? list : list.filter((d) => !d.cold && !needs.includes(d));
-  const cold = query ? [] : list.filter((d) => d.cold);
+
+  // Selection mode: checkboxes, select-all for the filter, and an action bar for one batch call.
+  const [selecting, setSelecting] = useState(false);
+  const [picked, setPicked] = useState<string[]>([]);
+  const { busy, error, run } = useAction();
+  const selectable = list.filter((d) => d.kind !== 'task').map((d) => d.id);
+  const toggle = (id: string, start = false) => {
+    if (start) {
+      setSelecting(true);
+      setPicked([id]);
+      return;
+    }
+    setPicked((p) => (p.includes(id) ? p.filter((x) => x !== id) : [...p, id]));
+  };
+  const leave = () => {
+    setSelecting(false);
+    setPicked([]);
+  };
+  useEffect(() => {
+    if (!selecting) return;
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && !document.querySelector('.sheet-backdrop') && leave();
+    addEventListener('keydown', onKey);
+    return () => removeEventListener('keydown', onKey);
+  }, [selecting]);
+  const act = (action: 'stale' | 'archive' | 'close' | 'reopen') =>
+    void run(async () => {
+      await batchDiscussions(pid, picked, action);
+      leave();
+    });
+  const all = selectable.length > 0 && selectable.every((id) => picked.includes(id));
 
   return (
     <section className="discussions-page">
@@ -169,35 +183,67 @@ export function DiscussionsPage({ s, embedded = false }: { s: ProjectState; embe
       )}
       <div className="section-head">
         {embedded ? <h2>Discussions</h2> : <h1 className="page-title">Discussions</h1>}
-        <button className="btn small" onClick={() => setCreating(true)}>
-          <Icon name="plus" size={15} /> New discussion
-        </button>
+        <span className="row">
+          {!selecting && list.length > 0 && (
+            <button className="btn small quiet" onClick={() => setSelecting(true)}>
+              Select
+            </button>
+          )}
+          <button className="btn small" onClick={() => setCreating(true)}>
+            <Icon name="plus" size={16} /> New discussion
+          </button>
+        </span>
       </div>
       <div className="disc-tools">
-        <input type="search" className="disc-search" placeholder="Search titles, summaries, conclusions and threads" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search discussions" />
+        <input type="search" className="disc-search" placeholder="Search discussions" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search discussions" />
         <Chips
           value={filter}
           onChange={setFilter}
           options={[
-            { id: 'all', label: 'All', count: count('all') },
-            { id: 'open', label: 'Open', count: count('open') },
-            { id: 'settled', label: 'Settled', count: count('settled') },
+            { id: 'all', label: 'All' },
+            { id: 'open', label: 'Open' },
+            { id: 'stale', label: 'Stale' },
+            { id: 'settled', label: 'Closed' },
+            { id: 'archived', label: 'Archived' },
           ]}
         />
       </div>
+      {selecting && (
+        <label className="disc-select-all small">
+          <input type="checkbox" checked={all} onChange={() => setPicked(all ? [] : selectable)} /> Select all{filter !== 'all' ? ` ${DISCUSSION_STATE_LABEL[filter as DiscussionState].toLowerCase()}` : ''}
+        </label>
+      )}
       {query && found === null && <div className="loading">Searching…</div>}
       {list.length === 0 && (query ? found !== null : true) && (
-        <Empty title={query ? 'Nothing matches' : 'No discussions yet'}>
-          {query ? 'Try other words: every word must appear in the title, summary, conclusion or thread.' : 'When you ask the director a question or float an idea, it keeps the exchange here as a thread by topic.'}
-        </Empty>
+        <Empty title={query ? 'Nothing matches' : 'No discussions yet'} />
       )}
-      <NeedsGroup list={needs} stateTag={(d) => <DiscussionStateTag state={d.state as DiscussionState} />} />
       <div className="stack">
-        {warm.map((d) => (
-          <DiscussionRow key={d.id} d={d} pid={pid} full />
+        {list.map((d) => (
+          <DiscussionRow key={d.id} d={d} pid={pid} full selecting={selecting} selected={picked.includes(d.id)} onSelect={toggle} />
         ))}
       </div>
-      <ColdGroup list={cold} pid={pid} full />
+      {selecting && (
+        <div className="disc-bar" role="toolbar" aria-label="Selected discussions">
+          <span className="disc-bar-n small">{picked.length} selected</span>
+          <button className="btn small" disabled={busy || !picked.length} onClick={() => act('stale')}>
+            Mark stale
+          </button>
+          <button className="btn small" disabled={busy || !picked.length} onClick={() => act('archive')}>
+            Archive
+          </button>
+          <button className="btn small" disabled={busy || !picked.length} onClick={() => act('close')}>
+            Close
+          </button>
+          <button className="btn small" disabled={busy || !picked.length} onClick={() => act('reopen')}>
+            Reopen
+          </button>
+          <span className="spacer" />
+          <button className="btn small quiet" onClick={leave}>
+            Cancel
+          </button>
+          {error && <span className="error-text small">{error}</span>}
+        </div>
+      )}
       {creating && <NewDiscussion pid={pid} onClose={() => setCreating(false)} />}
     </section>
   );
@@ -206,7 +252,7 @@ export function DiscussionsPage({ s, embedded = false }: { s: ProjectState; embe
 // ---------- start one ----------
 
 function NewDiscussion({ pid, onClose }: { pid: string; onClose: () => void }) {
-  const [form, setForm] = useState({ title: '', text: '' });
+  const [form, setForm, clearForm] = useStoredForm(`new-discussion:${pid}`, { title: '', text: '' });
   const { busy, error, run } = useAction();
   const save = async () => {
     let id = '';
@@ -214,6 +260,7 @@ function NewDiscussion({ pid, onClose }: { pid: string; onClose: () => void }) {
       id = (await api<{ id: string }>(`/api/projects/${pid}/discussions`, { body: form })).id;
     });
     if (ok) {
+      clearForm();
       onClose();
       go('p', pid, 'discussions', id);
     }
@@ -245,7 +292,7 @@ function NewDiscussion({ pid, onClose }: { pid: string; onClose: () => void }) {
 
 /**
  * A request holder opened from History or Needs you: an agent's standing "Requests from …" holder, or the old Inbox
- * archive. Not a discussion: no Settle, no Turn into a task, no reply box; just whose requests these are and the record.
+ * archive. Not a discussion: no Close, no Turn into a task, no reply box; just whose requests these are and the record.
  */
 function RequestHolderView({ s, data }: { s: ProjectState; data: TaskDetail }) {
   const pid = s.project.id;
@@ -291,6 +338,22 @@ function RequestHolderView({ s, data }: { s: ProjectState; data: TaskDetail }) {
   );
 }
 
+/**
+ * Make a task, on the director's proposed conclusion (one button, in the post and the header; it replaced Conclude):
+ * closes the discussion with that conclusion, and the director plans the work now.
+ */
+export function ConcludeButton({ task, message, small = true }: { task: string; message?: number; small?: boolean }) {
+  const { busy, error, run } = useAction();
+  return (
+    <>
+      <button className={`btn primary${small ? ' small' : ''}`} disabled={busy} onClick={() => void run(() => api(`/api/tasks/${task}/make-task`, { body: message == null ? {} : { message } }))}>
+        <Icon name="tasks" size={16} /> Make a task
+      </button>
+      {error && <p className="error-text">{error}</p>}
+    </>
+  );
+}
+
 export function DiscussionView({ s, data }: { s: ProjectState; data: TaskDetail }) {
   if (data.task.holder || data.task.inbox_archive) return <RequestHolderView s={s} data={data} />;
   return <DiscussionPage s={s} data={data} />;
@@ -299,13 +362,16 @@ export function DiscussionView({ s, data }: { s: ProjectState; data: TaskDetail 
 function DiscussionPage({ s, data }: { s: ProjectState; data: TaskDetail }) {
   const pid = s.project.id;
   const d = data.task as unknown as Discussion;
-  const [sheet, setSheet] = useState<'settle' | 'rename' | 'task' | null>(null);
+  const [sheet, setSheet] = useState<'settle' | 'rename' | 'task' | 'make' | null>(null);
   const [override, setOverride] = useState<DiscussionState | null>(null);
   useEffect(() => setOverride(null), [data]);
   const { busy, error, run } = useAction();
+  const [threadOpen, toggleThread] = useFold('history', true);
   const state = override ?? d.state;
   const root = s.agents.find((a) => !a.parent_id && a.status !== 'closed');
   const lines = toThreadLines(data.timeline, s, root?.name ?? 'Director', pinCtx(d.id, data.proposal));
+  // The director proposed a conclusion (task_post conclude): Conclude in the header uses the latest one.
+  const proposed = data.timeline.some((i) => i.type === 'message' && i.conclude);
   const working = root?.status === 'working' ? { name: root.name, line: root.status_line } : null;
 
   const reopen = () =>
@@ -314,6 +380,12 @@ function DiscussionPage({ s, data }: { s: ProjectState; data: TaskDetail }) {
       setOverride('open');
     });
   const toTask = () => setSheet('task');
+  // Mark stale or archive by hand (server/discrevisit.ts), from the header's menu.
+  const mark = (action: 'stale' | 'archive') =>
+    void run(async () => {
+      await batchDiscussions(pid, [d.id], action);
+      setOverride(action === 'stale' ? 'stale' : 'archived');
+    });
   const more = (
     <>
       <TaskSpecBlock projectId={pid} spec={data.spec} />
@@ -327,61 +399,98 @@ function DiscussionPage({ s, data }: { s: ProjectState; data: TaskDetail }) {
         <Icon name="back" size={16} /> Discussions
       </a>
 
-      <header className="card task-head">
+      <StickyHead
+        className="card task-head"
+        strip={
+          <div className="row title-strip-top">
+            <DiscussionStateTag state={state} />
+            <strong className="title-strip-title one-line">{d.title}</strong>
+            <button className="btn small" onClick={() => focusThreadBox(() => openChat({ kind: 'discussion', id: d.id }))}>
+              <Icon name="discuss" size={16} /> Message
+            </button>
+          </div>
+        }
+      >
         <div className="row wrap">
           <DiscussionStateTag state={state} />
-          <span className="muted small">
-            Discussion {d.origin === 'user' ? 'you started' : 'kept by the director'} · updated {ago(d.updated_at)}
-          </span>
+          <span className="spacer" />
+          {data.peer && <span className="muted small">{data.peer.from ? 'From' : 'With'} {data.peer.name} ·</span>}
+          <span className="muted small">{ago(d.updated_at)}</span>
+          <ShareButton route={href('p', pid, 'discussions', d.id)} title={d.title} />
         </div>
         <h1 className="page-title">{d.title}</h1>
         <SpecEntryCard s={s} discussionId={d.id} />
+        <SpecWorkBar s={s} discussionId={d.id} />
         <div className="row wrap task-actions">
-          {state === 'open' ? (
-            <button className="btn primary" disabled={busy} onClick={() => setSheet('settle')}>
-              <Icon name="check" size={15} /> Settle
-            </button>
+          {state === 'open' && proposed ? (
+            <>
+              {/* With a proposed conclusion: Make a task closes with it and the director plans the task now. */}
+              <ConcludeButton task={d.id} small={false} />
+              <button className="btn quiet" disabled={busy} onClick={() => setSheet('settle')}>
+                Close
+              </button>
+            </>
+          ) : state === 'open' ? (
+            <>
+              <button className="btn primary" disabled={busy} onClick={() => setSheet('make')}>
+                <Icon name="tasks" size={16} /> Make a task
+              </button>
+              <button className="btn" disabled={busy} onClick={() => setSheet('settle')}>
+                Close
+              </button>
+            </>
           ) : (
             <button className="btn" disabled={busy} onClick={reopen}>
               Reopen
             </button>
           )}
-          <button className="btn" disabled={busy} onClick={toTask}>
-            <Icon name="plus" size={15} /> Turn into a task
-          </button>
           <span className="spacer" />
-          <Menu label="More actions" items={[{ label: 'Rename', onSelect: () => setSheet('rename') }]} />
+          <Menu
+            label="More actions"
+            items={[
+              { label: 'Turn into a task', onSelect: toTask },
+              state === 'open' && { label: 'Mark stale', onSelect: () => mark('stale') },
+              state !== 'archived' && { label: 'Archive', onSelect: () => mark('archive') },
+              { label: 'Rename', onSelect: () => setSheet('rename') },
+            ]}
+          />
         </div>
         {error && <p className="error-text">{error}</p>}
 
         {state === 'settled' && (
           <div className="task-summary disc-conclusion">
             <span className="label">Conclusion</span>
-            {d.conclusion ? <Markdown text={d.conclusion} /> : <p className="muted">Settled. The director is writing the conclusion.</p>}
+            {d.conclusion && <Markdown text={d.conclusion} />}
           </div>
         )}
-        <div className={state === 'settled' ? 'disc-where muted' : 'task-summary'}>
-          <span className="label">Where it stands{d.summary_at ? ` · ${ago(d.summary_at)}` : ''}</span>
-          {d.status_summary ? <Markdown text={d.status_summary} /> : <p className="muted">No summary yet. The director writes a one-line summary as the discussion moves.</p>}
-        </div>
+        {state !== 'settled' && d.status_summary && (
+          <div className="task-summary">
+            <span className="label">Where it stands</span>
+            <Markdown text={d.status_summary} />
+          </div>
+        )}
         <ThreadLinks pid={pid} label="Led to" links={d.tasks ?? []} />
-        {!data.proposal && more}
-      </header>
+        <ThreadLinks pid={pid} label="For the task" links={d.about ? [d.about] : []} />
+      </StickyHead>
 
-      {/* A pinned proposal sits directly under the summary, above everything else: the options and the question (proposal.tsx). */}
-      {data.proposal && (
-        <>
-          <ProposalArea proposal={data.proposal} taskId={d.id} pid={pid} s={s} />
-          <section className="card disc-more">{more}</section>
-        </>
-      )}
+      {/* Its Spec entry and references, collapsed under the title unless the user opened it (fold.tsx). */}
+      <Fold kind="about" title="About this discussion" openByDefault={false} className="disc-more" label="About this discussion">
+        {more}
+      </Fold>
+      {/* A pinned proposal, then the latest previews pinned for review (proposal.tsx). */}
+      <ProposalArea proposal={data.proposal} review={data.review} taskId={d.id} pid={pid} s={s} />
 
+      {!threadOpen ? (
+        <section className="card fold closed task-thread-folded" aria-label={`Thread of ${d.title}`}>
+          <FoldHead open={false} onToggle={toggleThread} title="Thread" />
+        </section>
+      ) : (
       <Thread
         className="task-thread"
         label={`Thread of ${d.title}`}
         head={
           <div className="task-thread-head">
-            <h2 className="convo-name">Thread</h2>
+            <FoldHead open onToggle={toggleThread} title="Thread" />
           </div>
         }
         lines={lines}
@@ -395,8 +504,11 @@ function DiscussionPage({ s, data }: { s: ProjectState; data: TaskDetail }) {
         placeholder="Reply in this discussion"
         onSend={(text, attachments) => api(`/api/tasks/${d.id}/message`, { body: { text, attachments } })}
         attachTo={pid}
+        draftKey={`thread:${d.id}`}
       />
+      )}
 
+      {sheet === 'make' && <MakeTaskSheet d={d} onClose={() => setSheet(null)} />}
       {sheet === 'settle' && <SettleSheet d={d} onClose={() => setSheet(null)} onDone={() => setOverride('settled')} />}
       {sheet === 'rename' && <RenameSheet d={d} onClose={() => setSheet(null)} />}
       {sheet === 'task' && <NewTaskSheet from={d as unknown as Task} onClose={() => setSheet(null)} />}
@@ -404,18 +516,47 @@ function DiscussionPage({ s, data }: { s: ProjectState; data: TaskDetail }) {
   );
 }
 
+/** Make a task with no proposed conclusion yet: one optional line on what the task should do, for the director. */
+function MakeTaskSheet({ d, onClose }: { d: Discussion; onClose: () => void }) {
+  const [line, setLine] = useStoredText(`make:${d.id}`);
+  const { busy, error, run } = useAction();
+  const go = async () => {
+    if (await run(() => api(`/api/tasks/${d.id}/make-task`, { body: { line: line.trim() || undefined } }))) {
+      clearDraft(`make:${d.id}`);
+      onClose();
+    }
+  };
+  return (
+    <Sheet title="Make a task" onClose={onClose}>
+      <div className="form">
+        <label>
+          What should the task do? (optional)
+          <input value={line} onChange={(e) => setLine(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && void go()} autoFocus placeholder="Leave empty and the director works from the thread" />
+        </label>
+        {error && <p className="error-text">{error}</p>}
+        <div className="row">
+          <button className="btn primary" disabled={busy} onClick={go}>
+            <Icon name="tasks" size={16} /> Make a task
+          </button>
+        </div>
+      </div>
+    </Sheet>
+  );
+}
+
 function SettleSheet({ d, onClose, onDone }: { d: Discussion; onClose: () => void; onDone: () => void }) {
-  const [conclusion, setConclusion] = useState('');
+  const [conclusion, setConclusion] = useStoredText(`settle:${d.id}`);
   const { busy, error, run } = useAction();
   const save = async () => {
     const ok = await run(() => api(`/api/tasks/${d.id}/settle`, { body: { conclusion } }));
     if (ok) {
+      clearDraft(`settle:${d.id}`);
       onDone();
       onClose();
     }
   };
   return (
-    <Sheet title="Settle discussion" onClose={onClose}>
+    <Sheet title="Close discussion" onClose={onClose}>
       <div className="form">
         <label>
           Conclusion (optional)
@@ -424,10 +565,9 @@ function SettleSheet({ d, onClose, onDone }: { d: Discussion; onClose: () => voi
         {error && <p className="error-text">{error}</p>}
         <div className="row">
           <button className="btn primary" disabled={busy} onClick={save}>
-            Settle
+            Close
           </button>
         </div>
-        <p className="muted small">Settled discussions stay searchable and can be reopened.</p>
       </div>
     </Sheet>
   );
@@ -464,7 +604,7 @@ function RenameSheet({ d, onClose }: { d: Discussion; onClose: () => void }) {
  * Planning by default, so nothing starts until the owner approves.
  */
 export function NewTaskSheet({ from, another = false, onClose }: { from: Task; another?: boolean; onClose: () => void }) {
-  const [form, setForm] = useState({
+  const [form, setForm, clearForm] = useStoredForm(`discussion-task:${from.id}:${another ? 'another' : 'to'}`, {
     title: another ? '' : from.title,
     description: another ? '' : [from.status_summary, from.conclusion && `Conclusion: ${from.conclusion}`].filter(Boolean).join('\n\n'),
     state: 'planning' as 'planning' | 'waiting',
@@ -476,6 +616,7 @@ export function NewTaskSheet({ from, another = false, onClose }: { from: Task; a
       id = (await api<{ id: string }>(`/api/tasks/${from.id}/${another ? 'another-task' : 'to-task'}`, { body: form })).id;
     });
     if (ok) {
+      clearForm();
       onClose();
       go('p', from.project_id, 'tasks', id);
     }

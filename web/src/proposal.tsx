@@ -4,7 +4,9 @@ import type { PinnedItem, PinnedProposal, ProposalRound, ProposalSummary, Projec
 import { useDragReorder } from './drag';
 import { InboxCard } from './inbox';
 import { PreviewBody } from './preview';
+import { FoldHead, useFold } from './fold';
 import { Icon, Markdown, href, useAction } from './ui';
+import { when } from './time';
 
 /**
  * The pinned proposal at the very top of a task or discussion (server/pins.ts): the few options the director is
@@ -14,11 +16,7 @@ import { Icon, Markdown, href, useAction } from './ui';
  * Once the user has chosen, the chosen item stays and the rest collapse. Earlier rounds collapse below.
  */
 
-const time = (ts: number) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-const day = (ts: number) => {
-  const d = new Date(ts);
-  return d.toDateString() === new Date().toDateString() ? time(ts) : `${d.toLocaleDateString([], { day: 'numeric', month: 'short' })} ${time(ts)}`;
-};
+const day = when;
 
 /** The label's short key ("P1" of "P1: two lists and one box"), for "Chosen: P1". */
 const short = (label: string) => {
@@ -40,7 +38,7 @@ function ItemBody({ it }: { it: PinnedItem }) {
   }
   return (
     <a className="prop-file" href={a.url} target="_blank" rel="noreferrer">
-      <Icon name="file" size={18} /> <span className="one-line">{a.name}</span>
+      <Icon name="file" size={20} /> <span className="one-line">{a.name}</span>
     </a>
   );
 }
@@ -49,7 +47,7 @@ function ItemCard({ it, pid, chosen }: { it: PinnedItem; pid: string; chosen?: b
   return (
     <figure className={`prop-card ${chosen ? 'chosen' : ''}`} data-pin={it.pin_id}>
       <figcaption className="prop-label">
-        {chosen && <Icon name="check" size={15} />}
+        {chosen && <Icon name="check" size={16} />}
         <strong>{it.label}</strong>
         <span className="spacer" />
         {it.preview && (
@@ -110,6 +108,7 @@ function Arrange({ taskId, items, onDone }: { taskId: string; items: PinnedItem[
   const toRef = useRef<number | null>(null);
   const [to, setTo] = useState<number | null>(null);
   const ids = order.map(String);
+  const byId = new Map(items.map((i) => [i.pin_id, i]));
   const { drag, gripProps, rowProps } = useDragReorder({
     onMove: (id, y) => {
       const rows = [...(box.current?.children ?? [])] as HTMLElement[];
@@ -126,11 +125,12 @@ function Arrange({ taskId, items, onDone }: { taskId: string; items: PinnedItem[
       const [m] = next.splice(from, 1);
       next.splice(dest, 0, m);
       setOrder(next);
-      void run(() => api(`/api/tasks/${taskId}/pins/order`, { body: { ids: next.map(String), round: items[0]?.round } }));
+      // Only a proposal round has an order; the automatic items (round 0) follow it.
+      const round = items.find((i) => i.round > 0)?.round;
+      if (round) void run(() => api(`/api/tasks/${taskId}/pins/order`, { body: { ids: next.filter((n) => byId.get(n)?.round === round).map(String), round } }));
     },
   });
   const from = drag ? ids.indexOf(drag.id) : -1;
-  const byId = new Map(items.map((i) => [i.pin_id, i]));
   return (
     <div className="prop-arrange">
       <ul className={`reorder ${drag ? 'is-dragging' : ''}`} ref={box}>
@@ -218,29 +218,64 @@ function Thumb({ url, kind }: { url: string | null; kind: string }) {
   return <span className="prop-thumb">{url ? <img src={url} alt="" loading="lazy" /> : <Icon name={kind === 'link' ? 'external' : 'previews'} size={16} />}</span>;
 }
 
-export function ProposalArea({ proposal, taskId, pid, s }: { proposal?: PinnedProposal | null; taskId: string; pid: string; s: ProjectState }) {
+/** A list row's thumbnail: left out if its picture fails to load, never a broken-image icon. */
+function StripThumb({ url, onFail }: { url: string; onFail: () => void }) {
+  return (
+    <span className="prop-thumb">
+      <img src={url} alt="" loading="lazy" onError={onFail} />
+    </span>
+  );
+}
+
+/** "For review · 3 from 11:02 am": what the set is and when it was posted, so a stale one is obvious. */
+const reviewTitle = (n: number, from?: number) => `For review${n ? ` · ${n} from ${from ? when(from) : 'now'}` : ''}`;
+
+/**
+ * review: the task's newest burst of previews, pinned by Helm itself (server/pins.ts reviewNow). With no question asked
+ * they share this section under "For review · 3 from 11:02 am"; while the director's question is open, the proposal
+ * is this section and For review is a section of its own below it, never mixed.
+ */
+export function ProposalArea({ proposal, review, taskId, pid, s }: { proposal?: PinnedProposal | null; review?: { items: PinnedItem[]; from: number } | null; taskId: string; pid: string; s: ProjectState }) {
   const [arranging, setArranging] = useState(false);
-  if (!proposal) return null;
-  const { items, request, choice, question, earlier } = proposal;
-  const chosen = choice?.pin_id != null ? items.find((i) => i.pin_id === choice.pin_id) : undefined;
-  const others = chosen ? items.filter((i) => i !== chosen) : [];
-  const shown = chosen ? [chosen] : items;
+  const [open, toggle] = useFold('proposal', true);
+  const auto = review?.items ?? [];
+  if (!proposal && !auto.length) return null;
+  const { items: own, request, choice, question, earlier } = proposal ?? { items: [] as PinnedItem[], request: null, choice: null, question: '', earlier: [] as ProposalRound[], round: 0 };
+  const asked0 = !!proposal?.question || !!proposal?.request;
+  // An open proposal keeps its own section; For review goes below it (ReviewApart).
+  const apart = asked0 && auto.length > 0;
+  const items = apart ? own : [...own, ...auto];
+  const chosen = choice?.pin_id != null ? own.find((i) => i.pin_id === choice.pin_id) : undefined;
+  const others = chosen ? own.filter((i) => i !== chosen) : [];
+  const shown = chosen ? [chosen, ...(apart ? [] : auto)] : items;
+  const asked = !!question || !!request;
+  const round = proposal?.round ?? 0;
   const asker = request ? s.agents.find((a) => a.id === request.agent_id)?.name ?? request.agent_name : undefined;
   const waiting = request?.status === 'open';
   return (
+    <>
     <section className={`card prop-area ${waiting ? 'waiting' : ''} ${choice ? 'decided' : ''}`} aria-label="Proposal">
-      <header className="row prop-head">
-        <h2 className="now-label">
-          Proposal{proposal.round > 1 ? ` · round ${proposal.round}` : ''}
-          {waiting && <span className="prop-waiting">decision waiting</span>}
-        </h2>
-        <span className="spacer" />
-        {items.length > 0 && !arranging && (
-          <button className="btn small quiet" onClick={() => setArranging(true)}>
-            Arrange
-          </button>
-        )}
+      <header className="prop-head">
+        <FoldHead
+          open={open}
+          onToggle={toggle}
+          title={
+            <>
+              {asked ? 'Proposal' : own.length ? 'For review' : reviewTitle(auto.length, review?.from)}
+              {asked && round > 1 ? ` · round ${round}` : ''}
+              {waiting && <span className="prop-waiting">decision waiting</span>}
+            </>
+          }
+        >
+          {items.length > 0 && !arranging && (
+            <button className="btn small quiet" onClick={() => setArranging(true)}>
+              Arrange
+            </button>
+          )}
+        </FoldHead>
       </header>
+      {open && (
+      <>
       {choice && (
         <p className="prop-choice">
           <Icon name="check" size={16} /> <b>Chosen: {chosen ? short(chosen.label) : choice.text}</b> <span className="muted">· {day(choice.at)}</span>
@@ -254,7 +289,7 @@ export function ProposalArea({ proposal, taskId, pid, s }: { proposal?: PinnedPr
       {!arranging && others.length > 0 && (
         <details className="prop-others">
           <summary>
-            <Icon name="chevron" size={14} /> Other proposals ({others.length})
+            <Icon name="chevron" size={16} /> Other proposals ({others.length})
           </summary>
           <Cards items={others} pid={pid} />
         </details>
@@ -262,34 +297,62 @@ export function ProposalArea({ proposal, taskId, pid, s }: { proposal?: PinnedPr
       {question && <div className="prop-question">{<Markdown text={question} />}</div>}
       {request && waiting && (
         <div className="prop-request" id={`req-${request.id}`}>
-          <InboxCard item={request} agentName={asker} hidePreviews />
+          <InboxCard item={request} agentName={asker} hidePreviews context={false} />
         </div>
       )}
       {request && request.status === 'dismissed' && <p className="muted small">The question was dismissed.</p>}
       {earlier.length > 0 && (
         <details className="prop-earlier">
           <summary>
-            <Icon name="chevron" size={14} /> Earlier proposals ({earlier.length})
+            <Icon name="chevron" size={16} /> Earlier proposals ({earlier.length})
           </summary>
           {earlier.map((r) => (
             <EarlierRound key={r.round} r={r} pid={pid} />
           ))}
         </details>
       )}
+      </>
+      )}
+    </section>
+    {apart && <ReviewApart items={auto} from={review?.from} pid={pid} />}
+    </>
+  );
+}
+
+/** For review beside an open proposal: the newest previews, in their own section under it. */
+function ReviewApart({ items, from, pid }: { items: PinnedItem[]; from?: number; pid: string }) {
+  const [open, toggle] = useFold('review', true);
+  return (
+    <section className="card prop-area review-apart" aria-label="For review">
+      <header className="prop-head">
+        <FoldHead open={open} onToggle={toggle} title={reviewTitle(items.length, from)} />
+      </header>
+      {open && <Cards items={items} pid={pid} />}
     </section>
   );
 }
 
-/** On a list row: up to three thumbnails and "3 proposals · decision waiting" (or what was chosen). */
+/** On a list row: up to three thumbnails and "3 proposals · decision waiting" (or what was chosen); the automatic pin's thumbnails alone. */
 export function ProposalStrip({ p }: { p?: ProposalSummary | null }) {
-  if (!p || (!p.count && !p.waiting)) return null;
+  const [failed, setFailed] = useState<string[]>([]);
+  if (!p || (!p.count && !p.waiting && !p.review)) return null;
+  // Only items with a picture: no placeholder icons on a row; a picture that fails to load is left out.
+  const thumbs = p.thumbs.flatMap((t, i) => (t.url && !failed.includes(t.url) ? [<StripThumb key={i} url={t.url} onFail={() => setFailed((l) => [...l, t.url!])} />] : []));
+  if (p.review) {
+    if (!thumbs.length) return null;
+    return (
+      <span className="prop-strip small">
+        <span className="prop-strip-thumbs" aria-hidden="true">
+          {thumbs}
+        </span>
+      </span>
+    );
+  }
   return (
     <span className="prop-strip small">
-      {p.thumbs.length > 0 && (
+      {thumbs.length > 0 && (
         <span className="prop-strip-thumbs" aria-hidden="true">
-          {p.thumbs.map((t, i) => (
-            <Thumb key={i} url={t.url} kind={t.kind} />
-          ))}
+          {thumbs}
         </span>
       )}
       <span className={p.waiting ? 'prop-strip-waiting' : 'muted'}>
@@ -317,11 +380,11 @@ export function PinToggle({ ctx, itemId, kind }: { ctx: PinCtx; itemId: string; 
     <span className="pin-toggle">
       {pinId === undefined ? (
         <button className="btn small quiet" disabled={busy} onClick={() => void run(() => api(`/api/tasks/${ctx.taskId}/pins`, { body: kind === 'preview' ? { preview_id: itemId } : { attachment_id: itemId } }))}>
-          <Icon name="pin" size={14} /> Pin to top
+          <Icon name="pin" size={16} /> Pin to top
         </button>
       ) : (
         <button className="btn small quiet pinned" disabled={busy} onClick={() => void run(() => api(`/api/tasks/${ctx.taskId}/pins/${pinId}`, { method: 'DELETE' }))} title="Pinned at the top of the page. Tap to unpin.">
-          <Icon name="pin" size={14} /> Pinned · Unpin
+          <Icon name="pin" size={16} /> Pinned · Unpin
         </button>
       )}
       {error && <span className="error-text small">{error}</span>}

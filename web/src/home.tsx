@@ -1,23 +1,40 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { lazyNamed, loadDashboards } from './lazy';
+const PinnedTiles = lazyNamed<{ s: import('./api').ProjectState }>(loadDashboards, 'PinnedTiles');
 import { api, useLive } from './api';
 import type { Discussion, InboxItem, Preview, ProjectState, Task } from './api';
 import { AttachButton, AttachTray, useAttachDraft } from './attachments';
+import { useStoredText } from './drafts';
 import { AnnotateButton, openAnnotator } from './annotate';
 import { openViewer } from './viewer';
-import { ACTION_CHOICES, KIND_LABEL, answerRequest, kindTone, wantsWhat } from './needs';
-import { fileUrl, parseCompare, parseGuide } from './preview';
+import { ACTION_CHOICES, actOf, ErrorDetails, KIND_LABEL, LimitAll, answerRequest, appliesToAll, errorChoices, kindTone, wantsWhat } from './needs';
+import { PreviewThumb, hasThumb, previewImage } from './preview';
+export { previewImage };
 import { HandoffCard } from './handoff';
-import { activeMs, duration } from './sessions';
+import { duration, workText } from './sessions';
 import type { Period } from './sessions';
 import { openChat } from './chat';
+import { InboxCard } from './inbox';
 import type { ChatCtx } from './chat';
-import { Icon, Markdown, PlainRefs, Tag, ago, href, useAction, useTick } from './ui';
+import { EdgeProgress, Icon, Markdown, PlainRefs, Tag, href, openPreview, useAction, useTick } from './ui';
+import { when } from './time';
+import { RunningTaskCard } from './tasks';
+import { SearchBox, SearchResults, openHomeSearch, useHomeSearchFocus, useSearchState } from './search';
+import type { SearchBoxHandle } from './search';
+import { ModeBanner } from './projectmode';
+import { PlanLine } from './plan';
+import { History } from './more';
+import { Fold, jumpTo, openFold } from './fold';
 
 /**
  * The project home: what needs the user, one large card at a time (requests, plans waiting for approval, tasks
  * stalled or saying they need the user with nothing filed), blocking first, then importance, then age. Swipe or
  * Skip to move on; answering advances. When nothing needs the user: "All clear", with what was done since the last
  * session and what is running now. On desktop the done and running summary sits beside the card.
+ *
+ * Above them, the project's search (search.tsx): a slim field, the card a little shorter for it. On a short phone with a
+ * card showing it folds into the top bar's Search (main.tsx), so the card keeps its answers above the docked bars;
+ * while the search is open, its results take the place of the cards.
  */
 
 type Row = Task | Discussion;
@@ -53,16 +70,6 @@ export function triageCards(s: ProjectState): Card[] {
   return cards.sort((a, b) => Number(b.blocking) - Number(a.blocking) || b.importance - a.importance || a.at - b.at);
 }
 
-/** An image to show for a preview: the image itself, a comparison's after side, or a guide's first screenshot. */
-export function previewImage(p: Preview | null | undefined): string | null {
-  if (!p) return null;
-  if (p.kind === 'image' && p.file) return fileUrl(p.file);
-  const c = parseCompare(p);
-  if (c?.after?.file) return fileUrl(c.after.file);
-  const g = parseGuide(p)?.steps.find((x) => x.image)?.image;
-  return g?.file ? fileUrl(g.file) : null;
-}
-
 const firstLines = (text: string) =>
   text
     .replace(/```[\s\S]*?```/g, ' ')
@@ -73,8 +80,14 @@ const firstLines = (text: string) =>
 
 const rowHref = (row: Row) => href('p', row.project_id, row.kind === 'discussion' ? 'discussions' : 'tasks', row.id);
 
-export function ProjectHome({ s }: { s: ProjectState }) {
+/** `journal`: opened at #/p/<id>/overview/journal[/<entry or period>] (the old History page's links). */
+export function ProjectHome({ s, journal }: { s: ProjectState; journal?: string }) {
   useTick();
+  useEffect(() => {
+    // With an entry or period the section scrolls to it itself (more.tsx History); else to the section.
+    if (journal) openFold('home-journal');
+    else if (journal !== undefined) jumpTo('#home-journal', { fold: 'home-journal' });
+  }, [journal]);
   // Answered here: hidden at once, before the project refetches (and shown again if sending failed).
   const [answeredKeys, setAnsweredKeys] = useState<string[]>([]);
   const cards = triageCards(s).filter((c) => !answeredKeys.includes(c.key));
@@ -115,27 +128,70 @@ export function ProjectHome({ s }: { s: ProjectState }) {
     setCurrent(next && next.key !== key ? next.key : null);
   };
 
+  // Nothing waiting on the user in a project with work: the running tasks in detail where a card would be.
+  const calm = !card && !!(s.tasks.length || s.discussions.length || s.docs.length);
+  const [search, setSearch] = useSearchState(s.project.id, 'home');
+  const box = useRef<SearchBoxHandle>(null);
+  const openSearch = useCallback(() => openHomeSearch(setSearch, box.current), []);
+  useHomeSearchFocus(openSearch);
+
   return (
-    <div className={`home3 ${card ? 'has-cards' : 'all-clear'}`}>
+    <div className={`home3 ${search.open ? 'searching' : card ? 'has-cards' : calm ? 'calm' : 'all-clear'}`}>
       <h1 className="sr-only">{s.project.name}</h1>
-      <div className="home3-main">
-        <HandoffCard s={s} />
-        {card ? (
-          <>
-            <TriageCard key={card.key} c={card} n={index + 1} of={ordered.length} s={s} onSkip={skip} onSwipe={move} onAnswered={answered(card.key)} />
-          </>
-        ) : (
-          <AllClear s={s} />
-        )}
-      </div>
-      {card && (
-        <aside className="home3-side" aria-label="Done and running">
-          <Summary s={s} />
-        </aside>
+      <SearchBox ref={box} st={search} set={setSearch} />
+      {search.open ? (
+        <SearchResults s={s} st={search} set={setSearch} />
+      ) : (
+        <>
+          <div className="home3-main">
+            <ModeBanner s={s} />
+            <HandoffCard s={s} />
+            <Digest s={s} needs={cards.length} />
+            <CrossThreads s={s} />
+            {card ? (
+              <>
+                {card.kind === 'request' ? (
+                  <HomeRequest key={card.key} c={card} n={index + 1} of={ordered.length} s={s} onMove={move} onGo={(i) => setCurrent(ordered[i]?.key ?? null)} onAnswered={answered(card.key)} />
+                ) : (
+                  <TriageCard key={card.key} c={card} n={index + 1} of={ordered.length} s={s} onSkip={skip} onSwipe={move} onAnswered={answered(card.key)} />
+                )}
+              </>
+            ) : calm ? (
+              <>
+                {/* On a phone the session line and Step away lead; on desktop they are in the side column. */}
+                <div className="sess3 calm-sess">
+                  <SessionLine s={s} />
+                  <StepAway s={s} />
+                </div>
+                <RunningNow s={s} />
+              </>
+            ) : (
+              <AllClear s={s} />
+            )}
+            {/* Below the card (never pushing its answers under the bars) or All clear: tiles pinned from a dashboard. */}
+            <PinnedTiles s={s} />
+            <PlanLine />
+          </div>
+          {(card || calm) && (
+            <aside className="home3-side" aria-label="Done and running">
+              <Summary s={s} />
+              <div className="sess3">
+                <SessionLine s={s} />
+                <StepAway s={s} />
+              </div>
+            </aside>
+          )}
+          {/* The project's journal (and its sessions), collapsed at the bottom: what the History page was. */}
+          <div id="home-journal" className="home3-journal">
+            <Fold kind="home-journal" title="Journal" openByDefault={false} className="flat-fold">
+              <History s={s} focus={journal || undefined} />
+            </Fold>
+          </div>
+        </>
       )}
       {toast && (
         <div className="home3-toast" role="status">
-          <Icon name="check" size={18} /> <span className="one-line">{toast}</span>
+          <Icon name="check" size={20} /> <span className="one-line">{toast}</span>
         </div>
       )}
     </div>
@@ -178,7 +234,68 @@ function useSwipe(onSwipe: (by: number) => void) {
   };
 }
 
-function TriageCard({ c, n, of, s, onSkip, onSwipe, onAnswered }: { c: Card; n: number; of: number; s: ProjectState; onSkip: () => void; onSwipe: (by: number) => void; onAnswered: (what: string) => void }) {
+/** The dots a pager shows: all of them up to MAX_DOTS, else a window around the current one whose edge dots shrink. */
+const MAX_DOTS = 7;
+export function pagerDots(n: number, of: number): { index: number; small: boolean }[] {
+  if (of <= MAX_DOTS) return Array.from({ length: of }, (_, index) => ({ index, small: false }));
+  const start = Math.min(Math.max(0, n - 1 - Math.floor(MAX_DOTS / 2)), of - MAX_DOTS);
+  return Array.from({ length: MAX_DOTS }, (_, i) => {
+    const index = start + i;
+    return { index, small: (i === 0 && start > 0) || (i === MAX_DOTS - 1 && start + MAX_DOTS < of) };
+  });
+}
+
+/** A carousel pager under the card: ‹, a dot per request (the current one elongated, tappable), ›. Arrow keys on desktop. */
+function Pager({ n, of, onMove, onGo }: { n: number; of: number; onMove: (by: number) => void; onGo: (index: number) => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || t?.closest('input, textarea, select, [contenteditable="true"], [role="dialog"]')) return;
+      if (e.key === 'ArrowLeft') onMove(-1);
+      else if (e.key === 'ArrowRight') onMove(1);
+    };
+    addEventListener('keydown', onKey);
+    return () => removeEventListener('keydown', onKey);
+  }, [onMove]);
+  return (
+    <nav className="pager" aria-label={`Request ${n} of ${of}`}>
+      <button className="pager-arrow" onClick={() => onMove(-1)} aria-label="Previous request">
+        <Icon name="chevron" size={20} />
+      </button>
+      <span className="pager-dots">
+        {pagerDots(n, of).map((d) => (
+          <button key={d.index} className={`pager-dot ${d.index === n - 1 ? 'on' : ''} ${d.small ? 'small' : ''}`} onClick={() => onGo(d.index)} aria-label={`Request ${d.index + 1} of ${of}`} aria-current={d.index === n - 1 ? 'true' : undefined}>
+            <span />
+          </button>
+        ))}
+      </span>
+      <button className="pager-arrow next" onClick={() => onMove(1)} aria-label="Next request">
+        <Icon name="chevron" size={20} />
+      </button>
+    </nav>
+  );
+}
+
+/**
+ * A request on Home: its one full card (inbox.tsx), as on Needs you and in its thread, never cut down (Open, Ask and
+ * Dismiss are in it); under it a pager through the waiting requests. Answering moves on to the next card.
+ */
+function HomeRequest({ c, n, of, s, onMove, onGo, onAnswered }: { c: Extract<Card, { kind: 'request' }>; n: number; of: number; s: ProjectState; onMove: (by: number) => void; onGo: (index: number) => void; onAnswered: (what: string) => void }) {
+  const { dx, handlers } = useSwipe(onMove);
+  const row = c.row;
+  const pid = s.project.id;
+  const item = row ? { ...c.r, task_title: c.r.task_title ?? (row.holder ? null : row.title), task_kind: c.r.task_kind ?? (row.kind === 'discussion' ? 'discussion' : 'task') } : c.r;
+  const openHref = row ? href('p', pid, row.kind === 'discussion' ? 'discussions' : 'tasks', row.id, c.r.id) : c.r.agent_id ? href('p', pid, 'agents', c.r.agent_id) : null;
+  return (
+    <div className="home-req" style={dx ? { transform: `translateX(${dx}px)`, transition: 'none' } : undefined} {...handlers}>
+      <InboxCard item={item} onAnswered={onAnswered} openHref={openHref} />
+      {of > 1 && <Pager n={n} of={of} onMove={onMove} onGo={onGo} />}
+    </div>
+  );
+}
+
+/** A task that needs the user without a request filed: a plan to approve, a stalled task, a need nobody filed. */
+function TriageCard({ c, n, of, s, onSkip, onSwipe, onAnswered }: { c: Extract<Card, { kind: 'plan' | 'stalled' | 'unfiled' }>; n: number; of: number; s: ProjectState; onSkip: () => void; onSwipe: (by: number) => void; onAnswered: (what: string) => void }) {
   const { dx, handlers } = useSwipe(onSwipe);
   const row = c.row;
   const pid = s.project.id;
@@ -190,22 +307,13 @@ function TriageCard({ c, n, of, s, onSkip, onSwipe, onAnswered }: { c: Card; n: 
   let md = false;
   let shot: Preview | null = null;
   let chat: ChatCtx;
-  if (c.kind === 'request') {
-    tag = { label: KIND_LABEL[c.r.kind], tone: kindTone(c.r.kind) };
-    who = c.r.agent_name ?? 'An agent';
-    title = c.r.title;
-    // A question or to-do is markdown: its numbered steps show as a list, not one run-on paragraph.
-    why = c.r.kind === 'permission' ? '' : (c.r.body || c.r.payload.recommendation || '').trim();
-    md = c.r.kind !== 'permission';
-    shot = c.r.previews?.find((p) => previewImage(p)) ?? (previewImage(row?.thumb) ? row!.thumb : null);
-    chat = { kind: 'request', id: c.r.id };
-  } else {
+  {
     const t = c.row;
     tag = c.kind === 'plan' ? { label: 'Plan to approve', tone: 'tone-accent' } : c.kind === 'stalled' ? { label: 'Stalled', tone: 'tone-serious' } : { label: 'Says it needs you', tone: 'tone-serious' };
     who = c.kind === 'plan' ? director : t.driver?.name ?? director;
     title = t.title;
     why = c.kind === 'unfiled' ? `It says: ${t.unfiled_need ?? ''}. Nothing is filed for you to answer.` : c.kind === 'stalled' ? `Active, but nobody has worked on it for a while. ${firstLines(t.status_summary)}` : firstLines(t.status_summary || t.description);
-    shot = previewImage(t.thumb) ? t.thumb : null;
+    shot = hasThumb(t.thumb) ? t.thumb : null;
     chat = { kind: 'task', id: t.id };
   }
   // The body often opens with the title again.
@@ -214,14 +322,8 @@ function TriageCard({ c, n, of, s, onSkip, onSwipe, onAnswered }: { c: Card; n: 
     // A title cut short ("…") may end mid-word: drop the rest of that word too.
     why = why.slice(stem.length).replace(/(\.\.\.|…)$/.test(title) ? /^\S*/ : /^/, '').replace(/^[\s.:;,…-]+/, '');
   }
-  // A to-do's steps, under its text.
-  const steps = c.kind === 'request' && c.r.kind === 'action' ? (c.r.payload.steps ?? '').trim() : '';
-  const blocking = c.kind === 'request' && !!c.r.blocking;
-  // Pinned proposals the request asks about (proposal.tsx): their thumbnails instead of one screenshot.
-  const proposal = c.kind === 'request' && row?.proposal?.waiting && row.proposal.thumbs.length ? row.proposal : null;
-  const permission = c.kind === 'request' && c.r.kind === 'permission' ? c.r : null;
-  const danger = permission ? permission.payload.danger || permission.payload.triage?.passed || '' : '';
-  const openHref = row ? (c.kind === 'request' ? href('p', pid, row.kind === 'discussion' ? 'discussions' : 'tasks', row.id, c.r.id) : rowHref(row)) : c.kind === 'request' && c.r.agent_id ? href('p', pid, 'agents', c.r.agent_id) : null;
+  const blocking = false;
+  const openHref = rowHref(row);
   return (
     <article
       className={`card tri3 ${blocking ? 'blocking' : ''}`}
@@ -232,59 +334,29 @@ function TriageCard({ c, n, of, s, onSkip, onSwipe, onAnswered }: { c: Card; n: 
       <div className="tri3-top">
         <Tag tone={tag.tone}>{tag.label}</Tag>
         {blocking && <Tag tone="tone-warning">Blocking</Tag>}
-        <span className="tri3-from one-line">
-          {who} · {ago(c.at)}
-        </span>
-        <a className="tri3-of" href={href('p', pid, 'work', 'needs')} aria-label={`${n} of ${of}: see all`}>
-          {n} of {of}
-        </a>
+        <span className="tri3-from one-line">{who}</span>
+        {of > 1 && (
+          <a className="tri3-of" href={href('p', pid, 'work', 'needs')} aria-label={`${n} of ${of}: see all`}>
+            {n} of {of}
+          </a>
+        )}
       </div>
       {/* The middle shrinks and scrolls inside the card; the answers and the row under them are always in view. */}
       <div className="tri3-body">
         <h2 className="tri3-title">
           <PlainRefs text={title} />
         </h2>
-        {row && c.kind === 'request' && row.title !== title && (
-          <a className="tri3-in small" href={rowHref(row)}>
-            {row.holder ? `From ${row.holder.agent_name}, which has no task · ${row.holder.context}` : `${row.kind === 'discussion' ? 'Discussion' : 'Task'}: ${row.title}`}
-          </a>
-        )}
-        {danger && (
-          <p className="tri3-danger">
-            <span className="tri3-danger-k">Why it asks you</span> {danger}
-          </p>
-        )}
-        {permission && (permission.payload.input || permission.line) && <pre className="tri3-cmd">{commandOf(permission)}</pre>}
-        {proposal ? (
-          <div className="tri3-props" role="group" aria-label={`${proposal.count} proposals`}>
-            {proposal.thumbs.slice(0, 3).map((t, i, all) => (
-              <button
-                type="button"
-                key={i}
-                className="tri3-prop"
-                onClick={() => {
-                  const shown = all.filter((x) => x.url);
-                  if (t.url) openViewer(shown.map((x) => ({ src: x.url!, label: x.label })), shown.indexOf(t));
-                  else if (row) location.hash = rowHref(row);
-                }}
-                aria-label={`${t.label}, full screen`}
-              >
-                <span className="tri3-prop-img">{t.url ? <img src={t.url} alt="" loading="lazy" /> : <Icon name="previews" size={20} />}</span>
-                <span className="tri3-prop-label one-line">{t.label}</span>
-              </button>
-            ))}
-          </div>
-        ) : (
-          shot && <Shot p={shot} pid={pid} />
-        )}
+        {shot && <Shot p={shot} pid={pid} />}
         {why && !md && (
           <p className="tri3-why">
             <PlainRefs text={why} />
           </p>
         )}
-        {(why || steps) && md && <Markdown className="tri3-why" text={[why, steps].filter(Boolean).join('\n\n')} />}
+        {why && md && <Markdown className="tri3-why" text={why} />}
       </div>
-      <div className="tri3-acts">{c.kind === 'request' ? <RequestAnswers r={c.r} onAnswered={onAnswered} openHref={openHref} /> : <TaskCardActions c={c} onDone={onAnswered} />}</div>
+      <div className="tri3-acts">
+        <TaskCardActions c={c} onDone={onAnswered} />
+      </div>
       <div className="tri3-foot">
         <button className="btn quiet" onClick={onSkip} disabled={of < 2}>
           <Icon name="skip" size={16} /> Skip
@@ -304,23 +376,19 @@ function TriageCard({ c, n, of, s, onSkip, onSwipe, onAnswered }: { c: Card; n: 
   );
 }
 
-/** What a permission would run: the command itself for Bash, else the tool's input, as the request recorded it. */
-function commandOf(r: InboxItem): string {
-  try {
-    const input = JSON.parse(r.payload.input ?? '');
-    if (typeof input?.command === 'string') return input.command;
-    if (typeof input?.file_path === 'string') return `${r.payload.toolName ?? ''} ${input.file_path}`.trim();
-  } catch {}
-  return r.line || r.payload.input || '';
-}
-
 /**
  * The preview on a card: the whole image fitted in a bounded box; a tall screenshot fills the width from its top
  * and fades out at the bottom. Tapping opens it in the shared zoomable viewer (viewer.tsx).
  */
 function Shot({ p, pid }: { p: Preview; pid: string }) {
-  const url = previewImage(p)!;
+  const url = previewImage(p);
   const [tall, setTall] = useState(false);
+  // A chart or a text preview: its thumbnail, opening the preview.
+  if (!url) return (
+    <button type="button" className="tri3-shot" onClick={() => openPreview(pid, p.id)} aria-label={`Open ${p.title}`}>
+      <PreviewThumb p={p} />
+    </button>
+  );
   return (
     <button
       type="button"
@@ -350,7 +418,7 @@ function TaskCardActions({ c, onDone }: { c: Extract<Card, { kind: 'plan' | 'sta
       {c.kind === 'plan' && (
         <>
           <button className="btn primary wide" disabled={busy} onClick={async () => (await run(() => api(`/api/tasks/${t.id}/approve`, { method: 'POST', body: {} }))) && onDone(`Approved “${t.title}”`)}>
-            <Icon name="check" size={17} /> Approve the plan
+            <Icon name="check" size={16} /> Approve the plan
           </button>
           <a className="btn wide" href={href('p', t.project_id, 'tasks', t.id)}>
             Read the plan
@@ -364,7 +432,7 @@ function TaskCardActions({ c, onDone }: { c: Extract<Card, { kind: 'plan' | 'sta
       )}
       {c.kind === 'stalled' && (
         <button className="btn primary wide" onClick={() => openChat({ kind: 'task', id: t.id })}>
-          <Icon name="discuss" size={17} /> Ask the director about it
+          <Icon name="discuss" size={16} /> Ask the director about it
         </button>
       )}
       {error && <p className="error-text small wide">{error}</p>}
@@ -379,13 +447,16 @@ function TaskCardActions({ c, onDone }: { c: Extract<Card, { kind: 'plan' | 'sta
  */
 export function RequestAnswers({ r, compact = false, onAnswered, openHref }: { r: InboxItem; compact?: boolean; onAnswered?: (what: string) => void; openHref?: string | null }) {
   const { busy, error, run } = useAction();
-  const [other, setOther] = useState(false);
-  const [text, setText] = useState('');
+  // What is typed and the files attached are kept per request until it is answered (drafts.ts; shared with its card).
+  const draftKey = `request:${r.id}`;
+  const [text, setText] = useStoredText(draftKey);
+  const [other, setOther] = useState(() => !!text.trim());
+  const [all, setAll] = useState(true);
   const question = r.kind === 'question' || r.kind === 'action';
-  const draft = useAttachDraft(question ? r.project_id : undefined, `request:${r.id}`);
+  const draft = useAttachDraft(question ? r.project_id : undefined, `request:${r.id}`, draftKey);
   const files = draft.ready.map((a) => a.id);
   const hold = busy || draft.uploading;
-  const answer = async (body: { choice?: string; text?: string }, said: string) => {
+  const answer = async (body: { choice?: string; text?: string; all?: boolean; perform?: boolean }, said: string) => {
     const send = () => answerRequest(r.id, files.length ? { ...body, attachments: files } : body);
     // On the home card the next card comes up at once; the server can take a second (it wakes the agent).
     if (onAnswered) {
@@ -398,8 +469,10 @@ export function RequestAnswers({ r, compact = false, onAnswered, openHref }: { r
     if (await run(send)) draft.clear();
   };
   const wants = !!wantsWhat(r);
-  const recommended = r.payload.recommendation ? r.options.findIndex((o) => r.payload.recommendation!.toLowerCase().startsWith(o.label.toLowerCase())) : -1;
-  const btn = (label: string, cls: string, body: { choice?: string; text?: string }) => (
+  // A request's inline action (Approve, Update now…): its own button leads, or the option it rides on is the main one.
+  const act = actOf(r);
+  const recommended = act?.option ? r.options.findIndex((o) => o.label === act.option) : act?.button ? -2 : r.payload.recommendation ? r.options.findIndex((o) => r.payload.recommendation!.toLowerCase().startsWith(o.label.toLowerCase())) : -1;
+  const btn = (label: string, cls: string, body: { choice?: string; text?: string; perform?: boolean }) => (
     <button key={label} className={`btn ${cls}`} disabled={hold} onClick={() => answer(body, label)}>
       {label}
     </button>
@@ -407,12 +480,28 @@ export function RequestAnswers({ r, compact = false, onAnswered, openHref }: { r
   const stacked = r.options.length <= 3;
   return (
     <div className={`req-answers ${compact ? 'compact' : ''} ${r.options.length > 4 ? 'many' : ''}`}>
+      {act?.button && btn(act.button, 'primary wide', { perform: true })}
       {r.kind === 'permission' && (
         <>
           {btn('Allow once', 'primary wide', { choice: 'Allow' })}
           {r.payload.canAlways && btn('Always allow', '', { choice: 'Always allow' })}
           {btn('Deny', r.payload.canAlways ? 'danger' : 'danger wide', { choice: 'Deny' })}
         </>
+      )}
+      {r.kind === 'agent_error' &&
+        errorChoices(r).map((c, i) =>
+          c === 'Close the agent' ? (
+            <button key={c} className="btn quiet" disabled={hold} onClick={() => confirm(`Close ${r.agent_name ?? 'this agent'}? Its history stays.`) && answer({ choice: c }, c)}>
+              {c}
+            </button>
+          ) : (
+            btn(c, i === 0 ? 'primary wide' : appliesToAll(c) ? 'wide' : '', { choice: c, ...(appliesToAll(c) && all && (r.payload.limit_peers ?? 0) > 1 ? { all: true } : {}) })
+          ),
+        )}
+      {r.kind === 'agent_error' && (
+        <div className="wide">
+          <LimitAll r={r} all={all} setAll={setAll} />
+        </div>
       )}
       {r.kind === 'structure' && (
         <>
@@ -427,7 +516,7 @@ export function RequestAnswers({ r, compact = false, onAnswered, openHref }: { r
       )}
       {r.kind === 'action' && (
         <>
-          {btn(files.length ? `Done, send ${files.length > 1 ? `${files.length} files` : 'file'}` : 'Done', 'primary wide', { choice: 'Done' })}
+          {btn(files.length ? `Done, send ${files.length > 1 ? `${files.length} files` : 'file'}` : 'Done', act ? '' : 'primary wide', { choice: 'Done' })}
           {btn(ACTION_CHOICES[1], '', { choice: ACTION_CHOICES[1] })}
         </>
       )}
@@ -435,11 +524,11 @@ export function RequestAnswers({ r, compact = false, onAnswered, openHref }: { r
         <>
           {wants && !files.length && (
             <AttachButton draft={draft} className="btn primary wide" label="Attach photos or files">
-              <Icon name="clip" size={17} /> Attach {wantsWhat(r)}
+              <Icon name="clip" size={16} /> Attach {wantsWhat(r)}
             </AttachButton>
           )}
           {files.length > 0 && btn(`Send ${files.length > 1 ? `${files.length} files` : 'file'}`, 'primary wide', {})}
-          {r.options.map((o, i) => btn(o.label, `${!wants && !files.length && (recommended >= 0 ? i === recommended : i === 0) ? 'primary' : ''} ${stacked ? 'wide' : ''}`, { choice: o.label }))}
+          {r.options.map((o, i) => btn(o.label, `${!wants && !files.length && (recommended !== -1 ? i === recommended : i === 0) ? 'primary' : ''} ${stacked ? 'wide' : ''}`, { choice: o.label }))}
         </>
       )}
       {question && draft.items.length > 0 && (
@@ -459,7 +548,7 @@ export function RequestAnswers({ r, compact = false, onAnswered, openHref }: { r
             </div>
           </div>
         ) : (
-          <button className={`btn quiet req-other-btn ${r.kind === 'action' ? '' : 'wide'}`} onClick={() => setOther(true)}>
+          <button className={`btn quiet ${r.kind === 'action' ? '' : 'wide'}`} onClick={() => setOther(true)}>
             {r.kind === 'action' ? 'Add a note…' : 'Other answer…'}
           </button>
         ))}
@@ -470,17 +559,81 @@ export function RequestAnswers({ r, compact = false, onAnswered, openHref }: { r
 
 // ---------- when nothing needs the user ----------
 
-const clockTime = (ts: number) => new Date(ts).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
-const when = (ts: number) => (new Date(ts).toDateString() === new Date().toDateString() ? clockTime(ts) : new Date(ts).toLocaleDateString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }));
+
+/** Home's digest (server/digest.ts): since when, the tasks finished and the releases failed since then. */
+type DigestData = { since: number; finished: { id: string; title: string; finished_at: number }[]; failed: { kind: 'release'; id: string; title: string; at: number }[] };
+
+function useSessions(s: ProjectState) {
+  const pid = s.project.id;
+  return useLive<{ periods: Period[]; digest?: DigestData }>(`/api/projects/${pid}/sessions?limit=6`, (m) => m.type === 'project' && m.projectId === pid).data;
+}
+const usePeriods = (s: ProjectState): Period[] | undefined => useSessions(s)?.periods;
+
+/**
+ * "Since you were last here", at the top of Home: one line with what failed, what needs the user, what finished and
+ * what is running. The finished tasks themselves are Done (Summary), with their previews.
+ */
+function Digest({ s, needs }: { s: ProjectState; needs: number }) {
+  const d = useSessions(s)?.digest;
+  if (!d) return null;
+  const running = s.tasks.filter((t) => t.state === 'active').length;
+  // Agents stopped with an error now, and releases that failed since then.
+  const failed = s.agents.filter((a) => a.status === 'error').length + d.failed.length;
+  return (
+    <section className="digest" aria-label="Since you were last here">
+      <div className="digest-head">
+        <span className="digest-since">Since {when(d.since)}</span>
+        <span className="digest-counts muted small">
+          {failed > 0 && <span className="err-text">{failed} failed</span>}
+          {needs > 0 && <span className="digest-needs">{needs} {needs === 1 ? 'needs' : 'need'} you</span>}
+          {d.finished.length > 0 && <span>{d.finished.length} done</span>}
+          {running > 0 && <span>{running} running</span>}
+          {!d.finished.length && !running && !needs && !failed && <span>quiet</span>}
+        </span>
+      </div>
+    </section>
+  );
+}
+
+/** Threads with other projects' directors holding a reply not opened yet: one quiet line each (server/crossproject.ts). */
+function CrossThreads({ s }: { s: ProjectState }) {
+  const list = s.xthreads ?? [];
+  if (!list.length) return null;
+  return (
+    <ul className="xthreads" aria-label="Replies from other projects">
+      {list.map((t) => (
+        <li key={t.id}>
+          <a className="muted small" href={href('p', s.project.id, 'discussions', t.id)}>
+            <Icon name="discuss" size={14} /> <span className="one-line">{t.peer} replied: {t.title}</span>
+          </a>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** The session or away period going on now, as one muted line that opens it in History. */
+function SessionLine({ s }: { s: ProjectState }) {
+  const periods = usePeriods(s);
+  const now = periods?.find((x) => x.end == null);
+  if (!now) return null;
+  // What happened is the digest's (Digest, at the top of Home); this line is only the session itself.
+  const text = [`${now.kind === 'session' ? 'Session' : 'Away'} since ${when(now.start)}`, duration(Date.now() - now.start)].join(' · ');
+  return (
+    <a className="sess3-line muted small" href={href('p', s.project.id, 'overview', 'journal', now.id)} title="Open in the journal">
+      <span className="one-line">{text}</span>
+    </a>
+  );
+}
 
 /** Since when "done" counts: the end of the last session (so a new session shows what happened while away), else the start of this one. */
 function useSince(s: ProjectState): { since: number; label: string } {
-  const pid = s.project.id;
-  const { data } = useLive<{ periods: Period[] }>(`/api/projects/${pid}/sessions?limit=6`, (m) => m.type === 'project' && m.projectId === pid);
+  const periods = usePeriods(s);
+  const data = periods && { periods };
   const p = s.presence;
   const lastEnded = data?.periods.find((x) => x.kind === 'session' && x.end != null);
-  if (p?.state === 'away' && p.since) return { since: p.since, label: `since you left at ${when(p.since)}` };
-  if (lastEnded?.end) return { since: lastEnded.end, label: `since your last session ended at ${when(lastEnded.end)}` };
+  if (p?.state === 'away' && p.since) return { since: p.since, label: `since ${when(p.since)}` };
+  if (lastEnded?.end) return { since: lastEnded.end, label: `since ${when(lastEnded.end)}` };
   if (p?.since) return { since: p.since, label: 'this session' };
   return { since: Date.now() - 24 * 3600_000, label: 'in the last day' };
 }
@@ -491,24 +644,50 @@ function Summary({ s }: { s: ProjectState }) {
   const recent = finished.filter((t) => (t.finished_at ?? t.updated_at) >= since);
   // Nothing new since then: the last few finished anyway, so the card still says where the project got to.
   const done = recent.length ? recent : finished.slice(0, 3);
-  const running = s.tasks.filter((t) => t.state === 'active');
+  // Not running: a task whose driver stopped with an error (it is on the card above and on Agents).
+  const running = s.tasks.filter((t) => t.state === 'active' && t.driver?.status !== 'error');
   return (
     <div className="home3-summary">
+      {running.length > 0 && (
+      <section className="home3-running">
+        <h2 className="home3-h">Running</h2>
+        {(
+          <ul className="home3-list">
+            {running.map((t) => {
+              const step = t.driver?.checklist?.find((i) => i.state === 'doing')?.text ?? t.driver?.status_line ?? '';
+              return (
+                <li key={t.id}>
+                  <a href={href('p', t.project_id, 'tasks', t.id)}>
+                    <span className={`home3-thumb run ${t.driver?.status === 'working' ? 'working' : ''}`}>
+                      <span className={`status-dot ${t.driver?.status === 'working' ? 'dot-working pulse' : t.driver?.status === 'error' ? 'dot-error' : ''}`} />
+                    </span>
+                    <span className="home3-txt">
+                      <span className="home3-t">{t.title}</span>
+                      <span className={`home3-meta one-line ${t.driver?.status === 'error' ? 'err-text' : ''}`}>{t.driver?.status === 'error' ? 'Stopped with an error' : t.stalled ? 'Stalled' : t.held ? 'Held' : t.awaiting_review ? 'Awaiting review' : step || `Running ${workText(t)}`}</span>
+                    </span>
+                  </a>
+                  <EdgeProgress value={t.driver?.progress} live={t.driver?.status === 'working'} />
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
+      )}
       <section>
         <h2 className="home3-h">
-          Done <span className="muted">{recent.length ? label : 'most recently'}</span>
+          {recent.length && label === 'this session' ? 'Done this session' : <>Done <span className="muted">{recent.length ? label : 'recently'}</span></>}
         </h2>
-        {!recent.length && <p className="muted small">Nothing finished {label === 'this session' ? 'yet this session' : label}.</p>}
         {done.length > 0 && (
           <ul className="home3-list">
             {done.slice(0, 3).map((t) => (
               <li key={t.id}>
                 <a href={href('p', t.project_id, 'tasks', t.id)}>
-                  <span className="home3-thumb">{previewImage(t.thumb) ? <img src={previewImage(t.thumb)!} alt="" loading="lazy" /> : <Icon name="check" size={20} />}</span>
+                  <span className="home3-thumb">{hasThumb(t.thumb) ? <PreviewThumb p={t.thumb} /> : <Icon name="check" size={20} />}</span>
                   <span className="home3-txt">
                     <span className="home3-t">{t.title}</span>
                     <span className="home3-meta">
-                      took {duration(activeMs(t))}
+                      took {workText(t)}
                       {t.finished_at ? ` · ${when(t.finished_at)}` : ''}
                     </span>
                   </span>
@@ -517,42 +696,11 @@ function Summary({ s }: { s: ProjectState }) {
             ))}
             {done.length > 3 && (
               <li>
-                <a className="home3-more" href={href('p', s.project.id, 'history')}>
-                  and {done.length - 3} more <Icon name="chevron" size={14} />
+                <a className="home3-more" href={href('p', s.project.id, 'work', 'recent')}>
+                  and {done.length - 3} more <Icon name="chevron" size={16} />
                 </a>
               </li>
             )}
-          </ul>
-        )}
-      </section>
-      <section>
-        <h2 className="home3-h">
-          Running now <span className="muted">{running.length || ''}</span>
-        </h2>
-        {running.length === 0 ? (
-          <p className="muted small">Nothing is running.</p>
-        ) : (
-          <ul className="home3-list">
-            {running.map((t) => {
-              const step = t.driver?.checklist?.find((i) => i.state === 'doing')?.text ?? t.driver?.status_line ?? '';
-              return (
-                <li key={t.id}>
-                  <a href={href('p', t.project_id, 'tasks', t.id)}>
-                    <span className={`home3-thumb run ${t.driver?.status === 'working' ? 'working' : ''}`}>
-                      <span className={`status-dot ${t.driver?.status === 'working' ? 'dot-working pulse' : ''}`} />
-                    </span>
-                    <span className="home3-txt">
-                      <span className="home3-t">{t.title}</span>
-                      <span className="home3-meta one-line">
-                        {t.driver?.name ?? 'No driver'}
-                        {step && ` · ${step}`}
-                      </span>
-                      <span className="home3-meta">{t.stalled ? 'stalled' : t.awaiting_review ? 'awaiting review' : `running ${duration(activeMs(t))}`}</span>
-                    </span>
-                  </a>
-                </li>
-              );
-            })}
           </ul>
         )}
       </section>
@@ -560,8 +708,54 @@ function Summary({ s }: { s: ProjectState }) {
   );
 }
 
+/**
+ * Nothing waiting on the user: each running task in detail (its agents and what each is doing now, the step, progress,
+ * the latest preview and thread line), else the next scheduled tasks, else one muted line.
+ */
+function RunningNow({ s }: { s: ProjectState }) {
+  const running = s.tasks.filter((t) => t.state === 'active');
+  if (!running.length) {
+    const next = s.tasks.filter((t) => t.state === 'scheduled').slice(0, 3);
+    if (!next.length) return <p className="muted small calm-none">Nothing running</p>;
+    return (
+      <section className="calm-next">
+        <h2 className="home3-h">Next</h2>
+        <ul className="home3-list">
+          {next.map((t) => (
+            <li key={t.id}>
+              <a className="one-line" href={href('p', t.project_id, 'tasks', t.id)}>
+                {t.title}
+              </a>
+            </li>
+          ))}
+        </ul>
+      </section>
+    );
+  }
+  return (
+    <>
+      <h2 className="home3-h run3-h">
+        <span className={`status-dot ${running.some((t) => t.driver?.status === 'working') ? 'dot-working pulse' : ''}`} /> Running
+      </h2>
+      {running.map((t) => (
+        <RunningTaskCard key={t.id} s={s} t={t} />
+      ))}
+    </>
+  );
+}
+
+/** Ending the session by hand ("I'm stepping away"): only on Home, so the other pages carry no session bar. */
+function StepAway({ s }: { s: ProjectState }) {
+  const { busy, run } = useAction();
+  if (s.presence?.state !== 'session') return null;
+  return (
+    <button className="btn small quiet step-away" title="End the session now and let the director carry on alone" disabled={busy} onClick={() => run(() => api(`/api/projects/${s.project.id}/away`, { method: 'POST' }))}>
+      Step away
+    </button>
+  );
+}
+
 function AllClear({ s }: { s: ProjectState }) {
-  const p = s.presence;
   // A new project: nothing to clear yet; the first thing is to tell the director what it is for.
   if (!s.tasks.length && !s.discussions.length && !s.docs.length) {
     return (
@@ -569,7 +763,7 @@ function AllClear({ s }: { s: ProjectState }) {
         <h2 className="clear3-title">What do you want from this project?</h2>
         <p className="muted">Tell the director the outcome you are after, any constraints, and what done looks like. It writes the Spec, builds the team and reports back.</p>
         <button className="btn primary big3" onClick={() => openChat({ kind: 'general' })}>
-          <Icon name="discuss" size={18} /> Chat with the director
+          <Icon name="discuss" size={20} /> Chat with the director
         </button>
       </article>
     );
@@ -580,12 +774,10 @@ function AllClear({ s }: { s: ProjectState }) {
         <span className="clear3-ok">
           <Icon name="check" size={24} />
         </span>
-        <div>
-          <h2>All clear</h2>
-          <p className="muted small">
-            Nothing needs you.{' '}
-            {p?.state === 'session' ? `In session${p.since ? ` since ${when(p.since)}` : ''}.` : p?.state === 'away' ? `Away${p.since ? ` since ${when(p.since)}` : ''}; the director carries on.` : ''}
-          </p>
+        <h2>All clear</h2>
+        <div className="sess3">
+          <SessionLine s={s} />
+          <StepAway s={s} />
         </div>
       </div>
       <Summary s={s} />

@@ -1,7 +1,7 @@
 /**
  * Checks for request holders (requests.ts): an agent's standing "Requests from …" holder and the old Inbox archive are
- * not discussions, holders settle when nothing is pending and reopen with the next request, and spawn_agent links a
- * task when for_task is left out. Run: npm run check:holders.
+ * not discussions, holders settle when nothing is pending and reopen with the next request. (spawn_agent is gone: Helm starts
+ * builders on their task, dispatch.ts.) Run: npm run check:holders.
  */
 import '../testenv.ts';
 import assert from 'node:assert/strict';
@@ -12,7 +12,6 @@ const R = await import('../requests.ts');
 const Dz = await import('../discussions.ts');
 const { findInProject } = await import('../search.ts');
 const { touchProject } = await import('../store.ts');
-const { helmTools } = await import('../tools.ts');
 const { defaultStructure } = await import('../structure.ts');
 
 let passed = 0;
@@ -32,7 +31,8 @@ run('INSERT INTO projects (id, name, path, structure, created_at, updated_at, se
 const agent = (id: string, name: string, role = 'director', parent: string | null = null, task: string | null = null) =>
   run('INSERT INTO agents (id, project_id, parent_id, role_id, name, model, status, task_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)', id, pid, parent, role, name, 'x', 'idle', task, now(), now());
 agent('ag_dir', 'Director');
-const workerRole = defaultStructure().roles.find((r: any) => r.id !== 'director')!;
+// A builder (dispatch.ts).
+const workerRole = defaultStructure().roles.find((r: any) => r.id === 'builder')!;
 agent('ag_w', 'Top bar engineer', workerRole.id, 'ag_dir');
 
 const listed = () => Dz.listDiscussions(pid).map((d) => d.title);
@@ -87,50 +87,6 @@ await check("a task-less question from the director still starts a real discussi
   assert.equal(home.kind, 'discussion');
   assert.equal(home.requests_agent_id, null);
   assert.ok(listed().includes('Should Helm support Gemini?'));
-});
-
-// spawn_agent with a fake runtime that creates the agent row and runs the link callback, as runtime.spawn does.
-let n = 0;
-const rt = {
-  spawn: async (_me: any, role: string, name: string, _brief: string, link: (a: any) => void) => {
-    const id = `ag_s${++n}`;
-    agent(id, name, role, 'ag_dir');
-    link(get('SELECT * FROM agents WHERE id = ?', id));
-    return { id, name };
-  },
-  send: async () => {},
-  close: async () => {},
-  markComplete: () => {},
-};
-const spawn = (as: string, args: any) => (helmTools(as, rt as any, { manager: true, root: true, consult: false }) as any[]).find((t) => t.name === 'spawn_agent').handler({ role: workerRole.id, name: 'Worker', ...args }, {});
-const text = (r: any) => r.content.map((c: any) => c.text).join('');
-const active = T.createTask(pid, { title: 'Active work', state: 'active', origin: 'director' }, { author: 'director', name: 'Director' });
-const planning = T.createTask(pid, { title: 'A plan', state: 'planning', origin: 'director' }, { author: 'director', name: 'Director' });
-
-await check('spawn_agent links the one open task the brief names', async () => {
-  const r = await spawn('ag_dir', { task: `Fix the bar. This is for [[${active.id}]].` });
-  assert.match(text(r), /Linked to the task "Active work"/);
-  assert.equal(get('SELECT task_id FROM agents WHERE id = ?', `ag_s${n}`)!.task_id, active.id);
-});
-
-await check('spawn_agent does not link a planning task it names, and says why', async () => {
-  const r = await spawn('ag_dir', { task: `Look at ${planning.id}.` });
-  assert.match(text(r), /It has no task: .*Planning/);
-  assert.equal(get('SELECT task_id FROM agents WHERE id = ?', `ag_s${n}`)!.task_id, null);
-});
-
-await check("spawn_agent links the spawning agent's own task when the brief names none", async () => {
-  run('UPDATE agents SET task_id = ? WHERE id = ?', active.id, 'ag_w');
-  run("UPDATE agents SET role_id = 'director' WHERE id = 'ag_w'");
-  const r = await spawn('ag_w', { task: 'Help me with the bar.' });
-  assert.match(text(r), /because it is your own task/);
-  assert.equal(get('SELECT task_id FROM agents WHERE id = ?', `ag_s${n}`)!.task_id, active.id);
-});
-
-await check('spawn_agent with nothing to link says its requests show under Needs you with only its name', async () => {
-  const r = await spawn('ag_dir', { task: `Two tasks: ${active.id} and ${T.createTask(pid, { title: 'Other', state: 'active', origin: 'director' }, { author: 'director', name: 'Director' }).id}.` });
-  assert.match(text(r), /names 2 open tasks/);
-  assert.equal(get('SELECT task_id FROM agents WHERE id = ?', `ag_s${n}`)!.task_id, null);
 });
 
 console.log(`\n${passed} passed${process.exitCode ? ', some failed' : ''}.`);

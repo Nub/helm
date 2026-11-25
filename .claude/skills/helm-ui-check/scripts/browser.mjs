@@ -24,6 +24,7 @@ export const DEVICES = {
   se: { width: 375, height: 667, dpr: 2, mobile: true, ua: IOS_UA, safe: { top: 20, bottom: 0, left: 0, right: 0 }, kb: 260 },
   ipad: { width: 820, height: 1180, dpr: 2, mobile: true, ua: IPAD_UA, safe: { top: 24, bottom: 20, left: 0, right: 0 }, kb: 400 },
   desktop: { width: 1280, height: 900, dpr: 1, mobile: false },
+  laptop: { width: 1024, height: 768, dpr: 1, mobile: false },
 };
 
 export function findChromium() {
@@ -173,6 +174,7 @@ async function newPage(browser, opts = {}) {
   }
   if (d.ua) await s('Emulation.setUserAgentOverride', { userAgent: d.ua, platform: 'iPhone' });
   await s('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: theme }, ...(standalone ? [{ name: 'display-mode', value: 'standalone' }] : [])] });
+  if (opts.timezone) await s('Emulation.setTimezoneOverride', { timezoneId: opts.timezone });
   let safeAreas = false;
   if (standalone && d.safe) {
     try {
@@ -357,6 +359,59 @@ function audit() {
   out.smallTaps = taps.map((el) => [el, el.getBoundingClientRect()]).filter(([, r]) => r.width > 0 && (r.height < 32 || r.width < 32))
     .map(([el, r]) => `${tag(el)} "${(el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 24)}" ${Math.round(r.width)}x${Math.round(r.height)}`).slice(0, 30);
   out.tapTargets = taps.length;
+  // Text cut off without an ellipsis: content wider (or taller) than its box where the box hides the rest.
+  const fixedAncestor = (el) => { for (let p = el; p && p !== document.body; p = p.parentElement) { const pos = getComputedStyle(p).position; if (pos === 'fixed' || pos === 'sticky') return true; } return false; };
+  // Text in a closed <details> (other than its summary) is not drawn, though it keeps a layout box.
+  const closedAway = (el) => { const d = el.closest('details:not([open])'); return !!d && !el.closest('summary'); };
+  const textEls = [...document.querySelectorAll('body *')].filter((el) => vis(el) && !closedAway(el) && [...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim()));
+  out.clipped = textEls.filter((el) => {
+    if (el.getBoundingClientRect().width <= 1) return false; // screen-reader-only text
+    const s = getComputedStyle(el);
+    if (!/(hidden|clip)/.test(s.overflowX + s.overflowY)) return false;
+    // A box that fades its content out (a mask) cuts it on purpose.
+    if ((s.maskImage && s.maskImage !== 'none') || (s.webkitMaskImage && s.webkitMaskImage !== 'none')) return false;
+    const cutX = el.scrollWidth > el.clientWidth + 1 && s.textOverflow !== 'ellipsis' && /(hidden|clip)/.test(s.overflowX);
+    // A line clamp ends with an ellipsis: not a cut.
+    const clamp = parseInt(s.webkitLineClamp || s.lineClamp || '0') || 0;
+    const cutY = el.scrollHeight > el.clientHeight + 2 && /(hidden|clip)/.test(s.overflowY) && !(clamp > 0);
+    return cutX || cutY;
+  }).map((el) => `${tag(el)} "${el.textContent.trim().slice(0, 30)}"`).slice(0, 12);
+  // Text boxes drawn over each other (in the page's own flow, not a sticky bar or sheet over the page): each element's own
+  // text, cut to what its scrolling or clipping ancestors let show; screen-reader-only text (1 px boxes) left out.
+  const shown = (el, r) => {
+    let x0 = r.left, x1 = r.right, y0 = r.top, y1 = r.bottom;
+    // The element itself too: a line clamp hides its own extra lines.
+    for (let p = el; p && p !== document.body; p = p.parentElement) {
+      const ps = getComputedStyle(p);
+      if (/(auto|scroll|hidden|clip)/.test(ps.overflowX + ps.overflowY)) {
+        const pr = p.getBoundingClientRect();
+        x0 = Math.max(x0, pr.left); x1 = Math.min(x1, pr.right); y0 = Math.max(y0, pr.top); y1 = Math.min(y1, pr.bottom);
+      }
+    }
+    return x1 - x0 > 2 && y1 - y0 > 2 ? { left: x0, right: x1, top: y0, bottom: y1 } : null;
+  };
+  const boxes = [];
+  for (const el of textEls) {
+    if (fixedAncestor(el) || el.getBoundingClientRect().width <= 1) continue;
+    for (const n of el.childNodes) {
+      if (n.nodeType !== 3 || !n.textContent.trim()) continue;
+      const range = document.createRange();
+      range.selectNodeContents(n);
+      for (const r of range.getClientRects()) { const v = shown(el, r); if (v) boxes.push([el, v]); }
+    }
+  }
+  out.overlaps = [];
+  for (let i = 0; i < boxes.length && out.overlaps.length < 10; i++) {
+    const [a, ra] = boxes[i];
+    for (let j = i + 1; j < boxes.length; j++) {
+      const [b, rb] = boxes[j];
+      if (a.contains(b) || b.contains(a)) continue;
+      const w = Math.min(ra.right, rb.right) - Math.max(ra.left, rb.left);
+      const h = Math.min(ra.bottom, rb.bottom) - Math.max(ra.top, rb.top);
+      // Lines that only touch (a tight line height) are not an overlap: a third of the smaller line at least.
+      if (w > 4 && h > Math.max(4, Math.min(ra.bottom - ra.top, rb.bottom - rb.top) / 3)) { out.overlaps.push(`${tag(a)} "${a.textContent.trim().slice(0, 20)}" × ${tag(b)} "${b.textContent.trim().slice(0, 20)}"`); break; }
+    }
+  }
   out.fixedLayers = [...document.querySelectorAll('body *')].filter((el) => { const p = getComputedStyle(el).position; return (p === 'fixed' || p === 'sticky') && vis(el); })
     .map((el) => { const r = el.getBoundingClientRect(); return `${getComputedStyle(el).position} ${tag(el)} y=${Math.round(r.top)}..${Math.round(r.bottom)}`; });
   return out;

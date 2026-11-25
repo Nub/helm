@@ -1,9 +1,11 @@
 import { db, all, get, now, run } from './db.ts';
 import type { Row } from './db.ts';
+import { CAPS, cutClean } from './brevity.ts';
 import { liveOwned, liveUpdateEnabled, readStatus } from './liveupdate.ts';
 import { presence } from './sessions.ts';
 import { listSubscriptions, sendPush } from './push.ts';
 import type { PushOptions } from './push.ts';
+import { runnerOnly } from './role.ts';
 
 /**
  * Phone notifications: what is sent, to whom, and when not. Other code calls one of the `notify…` functions with an
@@ -141,19 +143,23 @@ export function kindOn(s: Settings, kind: NotifyKind, projectId?: string): boole
 
 // ---------- presence ----------
 
-/** Where each open page is ("#/p/…" route) and whether it is visible, as the page last reported. */
-const pagePresence = new Map<string, { hash: string; visible: boolean; at: number }>();
+/**
+ * Where each open page is ("#/p/…" route) and whether it is visible, as the page last reported. A table, not memory:
+ * the web service hears it and the runner, which sends the notifications, reads it (server/runner.ts).
+ */
 const PRESENCE_MS = 60_000;
 
 export function notePresence(client: string, hash: string, visible: boolean) {
-  pagePresence.set(client.slice(0, 64), { hash: hash.slice(0, 300), visible, at: Date.now() });
-  if (pagePresence.size > 200) for (const [k, v] of pagePresence) if (Date.now() - v.at > PRESENCE_MS) pagePresence.delete(k);
+  run(
+    'INSERT INTO page_presence (client, hash, visible, at) VALUES (?,?,?,?) ON CONFLICT (client) DO UPDATE SET hash = excluded.hash, visible = excluded.visible, at = excluded.at',
+    client.slice(0, 64), hash.slice(0, 300), visible ? 1 : 0, Date.now(),
+  );
+  run('DELETE FROM page_presence WHERE at < ?', Date.now() - 10 * PRESENCE_MS);
 }
 
 /** A page visible in the last minute whose route starts with `prefix`. */
 function watching(prefix: string): boolean {
-  for (const p of pagePresence.values()) if (p.visible && Date.now() - p.at < PRESENCE_MS && p.hash.startsWith(prefix)) return true;
-  return false;
+  return all('SELECT hash FROM page_presence WHERE visible = 1 AND at >= ?', Date.now() - PRESENCE_MS).some((p) => String(p.hash).startsWith(prefix));
 }
 
 // ---------- events ----------
@@ -172,6 +178,8 @@ export type NotifyEvent = {
   item?: string;
   /** A blocking request: bypasses quiet hours, sent at once, marked urgent. */
   blocking?: boolean;
+  /** The task's bell (bell.ts): the user asked for this one, so it goes out whatever the kind's setting says. */
+  bell?: boolean;
 };
 
 export type Payload = { title: string; body: string; url: string; tag: string; badge: number; urgent: boolean; ts: number };
@@ -190,12 +198,10 @@ export function badgeCount(): number {
   return (get("SELECT COUNT(*) AS n FROM inbox i JOIN projects p ON p.id = i.project_id JOIN tasks t ON t.id = i.task_id WHERE i.status = 'open' AND p.archived = 0")?.n as number) ?? 0;
 }
 
-const oneLine = (s: string, n = 160) => {
-  const line = s.replace(/\s+/g, ' ').trim();
-  return line.length > n ? `${line.slice(0, n - 1)}…` : line;
-};
+/** One line, cut at a sentence end or a word break (brevity.ts), never mid-word. */
+const oneLine = (s: string, n = CAPS.notification) => cutClean(s.replace(/\s+/g, ' '), n).text;
 const projectName = (id?: string) => (id ? ((get('SELECT name FROM projects WHERE id = ?', id)?.name as string) ?? '') : '');
-const prefixed = (projectId: string | undefined, text: string) => {
+export const prefixed = (projectId: string | undefined, text: string) => {
   const name = projectName(projectId);
   return name ? `${name} · ${text}` : text;
 };
@@ -203,14 +209,26 @@ const prefixed = (projectId: string | undefined, text: string) => {
 /** Seconds a group waits for more events before sending (blocking requests do not wait). */
 export const timing = { gatherMs: 4000, windowMs: 60_000 };
 
+/** Set in the web service (server/runner.ts): hand events to the runner instead of sending them here. */
+let forward: ((e: NotifyEvent) => void) | null = null;
+export function forwardNotifications(fn: (e: NotifyEvent) => void) {
+  forward = fn;
+}
+
 type Group = { pending: NotifyEvent[]; timer: ReturnType<typeof setTimeout> | null; sentAt: number; sentCount: number; tag: string };
 const groups = new Map<string, Group>();
 
 /** The entry point. Returns why an event was dropped, for the harness; callers ignore it. */
-export function notify(e: NotifyEvent): 'sent' | 'off' | 'watching' | 'held' {
+export function notify(e: NotifyEvent): 'sent' | 'off' | 'watching' | 'queued' | 'held' {
+  // The web service does not send: grouping and delivery live in the runner, which gets the event as a command.
+  if (forward) {
+    forward(e);
+    return 'queued';
+  }
+  runnerOnly('sending a push notification (notify.notify)');
   try {
     const s = getSettings();
-    if (!kindOn(s, e.kind, e.projectId)) return 'off';
+    if (e.bell ? s.muted : !kindOn(s, e.kind, e.projectId)) return 'off';
     if (e.item && watching(e.item)) return 'watching';
     if (!e.blocking && e.projectId && (e.kind === 'done' || e.kind === 'agent') && watching(`#/p/${e.projectId}/`)) return 'watching';
     if (!e.blocking && inQuietHours(s)) {
@@ -325,6 +343,19 @@ export function notifyRequest(inboxId: string) {
   const item = `#/p/${r.project_id}/${pageOf(home)}/${home.id}`;
   // The stable route: the app resolves it to wherever the request is shown (web/src/project.tsx), scrolled to it.
   notify({ kind: 'needs', projectId: r.project_id, title: prefixed(r.project_id, r.title), body, url: `#/p/${r.project_id}/request/${r.id}`, item, blocking: !!r.blocking });
+}
+
+/**
+ * Requests an agent filed in one turn, shown together when it ended (requests.ts releaseHeld): one notification. One
+ * request reads as itself; several as "3 requests from <agent>", opening Needs you.
+ */
+export function notifyRequests(ids: string[]) {
+  const rows = ids.map((id) => get("SELECT i.*, a.name AS agent_name FROM inbox i LEFT JOIN agents a ON a.id = i.agent_id WHERE i.id = ? AND i.status = 'open' AND i.task_id IS NOT NULL", id)).filter(Boolean) as Row[];
+  if (!rows.length) return;
+  if (rows.length === 1) return notifyRequest(rows[0].id);
+  const p = rows[0].project_id;
+  const url = `#/p/${p}/work/needs`;
+  notify({ kind: 'needs', projectId: p, title: prefixed(p, `${rows.length} requests from ${rows[0].agent_name ?? 'an agent'}`), body: rows.map((r) => r.title).join(' · '), url, item: url, blocking: rows.some((r) => !!r.blocking) });
 }
 
 /**
@@ -450,9 +481,9 @@ function checkUpdate(t: number) {
   writeState('updateNotified', s.id);
   const rev = (r: string) => r.slice(0, 7);
   const title =
-    s.stage === 'healthy' ? (s.kind === 'rollback' ? `Helm rolled back to ${rev(s.toRev)}` : `Helm updated to ${rev(s.toRev)}`)
+    s.stage === 'healthy' ? (s.kind === 'rollback' ? `Helm rolled back to ${rev(s.toRev)}` : s.kind === 'restart-runner' ? 'Agents restarted' : s.kind === 'adopt' ? 'Helm runs as a runner and a web service' : `Helm updated to ${rev(s.toRev)}`)
     : s.stage === 'rolled-back' ? 'Helm update rolled back'
-    : `Helm ${s.kind} failed`;
+    : s.kind === 'restart-runner' || s.kind === 'adopt' ? 'Restarting the agents failed' : `Helm ${s.kind} failed`;
   notify({ kind: 'update', title, body: oneLine(s.message || ''), url: '#/helm' });
 }
 
@@ -499,4 +530,4 @@ export function stopNotifications() {
 }
 
 /** For the test harness. */
-export const _internal = { presence: pagePresence, groups, held: () => all('SELECT * FROM notify_held'), resetGroups: () => groups.clear() };
+export const _internal = { presence: { clear: () => run('DELETE FROM page_presence') }, groups, held: () => all('SELECT * FROM notify_held'), resetGroups: () => groups.clear() };

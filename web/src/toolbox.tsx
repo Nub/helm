@@ -89,7 +89,8 @@ const STATUS_LABEL: Record<ToolboxItem['status'], string> = {
 const short = (s?: string, n = 12) => (s ? s.slice(0, n) : '');
 const kb = (n: number) => (n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
 
-export const toolboxRefresh = (m: { type: string }) => m.type === 'toolbox' || m.type === 'projects' || m.type === 'reconnect';
+import { toolboxRefresh } from './toolboxsignal';
+export { toolboxRefresh };
 
 // ---------- risk flags ----------
 
@@ -270,7 +271,6 @@ export function ReviewView({ review, kind }: { review: Review; kind: Kind }) {
 
 function SourceLine({ item }: { item: ToolboxItem }) {
   const s = item.source;
-  const commit = item.pin.commit || item.review.resolved?.commit;
   return (
     <div className="tb-source small">
       <span className="mono one-line" title={s.ref}>
@@ -279,19 +279,10 @@ function SourceLine({ item }: { item: ToolboxItem }) {
         {s.subpath ? ` · ${s.subpath}` : ''}
       </span>
       <span className="muted">
-        {[
-          commit && `commit ${short(commit)}`,
-          item.pin.store_path && item.pin.store_path.replace('/nix/store/', '').slice(0, 40),
-          item.content_hash && !item.pin.store_path && `content ${short(item.content_hash)}`,
-          s.pin && !commit && `pin ${s.pin}`,
-        ]
-          .filter(Boolean)
-          .join(' · ')}
         {(s.homepage || item.proposal.homepage) && (
           <>
-            {' · '}
             <a href={s.homepage || item.proposal.homepage} target="_blank" rel="noreferrer noopener">
-              homepage <Icon name="external" size={12} />
+              homepage <Icon name="external" size={16} />
             </a>
           </>
         )}
@@ -374,11 +365,6 @@ function ItemCard({ item, data, onAction }: { item: ToolboxItem; data: ToolboxDa
         <p className="tb-summary">{item.summary}</p>
         <FlagTags review={item.review} kind={item.kind} />
         <SourceLine item={item} />
-        <p className="small muted">
-          {item.origin === 'import' ? 'Imported from your Claude setup' : <>Proposed by {item.proposer_name ?? 'a director'}{item.project_name && <> in <a href={href('p', item.proposed_in_project!, 'overview')}>{item.project_name}</a></>}</>}
-          {' · '}
-          {clock(item.created_at)}
-        </p>
       </header>
 
       {item.integrity && (
@@ -407,7 +393,8 @@ function ItemCard({ item, data, onAction }: { item: ToolboxItem; data: ToolboxDa
       {item.status === 'declined' && (
         <div className="tb-alert">
           <strong>Declined</strong>
-          {item.decided_at && <> {clock(item.decided_at)}</>}: {item.decided_note}
+          {item.decided_at && <> {clock(item.decided_at)}</>}
+          {item.decided_note && <>: {item.decided_note}</>}
         </div>
       )}
 
@@ -416,7 +403,7 @@ function ItemCard({ item, data, onAction }: { item: ToolboxItem; data: ToolboxDa
       {item.status === 'installed' && <InstalledControls item={item} data={data} />}
 
       <button className="tb-expand" onClick={() => setOpen(!open)} aria-expanded={open}>
-        <Icon name="chevron" size={14} /> {open ? 'Hide details' : isOpen ? 'Review the proposal and what Helm fetched' : 'Details and review snapshot'}
+        <Icon name="chevron" size={16} /> {open ? 'Hide details' : isOpen ? 'Review the proposal and what Helm fetched' : 'Details and review snapshot'}
       </button>
       {open && (
         <div className="tb-details">
@@ -669,13 +656,13 @@ function PersonalCard({ p, onAdd }: { p: PersonalItem; onAdd: () => void }) {
       )}
       {p.error && <p className="error-text">{p.error}</p>}
       <button className="tb-expand" onClick={() => setOpen(!open)} aria-expanded={open}>
-        <Icon name="chevron" size={14} /> {open ? 'Hide contents' : 'Review contents'}
+        <Icon name="chevron" size={16} /> {open ? 'Hide contents' : 'Review contents'}
       </button>
       {open && <ReviewView review={p.review} kind={p.kind} />}
       <footer className="row wrap tb-actions">
         {p.state === 'new' && (
           <button className="btn primary" onClick={onAdd} disabled={!!p.error}>
-            <Icon name="plus" size={15} /> Add…
+            <Icon name="plus" size={16} /> Add…
           </button>
         )}
         {p.state === 'update' && (
@@ -755,12 +742,6 @@ export function ToolboxPage() {
 
   return (
     <section className="toolbox-page">
-      <div className="section-head">
-        <div>
-          <h1 className="page-title">Toolbox</h1>
-          <p className="muted small">Skills, plugins and MCP servers agents get, by project. Directors propose; only you install.</p>
-        </div>
-      </div>
       {flagged.length > 0 && (
         <div className="tb-alert tb-alert-bad">
           <strong>{flagged.length} installed item{flagged.length === 1 ? '' : 's'} changed on disk and {flagged.length === 1 ? 'is' : 'are'} not being loaded:</strong> {flagged.map((i) => i.name).join(', ')}.
@@ -771,8 +752,8 @@ export function ToolboxPage() {
         onChange={setTab}
         options={[
           { id: 'proposed', label: 'Proposed', count: count('proposed') },
-          { id: 'installed', label: 'Installed', count: count('installed') },
-          { id: 'declined', label: 'Declined', count: count('declined') },
+          { id: 'installed', label: 'Installed' },
+          { id: 'declined', label: 'Declined' },
           { id: 'import', label: 'Import' },
         ]}
       />
@@ -785,18 +766,14 @@ export function ToolboxPage() {
           ))}
         </div>
       ) : (
-        <Empty title={tab === 'proposed' ? 'No proposals waiting' : tab === 'installed' ? 'Nothing installed yet' : 'Nothing declined'}>
-          {tab === 'proposed' && <p>Directors propose tools here when they see agents struggling, or when you mention one to them.</p>}
-          {tab === 'installed' && <p>Install a proposal, or add a skill from your own Claude setup under Import.</p>}
-        </Empty>
+        <Empty title={tab === 'proposed' ? 'No proposals waiting' : tab === 'installed' ? 'Nothing installed yet' : 'Nothing declined'} />
       )}
       {action?.kind === 'install' && <InstallSheet item={action.item} data={data} onClose={() => setAction(null)} />}
       {action?.kind === 'decline' && (
         <TextSheet
           title={`Decline ${action.item.name}`}
-          hint="Why? Directors are told this if they propose it again."
+          hint="Reason (optional)"
           cta="Decline"
-          required
           onSubmit={(note) => api(`/api/toolbox/${action.item.id}/decline`, { body: { note } })}
           onClose={() => setAction(null)}
         />
@@ -825,8 +802,7 @@ export function ProjectToolboxSetup({ s }: { s: ProjectState }) {
   return (
     <>
       <h2>Toolbox</h2>
-      <p className="muted">
-        Skills, plugins and MCP servers this project’s agents get, besides the project’s own <span className="mono">.claude/</span> folder. Changes apply when an agent’s process next starts.{' '}
+      <p className="small">
         <a href={href('toolbox')}>Open the Toolbox</a>
       </p>
       <div className="card tb-setup">

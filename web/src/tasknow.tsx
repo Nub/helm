@@ -1,15 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { api, useStream } from './api';
-import type { Agent, AgentEvent, ProjectState, Task, TaskChange, TaskDetail } from './api';
+import type { Agent, AgentEvent, ProjectState, RunningCommand, Task, TaskDetail } from './api';
 import { InboxCard } from './inbox';
-import { PreviewBody } from './preview';
-import { Icon, Markdown, Status, ago, href, useTick , PlainRefs } from './ui';
+import { Fold } from './fold';
+import { Markdown, Status, ago, href, PlainRefs, useTick } from './ui';
 
 /**
  * The top of a task's page: what is happening now, so the user can step in while it happens. In order: open
- * requests (Needs you), the agents working on it this moment (Happening now), the newest status summary and
- * preview (Latest), and the last few notable changes (What changed). The header and the chat's docked bar
+ * requests (Needs you), the agents working on it this moment (Happening now), the newest status summary
+ * (Latest), and the last few notable changes (What changed). The header and the chat's docked bar
  * are separate pieces used by TaskPage (tasks.tsx). Everything here keeps a fixed shape so live updates do not
  * move the page under the reader's thumb.
  */
@@ -27,7 +27,7 @@ export function duration(ms: number): string {
 }
 
 /**
- * Running time while active ("started 14:02 · running 37 min"), what it took once done, and whether its driver finished
+ * Running time while active ("started 2:02 pm · running 37 min"), what it took once done, and whether its driver finished
  * and it awaits review or it has stalled: one component in sessions.tsx, shared with the task rows.
  */
 export { TaskTiming } from './sessions';
@@ -42,7 +42,7 @@ export function NeedsYou({ t, s, except }: { t: Task; s: ProjectState; except?: 
     <section className="now-needs" aria-label="Needs you">
       <h2 className="now-label">Needs you</h2>
       {open.map((r) => (
-        <InboxCard key={r.id} item={r} agentName={s.agents.find((a) => a.id === r.agent_id)?.name} />
+        <InboxCard key={r.id} item={r} agentName={s.agents.find((a) => a.id === r.agent_id)?.name} context={false} />
       ))}
     </section>
   );
@@ -64,8 +64,13 @@ export function actionText(e: AgentEvent): string {
   const sum = String(d.summary ?? '').trim();
   const of = (verb: string, what = sum) => (what ? `${verb} ${what}` : verb);
   switch (name) {
-    case 'Bash':
-      return of('Running', sum && `\`${sum}\``);
+    case 'Bash': {
+      // The plain words the agent gave the command, else the command without its leading "cd somewhere &&".
+      const said = /"description":\s*"((?:[^"\\]|\\.)*)"/.exec(String(d.input ?? ''))?.[1];
+      if (said) return said.replace(/\\(.)/g, '$1');
+      const cmd = sum.replace(/^cd \S+\s*&&\s*/, '');
+      return of('Running', cmd && `\`${cmd}\``);
+    }
     case 'Read':
       return of('Reading', shortPath(sum));
     case 'Edit':
@@ -118,13 +123,13 @@ export function actionText(e: AgentEvent): string {
 
 /** Calls the row already shows as its step and status line. */
 const QUIET = ['mcp__helm__report_status', 'mcp__helm__worklist_set', 'mcp__helm__worklist_update'];
-/** How many actions each agent's line shows. */
-const ACTIONS_SHOWN = 2;
+/** How many recent actions are kept per agent. */
+const ACTIONS_SHOWN = 5;
 /** At most one re-render per agent row in this interval, however fast events arrive. */
 const FLUSH_MS = 1500;
 
-/** The last few tool calls of each of `ids`, live, with updates throttled. */
-function useRecentActions(ids: string[]): Record<string, AgentEvent[]> {
+/** The last few tool calls (`keep`) of each of `ids`, live, with updates throttled. */
+export function useRecentActions(ids: string[], keep = ACTIONS_SHOWN): Record<string, AgentEvent[]> {
   const [actions, setActions] = useState<Record<string, AgentEvent[]>>({});
   const buffer = useRef<Record<string, AgentEvent[]>>({});
   const timer = useRef<number | null>(null);
@@ -162,7 +167,7 @@ function useRecentActions(ids: string[]): Record<string, AgentEvent[]> {
         const next = { ...cur };
         for (const [aid, evs] of Object.entries(add)) {
           const seen = new Map([...(cur[aid] ?? []), ...evs].map((e) => [e.id, e]));
-          next[aid] = [...seen.values()].sort((a, b) => a.id - b.id).slice(-ACTIONS_SHOWN);
+          next[aid] = [...seen.values()].sort((a, b) => a.id - b.id).slice(-keep);
         }
         return next;
       });
@@ -177,141 +182,103 @@ function useRecentActions(ids: string[]): Record<string, AgentEvent[]> {
 
 const BUSY = ['working', 'waiting'];
 
-/** One line per agent working on the task: its worklist step, status line and last actions. Fixed height per row. */
-export function HappeningNow({ agents, driverId, pid }: { agents: Agent[]; driverId?: string | null; pid: string }) {
-  const working = agents.filter((a) => BUSY.includes(a.status));
-  const actions = useRecentActions(working.map((a) => a.id));
-  if (!working.length) return null;
-  // The driver first, then the others in the order they joined; a quick helper right after the agent that asked.
-  const sorted = [...working].sort((a, b) => Number(b.id === driverId) - Number(a.id === driverId));
-  const caller = (h: Agent) => (h.quick ? sorted.find((a) => a.id === h.parent_id) : undefined);
-  const list = sorted.filter((a) => !caller(a)).flatMap((a) => [a, ...sorted.filter((h) => caller(h)?.id === a.id)]);
+/** How many actions open under an agent's line on the title card. */
+const ACTIONS_ON_TAP = 5;
+
+/**
+ * Every unfinished agent on the task, one per line, working ones first (then the driver): name, state, and for a
+ * working one what it is doing this moment, from its newest tool call ("Editing …/web/src/tasks.tsx · 2 min"), with
+ * its last five on tap. `max`: the title strip shows the first line only.
+ */
+export function TaskAgents({ agents, driverId, pid, max }: { agents: Agent[]; driverId?: string | null; pid: string; max?: number }) {
+  const on = agents.filter((a) => a.status !== 'closed' && a.status !== 'done');
+  const busy = (a: Agent) => BUSY.includes(a.status);
+  const sorted = [...on].sort((a, b) => Number(busy(b)) - Number(busy(a)) || Number(b.id === driverId) - Number(a.id === driverId));
+  const shown = sorted.slice(0, max ?? sorted.length);
+  const actions = useRecentActions(shown.filter(busy).map((a) => a.id), ACTIONS_ON_TAP);
+  useTick(30_000);
+  if (!shown.length) return null;
   return (
-    <section className="card now-live" aria-label="Happening now">
-      <h2 className="now-label">
-        <span className="status-dot dot-working pulse" /> Happening now
-      </h2>
-      {list.map((a) => {
-        // The step in hand: the newest one marked doing (an added step is usually what it just switched to), else the next to do.
-        const items = (a.checklist ?? []).filter((i) => i.state !== 'dropped');
-        const step = [...items].reverse().find((i) => i.state === 'doing') ?? items.find((i) => i.state === 'todo');
-        const total = items.length;
-        const at = step ? items.indexOf(step) : 0;
-        const recent = [...(actions[a.id] ?? [])].reverse();
-        return (
-          <div key={a.id} className={`now-agent ${a.quick ? 'quick' : ''}`}>
-            <div className="row now-agent-head">
-              <a className="now-agent-name" href={href('p', pid, 'agents', a.id)}>
-                {a.name}
-              </a>
-              <Status status={a.status} />
-              <span className="spacer" />
-              <a className="small now-transcript" href={href('p', pid, 'agents', a.id)}>
-                Transcript
-              </a>
-            </div>
-            {a.quick && !step ? null : (
-              <p className="now-line" title={step?.text}>
-                <span className="now-key">Step{total ? ` ${at + 1}/${total}` : ''}</span> {step ? <PlainRefs text={step.text} /> : <span className="muted">No worklist</span>}
-              </p>
-            )}
-            <p className="now-line muted" title={a.status_line ?? ''}>
-              {a.quick ? `Quick job${caller(a) ? ` for ${caller(a)!.name}` : ''}` : null}
-              {a.quick && a.status_line ? ' · ' : null}
-              {a.status_line ? <PlainRefs text={a.status_line} /> : a.quick ? null : ' '}
-            </p>
-            <ul className="now-actions">
-              {Array.from({ length: ACTIONS_SHOWN }, (_, i) => {
-                const e = recent[i];
-                return (
-                  <li key={i} className={`now-line mono-ish ${i === 0 ? 'newest' : ''}`} title={e ? actionText(e) : ''}>
-                    {e ? actionText(e) : ' '}
-                  </li>
-                );
-              })}
+    <div className="task-crew small">
+      {shown.map((a) => {
+        const recent = busy(a) ? [...(actions[a.id] ?? [])].reverse() : [];
+        const now = recent[0];
+        // Between turns with work in hand (server/busy.ts): what it waits on, not its last tool call.
+        const line = a.busy_between_turns ? a.status_line : now ? actionText(now) : '';
+        // How long since that action began, on the name's row so a long action never cuts it off.
+        const since = now ? duration(Date.now() - now.ts).replace('under a minute', 'just now') : '';
+        const head = (
+          <>
+            <a href={href('p', pid, 'agents', a.id)} onClick={(e) => e.stopPropagation()}>
+              {a.name}
+            </a>
+            <Status status={a.status} />
+            {since && <span className="muted">{since}</span>}
+          </>
+        );
+        const nowLine = line && <span className="task-agent-now one-line" title={line}>{line}</span>;
+        return recent.length > 1 && max === undefined ? (
+          <details key={a.id} className="task-agent-line">
+            <summary>
+              <span className="row">{head}</span>
+              {nowLine}
+            </summary>
+            <ul className="task-agent-recent">
+              {recent.slice(1).map((e) => (
+                <li key={e.id} className="one-line muted" title={actionText(e)}>
+                  {actionText(e)} · {ago(e.ts)}
+                </li>
+              ))}
             </ul>
+          </details>
+        ) : (
+          <div key={a.id} className="task-agent-line">
+            <span className="row">{head}</span>
+            {nowLine}
           </div>
         );
       })}
-    </section>
+    </div>
+  );
+}
+
+/** The commands running for the task now, one per line: what it is, the host of a heavy job, and how long so far. */
+export function TaskCommands({ commands }: { commands?: RunningCommand[] }) {
+  useTick(15_000);
+  if (!commands?.length) return null;
+  return (
+    <ul className="task-commands small">
+      {commands.map((c) => {
+        const what = c.label || c.command.replace(/^cd \S+\s*&&\s*/, '');
+        const took = duration(Date.now() - c.started_at).replace('under a minute', 'just started');
+        return (
+          <li key={c.id} title={c.command}>
+            <span className="one-line">{what}</span>
+            <span className="muted">
+              {c.host_name ? `${c.host_name} · ` : ''}
+              {took}
+              {c.expected_ms && c.expected_ms >= 60_000 ? ` of ~${Math.round(c.expected_ms / 60_000)} min` : ''}
+            </span>
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 
 // ---------- Latest ----------
 
-/** The newest status summary with its age, beside the newest preview (stacked on the phone). */
-export function Latest({ t, latest, pid, final = false }: { t: Task; latest: TaskDetail['latest']; pid: string; final?: boolean }) {
-  const shown = final ? latest : latest.slice(-1);
-  const more = latest.length - shown.length;
-  if (!t.status_summary && !shown.length) return null;
+/** The newest status summary with its age. Previews are not repeated here: the latest ones are pinned under For review. */
+export function Latest({ t, final = false }: { t: Task; final?: boolean }) {
+  if (!t.status_summary) return null;
   return (
-    <section className={`now-latest ${shown.length ? 'with-preview' : ''}`} aria-label="Latest">
-      <div className="card now-summary">
-        <span className="now-label">
-          {final ? 'Final status' : 'Latest status'}
-          {t.summary_at ? ` · ${ago(t.summary_at)}` : ''}
-        </span>
-        {t.status_summary ? <Markdown text={t.status_summary} /> : <p className="muted">No status written yet.</p>}
-      </div>
-      {shown.length > 0 && (
-        <div className="now-previews">
-          {shown.map((p) => (
-            <figure key={p.id} className="card task-latest-item now-preview">
-              <PreviewBody p={p} />
-              <figcaption>
-                <div className="row">
-                  <strong>{p.title}</strong>
-                  <span className="muted small">{ago(p.created_at)}</span>
-                  <span className="spacer" />
-                  <a className="small" href={href('p', pid, 'previews', p.id)}>
-                    Open
-                  </a>
-                </div>
-                {more > 0 && <p className="muted small">and {more} more posted with it, in the history below</p>}
-              </figcaption>
-            </figure>
-          ))}
-        </div>
-      )}
-    </section>
+    <Fold kind="status" title={`${final ? 'Final status' : 'Latest status'}${t.summary_at ? ` · ${ago(t.summary_at)}` : ''}`} className="now-summary" label="Latest status">
+      <Markdown text={t.status_summary} />
+    </Fold>
   );
 }
 
 // ---------- What changed ----------
-
-const CHANGE_ICON: Record<string, string> = {
-  state: 'play',
-  importance: 'top',
-  spec: 'spec',
-  decision: 'check',
-  milestone: 'check',
-  preview: 'previews',
-  question: 'inbox',
-  answer: 'return',
-  review: 'check',
-  interject: 'discuss',
-};
-
-export function WhatChanged({ changes, onJump }: { changes: TaskChange[]; onJump: (key: string) => void }) {
-  useTick(60000);
-  if (!changes.length) return null;
-  return (
-    <section className="card now-changes" aria-label="What changed">
-      <h2 className="now-label">What changed</h2>
-      <ul>
-        {changes.map((c) => (
-          <li key={c.key}>
-            <button className={`now-change ch-${c.kind}`} onClick={() => onJump(c.key)}>
-              <Icon name={CHANGE_ICON[c.kind] ?? 'history'} size={15} />
-              <span className="now-change-text">{c.text}</span>
-              <span className="now-change-ts muted small">{ago(c.ts)}</span>
-            </button>
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
 
 /** A labelled block of the plan (a planning task leads with it, above Approve's effects). */
 export function PlanBlock({ text, children }: { text: string; children?: ReactNode }) {

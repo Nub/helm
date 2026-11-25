@@ -1,27 +1,34 @@
 import { StrictMode, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { api, closeStream, setUnauthorizedHandler, useLive } from './api';
-import type { ApprovalPolicy, Meta, ProjectSummary, Structure } from './api';
+import type { Meta, ProjectSummary } from './api';
 import { HandoffPrompt, HandoffSheet } from './handoff';
-import { HostsPage } from './hosts';
+import { SystemPage } from './system';
 import { InstallEntry } from './install';
-import { NeedsYouPage } from './needs';
+import { GlobalHome } from './overview';
 import { NotificationsCard, startPush, useAppBadge, usePresence } from './notify';
+import { reportZone } from './timezone';
+import type { ZoneState } from './timezone';
 import type { NeedsAcross } from './needs';
-import { ApprovalPicker, AutonomyPicker, StructureEditor } from './more';
-import { ProjectPage } from './project';
+import { AutonomyPicker, PreviewHost } from './more';
+import { ErrorBadge, ProjectPage } from './project';
 import type { ProjectNav } from './project';
-import { ToolboxPage, toolboxRefresh } from './toolbox';
+import { openProjectSearch } from './search';
+import { KeyboardKeys } from './keyhost';
+import { prefetchPages } from './lazy';
 import { ProjectReorder } from './projectorder';
 import './styles.css';
 import { AnnotatorHost } from './annotate';
 import { ViewerHost } from './viewer';
-import { HelmPage, UpdateBanner, VersionFooter, useVersion } from './update';
-import { DiskBanner, DiskPage, useDiskStatus } from './disk';
+import { HelmPage, RunnerBanner, UpdateBanner, SideHelmLink, useVersion } from './update';
+import { SwitcherButton, SwitcherHost, lastProject, rememberProject } from './switcher';
+import { DiskBanner, useDiskStatus } from './disk';
 import type { VersionState } from './update';
 import { useRefRefresh } from './refcache';
 import { useKeyboardInset } from './keyboard';
-import { Empty, Icon, Progress, Tag, ago, go, href, useAction, useRoute, useTick , PlainRefs } from './ui';
+import { Empty, Icon, Tag, go, href, useAction, useRoute, useTick } from './ui';
+import { MODE_LABEL, ModeChip, ModeSheetHost, holdsWork } from './projectmode';
+import type { Mode } from './projectmode';
 
 function App() {
   const [authed, setAuthed] = useState<boolean | null>(null);
@@ -31,15 +38,24 @@ function App() {
       closeStream();
       setAuthed(false);
     });
-    api<{ authed: boolean; via?: string | null; signedInBy?: string | null }>('/api/session')
+    api<{ authed: boolean; via?: string | null; signedInBy?: string | null; timeZone?: ZoneState }>('/api/session')
       .then((d) => {
         setAuthed(d.authed);
+        if (d.authed) reportZone(d.timeZone);
         setAccess(d.via === 'lan' ? 'Local network, no sign-in' : d.via === 'sso' ? `Signed in through ${d.signedInBy || 'the sign-in gate'}` : null);
       })
       .catch(() => setAuthed(false));
   }, []);
   if (authed === null) return <div className="loading">Loading…</div>;
-  if (!authed) return <Login onDone={() => setAuthed(true)} />;
+  if (!authed)
+    return (
+      <Login
+        onDone={() => {
+          setAuthed(true);
+          api<{ timeZone?: ZoneState }>('/api/session').then((d) => reportZone(d.timeZone), () => {});
+        }}
+      />
+    );
   return <Shell access={access} />;
 }
 
@@ -79,15 +95,24 @@ function Shell({ access }: { access: string | null }) {
   // Notifications: the service worker and this device's subscription, what the page shows (so Helm does not notify
   // about it), and the app icon's badge.
   useEffect(() => startPush(), []);
+  // The lazy pages' chunks, fetched once the app is idle (lazy.tsx), so the first switch to one is instant.
+  useEffect(() => prefetchPages(), []);
   usePresence();
   useAppBadge(openCount);
-  // The global Inbox became Needs you; old links land there.
+  // The global Inbox became Needs you, and Needs you the top of the global Home; old links land on its requests.
   useEffect(() => {
-    if (route[0] === 'inbox') location.replace(href('needs'));
-  }, [route[0]]);
-  const toolbox = useLive<{ proposed: number }>('/api/toolbox/count', toolboxRefresh);
-  const proposed = toolbox.data?.proposed ?? 0;
+    if (route[0] === 'inbox' || route[0] === 'needs') location.replace(href('home', 'needs'));
+    // Hosts, Telemetry and Disk became sections of System.
+    else if (route[0] === 'hosts' || route[0] === 'telemetry') location.replace(href('system', route[0]));
+    // The Toolbox became System › Tools.
+    else if (route[0] === 'toolbox') location.replace(href('system', 'tools'));
+    else if (route[0] === 'helm' && route[1] === 'disk') location.replace(href('system', 'disk'));
+  }, [route[0], route[1]]);
   const current = route[0] === 'p' ? list.find((p) => p.id === route[1]) : undefined;
+  // The project Helm opens on next time (Landing).
+  useEffect(() => {
+    if (route[0] === 'p' && route[1]) rememberProject(route[1]);
+  }, [route[0], route[1]]);
   const version = useVersion();
   const disk = useDiskStatus();
   const [handoff, setHandoff] = useState(false);
@@ -100,33 +125,42 @@ function Shell({ access }: { access: string | null }) {
   }, [openCount, current?.name]);
 
   let page;
-  if (route[0] === 'p' && route[1]) page = <ProjectPage key={route[1]} id={route[1]} tab={route[2] ?? 'overview'} sub={route[3]} focus={route[4]} onNav={setProjectNav} />;
-  else if (route[0] === 'needs' || route[0] === 'inbox') page = <NeedsYouPage data={needs.data ?? null} />;
+  if (route[0] === 'p' && route[1]) page = <ProjectPage key={route[1]} id={route[1]} tab={route[2] ?? 'overview'} sub={route[3]} focus={route[4]} onNav={setProjectNav} version={version} />;
+  else if (route[0] === 'home') page = <GlobalHome section={route[1]} />;
+  else if (route[0] === 'needs' || route[0] === 'inbox') page = null;
   else if (route[0] === 'new') page = <NewProject />;
-  else if (route[0] === 'hosts') page = <HostsPage />;
-  else if (route[0] === 'toolbox') page = <ToolboxPage />;
-  else if (route[0] === 'helm') page = route[1] === 'disk' ? <DiskPage /> : <HelmPage v={version} />;
-  else page = <Home projects={projects.data ? list : null} openCount={openCount} access={access} version={version} onHandoff={() => setHandoff(true)} />;
+  else if (route[0] === 'system') page = <SystemPage section={route[1]} project={route[2]} />;
+  else if (route[0] === 'hosts' || route[0] === 'telemetry') page = null;
+  else if (route[0] === 'toolbox') page = null;
+  else if (route[0] === 'helm')
+    page =
+      route[1] === 'disk' ? null : (
+        <>
+          <HelmPage v={version} />
+          {/* This device's notifications and install, once on the All projects page. */}
+          <section className="helm-device">
+            <NotificationsCard />
+            <InstallEntry place="home" />
+            {access && <p className="muted small">{access}</p>}
+          </section>
+        </>
+      );
+  else page = <Landing projects={list} loaded={!!projects.data} />;
 
   return (
     <div className={`shell ${route[0] === 'p' ? 'in-project' : ''}`}>
       <AnnotatorHost />
       <ViewerHost />
+      <PreviewHost />
       <aside className="sidebar">
         <a className="brand" href={href()}>
           <img src="/icon.svg" alt="" width={26} height={26} /> Helm
         </a>
-        <a className={`side-link ${route[0] === 'needs' ? 'on' : ''}`} href={href('needs')}>
-          <Icon name="inbox" /> Needs you {openCount > 0 && <b className="badge">{openCount}</b>}
+        <a className={`side-link ${route[0] === 'home' ? 'on' : ''}`} href={href('home')}>
+          <Icon name="home" /> Home {openCount > 0 && <b className="badge">{openCount}</b>}
         </a>
-        <a className={`side-link ${route.length === 0 ? 'on' : ''}`} href={href()}>
-          <Icon name="home" /> All projects
-        </a>
-        <a className={`side-link ${route[0] === 'hosts' ? 'on' : ''}`} href={href('hosts')}>
-          <Icon name="hosts" /> Hosts
-        </a>
-        <a className={`side-link ${route[0] === 'toolbox' ? 'on' : ''}`} href={href('toolbox')}>
-          <Icon name="toolbox" /> Toolbox {proposed > 0 && <b className="badge">{proposed}</b>}
+        <a className={`side-link ${route[0] === 'system' ? 'on' : ''}`} href={href('system')}>
+          <Icon name="hosts" /> System
         </a>
         <div className="side-label">Projects</div>
         <ProjectReorder
@@ -136,9 +170,11 @@ function Shell({ access }: { access: string | null }) {
           render={(p, handle) => (
             <div className="side-project">
               {handle}
-              <a className={`side-link project-link ${current?.id === p.id ? 'on' : ''}`} href={href('p', p.id, 'overview')} aria-label={`${p.name}${p.working ? ', working now' : ''}${p.openInbox ? `, ${p.openInbox} waiting on you` : ''}`}>
-                <span className={`status-dot ${p.working ? 'dot-working pulse' : p.openInbox ? 'dot-waiting' : ''}`} />
+              <a className={`side-link project-link ${current?.id === p.id ? 'on' : ''}`} href={href('p', p.id, 'overview')} aria-label={`${p.name}${p.working ? ', working now' : ''}${p.openInbox ? `, ${p.openInbox} waiting on you` : ''}${p.errored ? `, ${p.errored} stopped with an error` : ''}`}>
+                <span className={`status-dot ${p.working ? 'dot-working pulse' : p.errored ? 'dot-error' : p.openInbox ? 'dot-waiting' : ''}`} />
                 <span className="one-line">{p.name}</span>
+                {holdsWork(p.mode) && <span className={`tag mode-chip mode-${p.mode} mini`} title={MODE_LABEL[p.mode as Mode]}><span className="mode-dot" aria-hidden="true" /></span>}
+                {!!p.errored && <ErrorBadge n={p.errored} />}
                 {p.openInbox > 0 && <b className="badge">{p.openInbox}</b>}
               </a>
             </div>
@@ -150,39 +186,44 @@ function Shell({ access }: { access: string | null }) {
         <button className="side-link side-handoff" onClick={() => setHandoff(true)}>
           <Icon name="external" /> Bring in an existing session
         </button>
-        <VersionFooter v={version} className="side-version" />
+        <SideHelmLink v={version} on={route[0] === 'helm'} />
       </aside>
 
       <header className="topbar">
-        {route.length > 0 ? (
+        {route.length > 0 && !(route[0] === 'p' && !route[3]) ? (
           <a className="icon-btn" href={route[0] === 'p' && route[3] ? href('p', route[1], route[2]) : href()} aria-label="Back">
-            <Icon name="back" size={22} />
+            <Icon name="back" size={20} />
           </a>
         ) : (
           <img src="/icon.svg" alt="" width={28} height={28} />
         )}
-        <strong className="one-line">{current?.name ?? (route[0] === 'needs' ? 'Needs you' : route[0] === 'new' ? 'New project' : route[0] === 'hosts' ? 'Hosts' : route[0] === 'toolbox' ? 'Toolbox' : 'Helm')}</strong>
-        {nav && nav.progress !== null && <span className="bar-pct mono" aria-hidden="true">{nav.progress}%</span>}
+        {current ? <SwitcherButton name={current.name} /> : <strong className="one-line">{(route[0] === 'home' ? 'Home' : route[0] === 'new' ? 'New project' : route[0] === 'system' ? 'System' : route[0] === 'toolbox' ? 'Toolbox' : 'Helm')}</strong>}
         <span className="spacer" />
-        {/* Inside a project, Hosts, Toolbox and Helm are under its More (the top bar keeps back, the name and Needs you). */}
+        {nav && nav.progress !== null && <span className="bar-pct mono" aria-hidden="true">{nav.progress}%</span>}
+        {/* In a project, right-aligned beside Needs you: its mode and what it is doing, the menu that changes it (projectmode.tsx). */}
+        {nav && current && <ModeChip projectId={current.id} mode={current.mode} working={current.working} queued={current.queued} className="bar-mode" />}
+        {/* Inside a project, Hosts and Helm are under its More (the top bar keeps back, the name and Needs you). */}
+        {/* Not the page you are on: its button would only crowd out the page's name on a phone. */}
         {!nav && (
           <>
-            <a className="icon-btn" href={href('toolbox')} aria-label={`Toolbox, ${proposed} proposed`}>
-              <Icon name="toolbox" size={22} />
-              {proposed > 0 && <b className="badge">{proposed}</b>}
-              <span className="bar-cap" aria-hidden="true">Toolbox</span>
-            </a>
-            <a className="icon-btn" href={href('hosts')} aria-label="Hosts">
-              <Icon name="hosts" size={22} />
-              <span className="bar-cap" aria-hidden="true">Hosts</span>
-            </a>
+            {route[0] !== 'system' && <a className="icon-btn" href={href('system')} aria-label="System">
+              <Icon name="hosts" size={20} />
+              <span className="bar-cap" aria-hidden="true">System</span>
+            </a>}
           </>
         )}
-        <a className="icon-btn" href={href('needs')} aria-label={`Needs you, ${openCount} open ${openCount === 1 ? 'request' : 'requests'}`}>
-          <Icon name="inbox" size={22} />
+        {/* In a project: its search (search.tsx). On Home it shows only where Home's own field is folded away (styles.css). */}
+        {nav && (
+          <button type="button" className="icon-btn bar-search" onClick={openProjectSearch} aria-label="Search this project">
+            <Icon name="search" size={20} />
+            <span className="bar-cap" aria-hidden="true">Search</span>
+          </button>
+        )}
+        {route[0] !== 'home' && <a className="icon-btn" href={href('home')} aria-label={`Needs you, ${openCount} open ${openCount === 1 ? 'request' : 'requests'}`}>
+          <Icon name="inbox" size={20} />
           {openCount > 0 && <b className="badge">{openCount}</b>}
           <span className="bar-cap" aria-hidden="true">Needs you</span>
-        </a>
+        </a>}
         {/* The project's overall progress, a slim line along the bar's bottom edge on every project page. */}
         {nav && nav.progress !== null && (
           <div className="bar-progress" role="progressbar" aria-label="Project progress" aria-valuenow={nav.progress} aria-valuemin={0} aria-valuemax={100} aria-valuetext={`${nav.progress}%`}>
@@ -191,122 +232,40 @@ function Shell({ access }: { access: string | null }) {
         )}
       </header>
 
+      <ModeSheetHost />
+      <KeyboardKeys />
       <main className="main">
         <UpdateBanner v={version} />
         <DiskBanner s={disk.data} />
+        {!version.restarting && <RunnerBanner />}
         {page}
       </main>
       {handoff && <HandoffSheet onClose={() => setHandoff(false)} />}
+      <SwitcherHost projects={list} current={current?.id} onHandoff={() => setHandoff(true)} />
     </div>
   );
 }
 
-// ---------- home ----------
+// ---------- landing ----------
 
-/** Whether the desktop layout (sidebar) is showing: matches the 900 px breakpoint in styles.css. */
-function useWide() {
-  const q = '(min-width: 900px)';
-  const [wide, setWide] = useState(() => matchMedia(q).matches);
-  useEffect(() => {
-    const m = matchMedia(q);
-    const on = () => setWide(m.matches);
-    m.addEventListener('change', on);
-    return () => m.removeEventListener('change', on);
-  }, []);
-  return wide;
-}
-
-function Home({ projects, openCount, access, version, onHandoff }: { projects: ProjectSummary[] | null; openCount: number; access: string | null; version: VersionState; onHandoff: () => void }) {
-  const wide = useWide();
-  if (!projects) return <div className="loading">Loading…</div>;
+/**
+ * Helm opens on the last project opened on this device (the first one if none): the project switcher in the top bar
+ * replaced the All projects page. With no project yet: a start.
+ */
+function Landing({ projects, loaded }: { projects: ProjectSummary[]; loaded: boolean }) {
   const active = projects.filter((p) => !p.archived);
-  const archived = projects.filter((p) => p.archived);
+  const last = lastProject();
+  const target = active.find((p) => p.id === last) ?? active[0];
+  useEffect(() => {
+    if (target) location.replace(href('p', target.id, 'overview'));
+  }, [target?.id]);
+  if (!loaded || target) return <div className="loading">Loading…</div>;
   return (
     <section className="home">
-      <div className="section-head">
-        <h1 className="page-title">Projects</h1>
-        <a className="btn primary" href={href('new')}>
-          <Icon name="plus" size={16} /> New project
-        </a>
-      </div>
-      {openCount > 0 && (
-        <a className="needs-banner" href={href('needs')}>
-          <Icon name="inbox" />
-          <span>
-            <strong>
-              {openCount} {openCount === 1 ? 'request is' : 'requests are'} waiting on you
-            </strong>
-            <span className="muted small">Answering them unblocks the agents that asked.</span>
-          </span>
-          <Icon name="chevron" />
-        </a>
-      )}
-      {active.length === 0 && (
-        <Empty title="No projects yet">
-          Start one from scratch, point Helm at a folder you already have, or clone a repository. <a href={href('new')}>Create a project</a>
-        </Empty>
-      )}
-      {/* On a phone or tablet this is the list to reorder; on desktop the sidebar is. */}
-      <ProjectReorder
-        items={active}
-        gap={14}
-        className="project-grid project-order"
-        disabled={wide}
-        render={(p, handle) => (
-          <div className="project-slot">
-            <ProjectCard p={p} />
-            {handle}
-          </div>
-        )}
-      />
-      {archived.length > 0 && (
-        <details className="handled-list">
-          <summary>Archived ({archived.length})</summary>
-          <div className="project-grid">
-            {archived.map((p) => (
-              <ProjectCard key={p.id} p={p} />
-            ))}
-          </div>
-        </details>
-      )}
-      <NotificationsCard />
-      <InstallEntry place="home" />
-      <div className="home-foot">
-        <button className="btn small quiet" onClick={onHandoff}>
-          Bring in an existing session
-        </button>
-        <VersionFooter v={version} />
-        {access && <p className="muted small">{access}</p>}
-      </div>
+      <Empty title="No projects yet">
+        <a href={href('new')}>Create a project</a>
+      </Empty>
     </section>
-  );
-}
-
-function ProjectCard({ p }: { p: ProjectSummary }) {
-  return (
-    <a className="card project-card" href={href('p', p.id, 'overview')}>
-      <div className="row wrap">
-        <Tag tone="tone-phase">{p.phase}</Tag>
-        {p.openInbox > 0 && <Tag tone="tone-warning">{p.openInbox} waiting on you</Tag>}
-        {!!p.unfiledNeeds && <Tag tone="tone-serious">{p.unfiledNeeds} {p.unfiledNeeds === 1 ? 'says' : 'say'} it needs you, nothing filed</Tag>}
-        <span className="spacer" />
-        <span className="muted small">{ago(p.updated_at)}</span>
-      </div>
-      <h2 className="project-name">{p.name}</h2>
-      <p className="muted clamp" style={{ ['--lines' as any]: 2 }}>
-        {p.description || p.path}
-      </p>
-      {p.progress !== null && (
-        <div className="overall">
-          <Progress value={p.progress} tone={p.working ? 'live' : ''} />
-          <span className="mono small">{p.progress}%</span>
-        </div>
-      )}
-      <p className="small one-line">
-        <span className={`status-dot ${p.working ? 'dot-working pulse' : ''}`} /> {p.working ? `${p.working} of ${p.agents} working` : `${p.agents} ${p.agents === 1 ? 'agent' : 'agents'}, none working`}
-        {p.statusLine && <span className="muted"> · <PlainRefs text={p.statusLine} /></span>}
-      </p>
-    </a>
   );
 }
 
@@ -342,14 +301,14 @@ function FolderPicker({ value, onChange, start }: { value: string; onChange: (p:
           {listing.parent && (
             <li>
               <button type="button" onClick={() => load(listing.parent!)}>
-                <Icon name="back" size={15} /> Up one level
+                <Icon name="back" size={16} /> Up one level
               </button>
             </li>
           )}
           {listing.dirs.map((d) => (
             <li key={d.path}>
               <button type="button" onClick={() => load(d.path)}>
-                <Icon name="folder" size={15} /> <span className="one-line">{d.name}</span>
+                <Icon name="folder" size={16} /> <span className="one-line">{d.name}</span>
                 {d.git && <Tag>git</Tag>}
               </button>
             </li>
@@ -373,17 +332,12 @@ function NewProject() {
   const [path, setPath] = useState('');
   const [gitUrl, setGitUrl] = useState('');
   const [brief, setBrief] = useState('');
-  const [templateId, setTemplateId] = useState('director-crew');
   const [autonomy, setAutonomy] = useState('auto');
-  const [custom, setCustom] = useState<Structure | null>(null);
-  const [approval, setApproval] = useState<ApprovalPolicy>('none');
   const { busy, error, run } = useAction();
 
-  const template = meta?.templates.find((t) => t.id === templateId);
   const create = () =>
     run(async () => {
-      const { id } = await api<{ id: string }>('/api/projects', { body: { mode, name, path, gitUrl, brief, templateId, autonomy, approval } });
-      if (custom) await api(`/api/projects/${id}`, { method: 'PATCH', body: { structure: { ...custom, approval } } });
+      const { id } = await api<{ id: string }>('/api/projects', { body: { mode, name, path, gitUrl, brief, autonomy } });
       go('p', id, 'overview');
     });
   const ready = mode === 'new' ? !!name.trim() : mode === 'existing' ? !!path : !!gitUrl.trim();
@@ -435,34 +389,6 @@ function NewProject() {
           <textarea rows={6} value={brief} onChange={(e) => setBrief(e.target.value)} placeholder="What should this project achieve? What matters most, what is out of scope, how will you know it is done?" />
         </label>
       </div>
-
-      <h2>Team</h2>
-      <div className="radio-cards">
-        {meta?.templates.map((t) => (
-          <label key={t.id} className={`radio-card ${templateId === t.id && !custom ? 'on' : ''}`}>
-            <input
-              type="radio"
-              name="template"
-              checked={templateId === t.id && !custom}
-              onChange={() => {
-                setTemplateId(t.id);
-                setCustom(null);
-              }}
-            />
-            <strong>{t.name}</strong>
-            <span>{t.description}</span>
-          </label>
-        ))}
-      </div>
-      {template && (
-        <details className="handled-list" onToggle={(e) => (e.target as HTMLDetailsElement).open && !custom && setCustom(structuredClone(template.structure))}>
-          <summary>Customize roles, models and who can delegate</summary>
-          {custom && <StructureEditor value={custom} onChange={setCustom} meta={meta} />}
-        </details>
-      )}
-
-      <h2>When the director changes the team</h2>
-      <ApprovalPicker value={approval} onChange={setApproval} />
 
       <h2>How much agents may do without asking</h2>
       <AutonomyPicker value={autonomy} onChange={setAutonomy} />

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { clearDraft, useStoredText } from './drafts';
 import { api, useLive } from './api';
 import type { Doc, ProjectState, Proposal } from './api';
 import { DiffText, docStatusLabel } from './spec';
@@ -37,7 +38,7 @@ export function entryOfDiscussion(s: ProjectState, discussionId: string): Doc | 
 export function DiscussButton({ d }: { s: ProjectState; d: Doc; director: string }) {
   return (
     <button className="btn quiet" onClick={() => openChat({ kind: 'doc', id: d.id })}>
-      <Icon name="discuss" size={15} /> Discuss
+      <Icon name="discuss" size={16} /> Discuss
     </button>
   );
 }
@@ -48,7 +49,7 @@ export function DiscussingMarker({ s, d }: { s: ProjectState; d: Doc }) {
   if (!open) return null;
   return (
     <a className="spec-discussing small" href={href('p', s.project.id, 'discussions', open.id)} onClick={(e) => e.stopPropagation()}>
-      <Icon name="discuss" size={13} /> Discussing · {open.messages} {open.messages === 1 ? 'message' : 'messages'}
+      <Icon name="discuss" size={16} /> Discussing · {open.messages} {open.messages === 1 ? 'message' : 'messages'}
     </a>
   );
 }
@@ -67,7 +68,7 @@ export function SpecEntryCard({ s, discussionId }: { s: ProjectState; discussion
   return (
     <section className={`spec-disc-entry ${open ? 'open' : ''}`}>
       <button className="spec-disc-entry-head" onClick={() => setOpen(!open)} aria-expanded={open}>
-        <Icon name="chevron" size={14} />
+        <Icon name="chevron" size={16} />
         <span>
           <span className="label">About the Spec entry · as it is now</span>
           <b>{d.title}</b>
@@ -79,7 +80,7 @@ export function SpecEntryCard({ s, discussionId }: { s: ProjectState; discussion
           <div className="row wrap">
             <Tag tone={`doc-st st-${d.status}`}>{docStatusLabel(d.status)}</Tag>
             {d.tags.map((t) => (
-              <span key={t} className="spec-tag small">
+              <span key={t} className="tag tone-blue mono">
                 #{t}
               </span>
             ))}
@@ -142,13 +143,13 @@ export function ProposalCard({ body, ts, projectId }: { body: string; ts: number
   const { data: p, error: loadError } = useLive<Proposal>(id ? `/api/proposals/${id}` : null, (m) => m.type === 'project' && m.projectId === projectId);
   const { busy, error, run } = useAction();
   const [declining, setDeclining] = useState(false);
-  const [note, setNote] = useState('');
+  const [note, setNote] = useStoredText(`proposal-note:${id}`);
   if (loadError) return <div className="tl-card error-text">{loadError}</div>;
   if (!p) return <div className="tl-card muted small">Loading the proposed edit…</div>;
   const st = STATUS[p.status] ?? STATUS.closed;
   const live = p.status === 'open';
   const apply = (wording_only: boolean) => void run(() => api(`/api/proposals/${p.id}/apply`, { body: { wording_only } }));
-  const decline = () => void run(() => api(`/api/proposals/${p.id}/decline`, { body: { note } }));
+  const decline = () => void run(async () => { await api(`/api/proposals/${p.id}/decline`, { body: { note } }); clearDraft(`proposal-note:${id}`); });
   return (
     <div className={`tl-card tl-proposal prop-${p.status}`}>
       <span className="msg-meta">
@@ -195,11 +196,11 @@ export function ProposalCard({ body, ts, projectId }: { body: string; ts: number
       )}
       {p.status === 'declined' && <p className="small muted">You declined it{p.note ? `: ${p.note}` : '.'}</p>}
       {p.status === 'superseded' && <p className="small muted">A newer proposal for this entry replaced it.</p>}
-      {p.status === 'closed' && <p className="small muted">The discussion was settled before it was applied.</p>}
+      {p.status === 'closed' && <p className="small muted">The discussion was closed before it was applied.</p>}
       {live && !declining && (
         <div className="row wrap prop-actions">
           <button className="btn primary small" disabled={busy || p.stale.length > 0 || !p.doc_exists} onClick={() => apply(false)}>
-            <Icon name="check" size={14} /> Apply
+            <Icon name="check" size={16} /> Apply
           </button>
           <button
             className="btn small"

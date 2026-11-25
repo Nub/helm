@@ -1,25 +1,36 @@
+import { SwitcherButton } from './switcher';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, api, useAgentEvents, useLive } from './api';
 import type { Agent, AgentEvent, ProjectState } from './api';
 import { InboxCard } from './inbox';
 import { requestHref, useFocusRequest } from './needs';
 import { HostBadges } from './hosts';
-import { History, Previews, Setup } from './more';
-import { ReportsPage } from './reports';
+import { Setup } from './more';
 import { SpecPage } from './spec';
 import { TaskPage } from './tasks';
 import { Team } from './team';
-import { AgentToolboxLine } from './toolbox';
-import { toolboxRefresh } from './toolbox';
+import { lazyNamed, loadDashboards, loadIdeas, loadReleases, loadReports, loadToolbox } from './lazy';
+import type { ProjectState as PS } from './api';
+// Pages and pieces loaded on first use (lazy.tsx): each its own chunk.
+const PageLoading = <div className="loading">Loading…</div>;
+const ReportsPage = lazyNamed<{ s: PS; sub?: string }>(loadReports, 'ReportsPage', PageLoading);
+const DashboardsPage = lazyNamed<{ s: PS; sub?: string }>(loadDashboards, 'DashboardsPage', PageLoading);
+const IdeasPage = lazyNamed<{ s: PS }>(loadIdeas, 'IdeasPage', PageLoading);
+import { GalleryPage } from './gallery';
+const ShipPage = lazyNamed<{ s: PS; sub?: string; helm?: import('react').ReactNode }>(loadReleases, 'ShipPage', PageLoading);
+const AgentToolboxLine = lazyNamed<{ agent: import('./api').Agent }>(loadToolbox, 'AgentToolboxLine');
 import { AttachmentList } from './attachments';
-import { roleAnchor } from './roles';
-import { PresenceBar } from './sessions';
 import { seedRefs } from './refcache';
-import { ChatHost, routeContext } from './chat';
+import { ChatHost, focusChatAt, routeContext } from './chat';
 import { ProjectHome, triageCards } from './home';
+import { SearchShortcut } from './search';
 import { WorkPage, workFilter } from './work';
-import { Clamp, Composer, Empty, Icon, Markdown, Progress, Sheet, Status, Tag, clock, href, modelLabel, useAction, useTick, PlainRefs } from './ui';
+import { Clamp, Composer, Empty, Icon, Markdown, Progress, Sheet, Status, Tag, clock, href, modelLabel, runLabel, useAction, useTick, PlainRefs } from './ui';
 import { DecisionsPage } from './decisions';
+import { ModeChip, StoppedBar } from './projectmode';
+import { tokensText } from './usage.ts';
+import { HelmUpdate } from './update';
+import type { VersionState } from './update';
 
 /**
  * A project's pages. On a phone the bottom bar is Home, Work, Spec and More (a sheet with the rest and the
@@ -30,16 +41,33 @@ const MAIN = [
   { id: 'overview', label: 'Home', icon: 'home' },
   { id: 'work', label: 'Work', icon: 'tasks' },
   { id: 'spec', label: 'Spec', icon: 'spec' },
+  // Shown only while the project's Dashboards setting is on (or it has dashboards, or one is open).
+  { id: 'dashboards', label: 'Dashboards', icon: 'dashboards' },
 ];
 const MORE = [
+  { id: 'ideas', label: 'Ideas' },
+  { id: 'gallery', label: 'Gallery' },
+  { id: 'ship', label: 'Ship' },
   { id: 'agents', label: 'Agents' },
-  { id: 'previews', label: 'Previews' },
-  { id: 'history', label: 'History' },
   { id: 'reports', label: 'Reports' },
   { id: 'setup', label: 'Setup' },
 ];
+/**
+ * Pages folded into others, and where their old links land: Knowledge into Setup, the History journal into Home,
+ * Watches into System (with this project), Previews onto their tasks (a link with an id is the viewer, more.tsx
+ * PreviewHost; without one, Home, where search finds them).
+ */
+export function movedPage(id: string, tab: string, sub?: string): string | null {
+  if (tab === 'knowledge') return href('p', id, 'setup', 'knowledge');
+  if (tab === 'history') return sub ? href('p', id, 'overview', 'journal', sub) : href('p', id, 'overview', 'journal');
+  if (tab === 'watches') return href('system', 'watches', id);
+  if (tab === 'previews' && !sub) return href('p', id, 'gallery');
+  // Releases is a section of Ship (with test builds, and Helm's update for Helm's own project).
+  if (tab === 'releases') return sub ? href('p', id, 'ship', sub) : href('p', id, 'ship');
+  return null;
+}
 /** Which bottom-bar entry a page belongs to. */
-const sectionOf = (tab: string) => (tab === 'overview' ? 'overview' : tab === 'work' || tab === 'tasks' || tab === 'discussions' ? 'work' : tab === 'spec' ? 'spec' : 'more');
+const sectionOf = (tab: string) => (tab === 'overview' ? 'overview' : tab === 'work' || tab === 'tasks' || tab === 'discussions' ? 'work' : tab === 'spec' || tab === 'dashboards' ? tab : 'more');
 
 const FINISHED = ['done', 'closed'];
 
@@ -53,16 +81,18 @@ export function overallProgress(agents: Agent[]): number | null {
 export type ProjectNav = { id: string; progress: number | null };
 
 /**
- * The desktop's sticky project row (name, phase, progress, tabs) must never overflow. It tries the roomiest
- * form first and steps down until it fits: tabs with icon and label (0), labels only (1), tighter with no
- * phase tag (2), icons only (3).
- * The label stays for screen readers. Below 900 px the row is the phone's bottom bar and this does nothing.
+ * The desktop's sticky project row (name, progress, tabs) must never overflow. It tries the roomiest
+ * form first and steps down until it fits: every tab with icon and label (0), More's pages folded into a labelled
+ * More with the page shown kept as its own tab (1), tighter (2), labels without icons (3).
+ * Below 900 px the row is the phone's bottom bar and this does nothing.
  */
 function useFitRow() {
   const ref = useRef<HTMLElement>(null);
   const fit = () => {
     const el = ref.current;
     if (!el || innerWidth < 900) return;
+    // Its height, for what sticks under it (the task page's title strip).
+    document.documentElement.style.setProperty('--project-row', `${el.offsetHeight}px`);
     for (const level of ['0', '1', '2', '3']) {
       el.dataset.fit = level;
       if (el.scrollWidth <= el.clientWidth) break;
@@ -81,13 +111,22 @@ function useFitRow() {
   return ref;
 }
 
-export function ProjectPage({ id, tab, sub, focus, onNav }: { id: string; tab: string; sub?: string; focus?: string; onNav?: (n: ProjectNav | null) => void }) {
+/** `version`: Helm's own version and update (update.tsx), shown in Ship for Helm's own project. */
+export function ProjectPage({ id, tab, sub, focus, onNav, version }: { id: string; tab: string; sub?: string; focus?: string; onNav?: (n: ProjectNav | null) => void; version?: VersionState }) {
   useTick();
   // The Inbox tab is gone: its old links open Work filtered to Needs response.
   useEffect(() => {
     if (tab === 'inbox') location.replace(href('p', id, 'work', 'needs'));
-  }, [tab, id]);
+    const moved = movedPage(id, tab, sub);
+    if (moved) location.replace(moved);
+  }, [tab, id, sub]);
   useFocusRequest(focus);
+  // A chat message (a search hit, #/p/<project>/chat/<event id>): Home, with the chat open at it (chat.tsx).
+  useEffect(() => {
+    if (tab !== 'chat' || !sub) return;
+    focusChatAt(id, sub);
+    location.replace(href('p', id));
+  }, [tab, sub, id]);
   // A notification's stable route to a request (#/p/<project>/request/<id>): find where it is shown now and replace
   // this history entry with that page, scrolled to it. Gone: the project's Needs response list. A phone just woken
   // may be offline for a moment, so other failures are retried for a while first; signed out, the sign-in shows and
@@ -132,20 +171,21 @@ export function ProjectPage({ id, tab, sub, focus, onNav }: { id: string; tab: s
   if (error && !data) return <Empty title="Could not load this project">{error}</Empty>;
   if (!data) return <div className="loading">Loading…</div>;
   const reportCount = data.reports.new + data.reports.needs_input;
+  // Agents stopped with an error (server/agenterrors.ts): a red badge on Agents, and on More on the phone.
+  const errored = data.agents.filter((a) => a.status === 'error').length;
   const section = sectionOf(active);
   const needs = triageCards(data).length;
   const detail = (active === 'tasks' || active === 'discussions') && !!sub && sub !== 'recent' && sub !== 'needs';
-  const moreTabs = MORE.filter((t) => t.id !== 'reports' || data.reports.sources > 0 || data.reports.total > 0 || active === 'reports');
+  const moreTabs = MORE.filter((t) => (t.id !== 'reports' || data.reports.sources > 0 || data.reports.total > 0 || active === 'reports') && (t.id !== 'ship' || data.own_helm || data.releases?.on !== false || (data.releases?.count ?? 0) > 0 || active === 'ship'));
+  const mainTabs = MAIN.filter((t) => t.id !== 'dashboards' || data.dashboards?.on !== false || (data.dashboards?.count ?? 0) > 0 || active === 'dashboards');
 
   return (
     <div className={`project page-${active}`}>
       <nav className="tabs" aria-label="Project sections" ref={rowRef}>
         {/* Desktop only: the project's name and progress stay in view on every page. */}
         <div className="tabs-project">
-          <strong className="one-line" title={data.project.name}>
-            {data.project.name}
-          </strong>
-          <Tag tone="tone-phase">{data.project.phase}</Tag>
+          <SwitcherButton name={data.project.name} />
+          <ModeChip projectId={data.project.id} mode={data.mode?.mode} working={data.agents.filter((a) => a.status === 'working').length} queued={data.tasks.filter((t) => t.state === 'scheduled' || t.state === 'active').length} />
           {progress !== null && (
             <span className="tabs-progress">
               <Progress value={progress} />
@@ -153,12 +193,12 @@ export function ProjectPage({ id, tab, sub, focus, onNav }: { id: string; tab: s
             </span>
           )}
         </div>
-        {MAIN.map((t) => {
+        {mainTabs.map((t) => {
           const on = section === t.id;
           return (
             <a key={t.id} href={href('p', id, t.id)} className={on ? 'tab on' : 'tab'} aria-current={on ? 'page' : undefined} aria-label={t.id === 'overview' && needs ? `Home, ${needs} ${needs === 1 ? 'thing needs' : 'things need'} you` : undefined}>
               <span className="tab-icon">
-                <Icon name={t.icon} size={22} />
+                <Icon name={t.icon} size={20} />
                 {t.id === 'overview' && needs > 0 && <b className="badge">{needs > 99 ? '99+' : needs}</b>}
               </span>
               <span className="tab-label">{t.label}</span>
@@ -172,42 +212,56 @@ export function ProjectPage({ id, tab, sub, focus, onNav }: { id: string; tab: s
             <span className="tab-icon">
               <Icon name={t.id} size={20} />
               {t.id === 'reports' && reportCount > 0 && <b className="badge">{reportCount > 99 ? '99+' : reportCount}</b>}
+              {t.id === 'agents' && errored > 0 && <ErrorBadge n={errored} />}
             </span>
             <span className="tab-label">{t.label}</span>
           </a>
         ))}
         {/* Phone: More opens a sheet. */}
-        <button className={`tab tab-more ${section === 'more' ? 'on' : ''}`} onClick={() => setMore(true)} aria-haspopup="dialog" aria-current={section === 'more' ? 'page' : undefined}>
+        <button className={`tab tab-more ${section === 'more' ? 'on' : ''}`} onClick={() => setMore(true)} aria-haspopup="dialog" aria-label={errored ? `More, ${errored} ${errored === 1 ? 'agent' : 'agents'} stopped with an error` : undefined} aria-current={section === 'more' ? 'page' : undefined}>
           <span className="tab-icon">
-            <Icon name="more" size={22} />
-            {reportCount > 0 && <b className="badge">{reportCount > 99 ? '99+' : reportCount}</b>}
+            <Icon name="more" size={20} />
+            {errored > 0 ? <ErrorBadge n={errored} /> : reportCount > 0 && <b className="badge">{reportCount > 99 ? '99+' : reportCount}</b>}
           </span>
           <span className="tab-label">More</span>
         </button>
       </nav>
-      {active !== 'overview' && <PresenceBar s={data} />}
+      {active !== 'overview' && data.mode?.mode === 'stopped' && <StoppedBar s={data} />}
       <div className="project-body">
-        {active === 'overview' && <ProjectHome s={data} />}
+        {active === 'overview' && <ProjectHome s={data} journal={sub === 'journal' ? (focus ?? '') : undefined} />}
         {active === 'request' && <div className="loading">Opening the request…</div>}
+        {active === 'chat' && <div className="loading">Opening the chat…</div>}
         {active === 'spec' && <SpecPage s={data} focus={sub} />}
         {(active === 'work' || active === 'tasks' || active === 'discussions') &&
           (detail ? <TaskPage key={sub} s={data} taskId={sub!} tab={active === 'discussions' ? 'discussions' : 'tasks'} /> : <WorkPage s={data} filter={workFilter(active, sub)} recent={sub === 'recent'} />)}
         {active === 'agents' && (sub ? <AgentDetail s={data} agentId={sub} /> : <Team s={data} page />)}
         {active === 'reports' && <ReportsPage s={data} sub={sub} />}
-        {active === 'previews' && <Previews s={data} openId={sub} />}
-        {active === 'history' && <History s={data} focus={sub} />}
+        {active === 'dashboards' && <DashboardsPage s={data} sub={sub} />}
+        {active === 'ship' && <ShipPage s={data} sub={sub} helm={data.own_helm && version ? <HelmUpdate v={version} /> : null} />}
+        {active === 'previews' && <div className="loading">Opening the preview…</div>}
+        {active === 'gallery' && <GalleryPage s={data} />}
+        {active === 'ideas' && <IdeasPage s={data} />}
         {active === 'setup' && (sub === 'decisions' ? <DecisionsPage s={data} /> : <Setup s={data} focus={sub} />)}
       </div>
-      <ChatHost s={data} page={routeContext(data, active, sub)} />
-      {more && <MoreSheet s={data} tabs={moreTabs} active={active} reportCount={reportCount} onClose={() => setMore(false)} />}
+      {/* An agent's page has its own composer to that agent; the director's chat bar would cover it. */}
+      {!(active === 'agents' && sub) && <ChatHost s={data} page={routeContext(data, active, sub)} />}
+      <SearchShortcut s={data} />
+      {more && <MoreSheet s={data} tabs={moreTabs} active={active} reportCount={reportCount} errored={errored} onClose={() => setMore(false)} />}
     </div>
   );
 }
 
+/** How many agents stopped with an error: the badge, in red, with a label for screen readers. */
+export function ErrorBadge({ n }: { n: number }) {
+  return (
+    <b className="badge badge-error" title={`${n} ${n === 1 ? 'agent' : 'agents'} stopped with an error`}>
+      {n > 99 ? '99+' : n}
+    </b>
+  );
+}
+
 /** The phone's More: the project's other pages, then the install-wide ones. */
-function MoreSheet({ s, tabs, active, reportCount, onClose }: { s: ProjectState; tabs: typeof MORE; active: string; reportCount: number; onClose: () => void }) {
-  const toolbox = useLive<{ proposed: number }>('/api/toolbox/count', toolboxRefresh);
-  const proposed = toolbox.data?.proposed ?? 0;
+function MoreSheet({ s, tabs, active, reportCount, errored, onClose }: { s: ProjectState; tabs: typeof MORE; active: string; reportCount: number; errored: number; onClose: () => void }) {
   const id = s.project.id;
   return (
     <Sheet title="More" onClose={onClose}>
@@ -217,23 +271,17 @@ function MoreSheet({ s, tabs, active, reportCount, onClose }: { s: ProjectState;
             <a className={active === t.id ? 'on' : ''} href={href('p', id, t.id)} onClick={onClose}>
               <Icon name={t.id} size={20} /> <span>{t.label}</span>
               {t.id === 'reports' && reportCount > 0 && <b className="badge">{reportCount}</b>}
+              {t.id === 'agents' && errored > 0 && <ErrorBadge n={errored} />}
               <Icon name="chevron" size={16} />
             </a>
           </li>
         ))}
       </ul>
-      <h3 className="more-label">All projects</h3>
+      <h3 className="more-label">Across projects</h3>
       <ul className="more-list">
         <li>
-          <a href={href('hosts')} onClick={onClose}>
-            <Icon name="hosts" size={20} /> <span>Hosts</span>
-            <Icon name="chevron" size={16} />
-          </a>
-        </li>
-        <li>
-          <a href={href('toolbox')} onClick={onClose}>
-            <Icon name="toolbox" size={20} /> <span>Toolbox</span>
-            {proposed > 0 && <b className="badge">{proposed}</b>}
+          <a href={href('system')} onClick={onClose}>
+            <Icon name="hosts" size={20} /> <span>System</span>
             <Icon name="chevron" size={16} />
           </a>
         </li>
@@ -258,7 +306,7 @@ export function Checklist({ agent }: { agent: Agent }) {
       {agent.checklist.map((i) => (
         <li key={i.id} className={`item item-${i.state}`}>
           <span className="box" aria-hidden="true">
-            {i.state === 'done' && <Icon name="check" size={13} />}
+            {i.state === 'done' && <Icon name="check" size={16} />}
           </span>
           <span className="item-text">{i.text}</span>
           {['doing', 'blocked', 'dropped'].includes(i.state) && <span className={`item-state st-${i.state}`}>{i.state === 'doing' ? 'in progress' : i.state}</span>}
@@ -284,7 +332,6 @@ function AgentDetail({ s, agentId }: { s: ProjectState; agentId: string }) {
   if (!agent) return <Empty title="No such agent" />;
   const role = s.project.structure.roles.find((r) => r.id === agent.role_id);
   const parent = s.agents.find((a) => a.id === agent.parent_id);
-  const children = s.agents.filter((a) => a.parent_id === agent.id);
   const open = s.inbox.filter((i) => i.status === 'open' && i.agent_id === agent.id);
   const post = (action: string) => run(() => api(`/api/agents/${agent.id}/${action}`, { method: 'POST', body: {} }));
 
@@ -300,14 +347,20 @@ function AgentDetail({ s, agentId }: { s: ProjectState; agentId: string }) {
           <Status status={agent.status} />
         </div>
         <p className="muted small">
-          <a href={href('p', s.project.id, 'setup', roleAnchor(agent.role_id))}>{role?.name ?? agent.role_id}</a> · {modelLabel(agent.model)}
+          {role?.name ?? agent.role_id} · {runLabel(agent) || modelLabel(agent.model)}
+          {agent.task_id && agent.parent_id && (
+            <>
+              {' '}
+              · on <a href={href('p', s.project.id, 'tasks', agent.task_id)}>{s.tasks.find((t) => t.id === agent.task_id)?.title ?? agent.task_id}</a>
+            </>
+          )}
           {parent && (
             <>
               {' '}
               · reports to <a href={href('p', s.project.id, 'agents', parent.id)}>{parent.name}</a>
             </>
           )}
-          {children.length > 0 && <> · manages {children.length}</>} · {agent.turns} turns · est. ${agent.cost_usd.toFixed(2)}
+          {tokensText(agent.tokens) && <> · {tokensText(agent.tokens)}</>}
         </p>
         <HostBadges agentId={agent.id} s={s} />
         <AgentToolboxLine agent={agent} />
@@ -328,12 +381,12 @@ function AgentDetail({ s, agentId }: { s: ProjectState; agentId: string }) {
         <div className="row wrap actions">
           {['working', 'waiting'].includes(agent.status) && (
             <button className="btn" disabled={busy} onClick={() => post('stop')}>
-              <Icon name="stop" size={15} /> Stop turn
+              <Icon name="stop" size={16} /> Stop turn
             </button>
           )}
           {['interrupted', 'error'].includes(agent.status) && (
             <button className="btn" disabled={busy} onClick={() => post('resume')}>
-              <Icon name="play" size={15} /> Resume
+              <Icon name="play" size={16} /> Resume
             </button>
           )}
           {agent.status !== 'closed' && agent.parent_id && (
@@ -352,7 +405,7 @@ function AgentDetail({ s, agentId }: { s: ProjectState; agentId: string }) {
       <Transcript agentId={agent.id} working={agent.status === 'working'} />
 
       <div className="sticky-composer">
-        <Composer placeholder={`Message ${agent.name}`} onSend={(text, attachments) => api(`/api/agents/${agent.id}/message`, { body: { text, attachments } })} attachTo={agent.project_id} />
+        <Composer placeholder={`Message ${agent.name}`} onSend={(text, attachments) => api(`/api/agents/${agent.id}/message`, { body: { text, attachments } })} attachTo={agent.project_id} draftKey={`agent:${agent.id}`} />
       </div>
     </section>
   );
@@ -397,7 +450,7 @@ function Transcript({ agentId, working }: { agentId: string; working: boolean })
           Load earlier
         </button>
       )}
-      {loaded && events.length === 0 && <Empty title="Nothing yet">This agent has not been given anything to do.</Empty>}
+      {loaded && events.length === 0 && <Empty title="Nothing yet" />}
       {events.map((e) => (
         <EventRow key={e.id} e={e} result={e.kind === 'tool' ? results.get(e.data.id) : undefined} showTools={showTools} />
       ))}
@@ -480,7 +533,7 @@ function EventRow({ e, result, showTools }: { e: AgentEvent; result?: AgentEvent
   if (e.kind === 'text') {
     return (
       <div className={`ev said ${d.sub ? 'sub' : ''}`}>
-        <Markdown text={d.text} />
+        <Clamp text={String(d.text ?? '')} lines={12} />
       </div>
     );
   }
@@ -492,7 +545,8 @@ function EventRow({ e, result, showTools }: { e: AgentEvent; result?: AgentEvent
       <details className={`ev tool ${helm ? 'helm' : ''} ${result?.data.error ? 'failed' : ''}`}>
         <summary>
           <span className="tool-name">{name}</span>
-          <span className="tool-summary">{d.summary}</span>
+          {/* The same "cd <worktree> &&" opens most commands: the line shows what runs after it. */}
+          <span className="tool-summary">{String(d.summary ?? '').replace(/^cd\s+\S+\s*&&\s*/, '')}</span>
           {result?.data.error && <Tag tone="tone-critical">failed</Tag>}
         </summary>
         <pre>{d.input}</pre>

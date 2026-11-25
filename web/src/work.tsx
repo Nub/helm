@@ -22,15 +22,15 @@ export function WorkPage({ s, filter, recent = false }: { s: ProjectState; filte
   const needs = [...s.tasks, ...discussions].filter(needsResponse).length;
   return (
     <section className="work-page">
-      <h1 className="page-title">Work</h1>
+      <h1 className="sr-only">Work</h1>
       <div className="work-filter">
         <Chips
           value={filter}
           onChange={(f) => go('p', pid, 'work', f)}
           options={[
             { id: 'all', label: 'All' },
-            { id: 'tasks', label: 'Tasks', count: s.tasks.filter((t) => !['done', 'dropped'].includes(t.state)).length },
-            { id: 'discussions', label: 'Discussions', count: discussions.filter((d) => d.state === 'open').length },
+            { id: 'tasks', label: 'Tasks' },
+            { id: 'discussions', label: 'Discussions' },
             { id: 'needs', label: 'Needs response', count: needs },
           ]}
         />

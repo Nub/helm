@@ -485,13 +485,13 @@ export function serveAttachment(req: FastifyRequest, reply: FastifyReply, a: Row
 // ---------- references a manager attaches (attach_reference) ----------
 
 /** Names and folders that hold secrets. Such files are refused even when they sit in the project. */
-const SECRET_NAME = /^(\.env(\..*)?|\.npmrc|\.netrc|\.pypirc|\.git-credentials|\.htpasswd|credentials(\..*)?|secrets?(\..*)?|id_(rsa|dsa|ecdsa|ed25519)(\.pub)?|.*\.(pem|key|p12|pfx|kdbx|keystore|jks|asc|gpg))$/i;
-const SECRET_DIR = /(^|\/)(\.ssh|\.gnupg|\.aws|\.azure|\.kube|\.docker|\.password-store|\.config\/gh|\.config\/gcloud)(\/|$)/;
+export const SECRET_NAME = /^(\.env(\..*)?|\.npmrc|\.netrc|\.pypirc|\.git-credentials|\.htpasswd|credentials(\..*)?|secrets?(\..*)?|id_(rsa|dsa|ecdsa|ed25519)(\.pub)?|.*\.(pem|key|p12|pfx|kdbx|keystore|jks|asc|gpg))$/i;
+export const SECRET_DIR = /(^|\/)(\.ssh|\.gnupg|\.aws|\.azure|\.kube|\.docker|\.password-store|\.config\/gh|\.config\/gcloud)(\/|$)/;
 /** Text inside a file that gives a secret away: private keys and common API key shapes. */
-const SECRET_TEXT = /-----BEGIN [A-Z ]*PRIVATE KEY-----|\bAKIA[0-9A-Z]{16}\b|\bsk-(ant-)?[A-Za-z0-9_-]{20,}|\bgh[pousr]_[A-Za-z0-9]{30,}|\bxox[abprs]-[A-Za-z0-9-]{10,}/;
+export const SECRET_TEXT = /-----BEGIN [A-Z ]*PRIVATE KEY-----|\bAKIA[0-9A-Z]{16}\b|\bsk-(ant-)?[A-Za-z0-9_-]{20,}|\bgh[pousr]_[A-Za-z0-9]{30,}|\bxox[abprs]-[A-Za-z0-9-]{10,}/;
 
 /** The project folder and the worktrees git knows for it: where an agent may take a file from. */
-function projectRoots(projectPath: string): string[] {
+export function projectRoots(projectPath: string): string[] {
   const roots = [projectPath];
   try {
     const out = execFileSync('git', ['-C', projectPath, 'worktree', 'list', '--porcelain'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });

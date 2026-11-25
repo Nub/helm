@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { closeSync, existsSync, openSync, readSync, statSync, unlinkSync } from 'node:fs';
 import { extname, isAbsolute, join, resolve } from 'node:path';
 import { bus } from './bus.ts';
@@ -6,7 +7,13 @@ import { copyFileAtomic, writeFileAtomic } from './safefs.ts';
 import { all, get, newId, now, run, tx } from './db.ts';
 import type { Row } from './db.ts';
 import { formatRequestText, splitAction } from './reqformat.ts';
+import { errorPayload, resumesText } from './errorview.ts';
+import { agentTokens } from './usage.ts';
+import { subagentLine, withBusy } from './busy.ts';
+import { taskProgress } from './donewhen.ts';
 import type { Structure } from './structure.ts';
+import { agentTier, isTier, nearestTier, tierName, tierOf } from './tiers.ts';
+import type { TierId } from './tiers.ts';
 
 /** Agent statuses that mean "no longer part of the active team". */
 export const FINISHED = ['done', 'closed'];
@@ -50,15 +57,25 @@ export const DOC_STATUSES = ['proposed', 'active', 'paused', 'done', 'dropped'];
 export const ITEM_STATES = ['todo', 'doing', 'done', 'blocked', 'dropped'] as const;
 export type ItemState = (typeof ITEM_STATES)[number];
 
-export function getChecklist(agentId: string): Row[] {
-  return all('SELECT id, text, state, sort FROM checklist WHERE agent_id = ? ORDER BY sort, id', agentId);
+/** The task a worklist call is about when none is named: the agent's current task (none for a director). */
+const currentTaskOf = (agentId: string): string | null => (get('SELECT task_id FROM agents WHERE id = ?', agentId)?.task_id as string | null) ?? null;
+
+/**
+ * An agent's worklist for one task (default: its current task). Items written before worklists had a task (task_id
+ * NULL) count as the current task's, so they never show on a task the agent runs alongside.
+ */
+export function getChecklist(agentId: string, taskId: string | null = currentTaskOf(agentId)): Row[] {
+  const current = currentTaskOf(agentId);
+  return taskId === current
+    ? all('SELECT id, text, state, sort FROM checklist WHERE agent_id = ? AND (task_id IS ? OR task_id IS NULL) ORDER BY sort, id', agentId, taskId)
+    : all('SELECT id, text, state, sort FROM checklist WHERE agent_id = ? AND task_id IS ? ORDER BY sort, id', agentId, taskId);
 }
 
-export function setChecklist(agentId: string, items: { text: string; state?: ItemState }[]) {
+export function setChecklist(agentId: string, items: { text: string; state?: ItemState }[], taskId: string | null = currentTaskOf(agentId)) {
   tx(() => {
-    run('DELETE FROM checklist WHERE agent_id = ?', agentId);
+    run('DELETE FROM checklist WHERE agent_id = ? AND (task_id IS ? OR task_id IS NULL)', agentId, taskId);
     items.forEach((it, i) =>
-      run('INSERT INTO checklist (agent_id, text, state, sort, updated_at) VALUES (?,?,?,?,?)', agentId, it.text, it.state ?? 'todo', i, now()),
+      run('INSERT INTO checklist (agent_id, task_id, text, state, sort, updated_at) VALUES (?,?,?,?,?,?)', agentId, taskId, it.text, it.state ?? 'todo', i, now()),
     );
   });
 }
@@ -67,8 +84,9 @@ export function updateChecklist(
   agentId: string,
   updates: { item: number; state?: ItemState; text?: string }[],
   add: { text: string; state?: ItemState }[],
+  taskId: string | null = currentTaskOf(agentId),
 ): string | null {
-  const items = getChecklist(agentId);
+  const items = getChecklist(agentId, taskId);
   for (const u of updates) {
     const row = items[u.item - 1];
     if (!row) return `There is no item ${u.item}; the worklist has ${items.length} items.`;
@@ -76,12 +94,12 @@ export function updateChecklist(
     if (u.text) run('UPDATE checklist SET text = ?, updated_at = ? WHERE id = ?', u.text, now(), row.id);
   }
   let sort = items.length ? Math.max(...items.map((i) => i.sort)) + 1 : 0;
-  for (const a of add) run('INSERT INTO checklist (agent_id, text, state, sort, updated_at) VALUES (?,?,?,?,?)', agentId, a.text, a.state ?? 'todo', sort++, now());
+  for (const a of add) run('INSERT INTO checklist (agent_id, task_id, text, state, sort, updated_at) VALUES (?,?,?,?,?,?)', agentId, taskId, a.text, a.state ?? 'todo', sort++, now());
   return null;
 }
 
-export function renderChecklist(agentId: string): string {
-  const items = getChecklist(agentId);
+export function renderChecklist(agentId: string, taskId: string | null = currentTaskOf(agentId)): string {
+  const items = getChecklist(agentId, taskId);
   if (!items.length) return '(worklist is empty)';
   return items.map((it, i) => `${i + 1}. [${it.state}] ${it.text}`).join('\n');
 }
@@ -159,6 +177,10 @@ export type PreviewInput = {
   steps?: { text: string; image?: string }[];
   expect?: string;
   task_id?: string | null;
+  /** The preview this is a version of on its task (same key); without a key, the same title is. */
+  key?: string;
+  /** A new preview whatever its title (a proposal option pinned by hand). */
+  fresh?: boolean;
 };
 
 /** Resolves a path an agent gave and checks it is a file of a sensible size. */
@@ -241,7 +263,56 @@ function compareNote({ before: b, after: a }: CompareContent): string {
   return `"${b.label}" is ${b.width}×${b.height} and "${a.label}" is ${a.width}×${a.height} (${shape}); the user is shown that they differ. If they were meant to be the same viewpoint, retake one to match and post again.`;
 }
 
-export function addPreview(project: Row, agentId: string | null, input: PreviewInput): { id: string; note?: string } | { error: string } {
+/**
+ * The preview a new post is the next version of: on the same task, the one with the same key, else (no key) the one
+ * with the same title and no key. Never one pinned by hand as a proposal option, and never for a fresh post.
+ */
+export function previewToVersion(taskId: string | null | undefined, title: string, key?: string, fresh = false): Row | undefined {
+  if (!taskId || fresh) return undefined;
+  const k = key?.trim();
+  if (k) return get('SELECT * FROM previews WHERE task_id = ? AND pkey = ? ORDER BY created_at DESC LIMIT 1', taskId, k);
+  return get(
+    'SELECT * FROM previews p WHERE task_id = ? AND pkey IS NULL AND lower(trim(title)) = lower(trim(?)) AND NOT EXISTS (SELECT 1 FROM pins h WHERE h.preview_id = p.id AND h.auto = 0) ORDER BY created_at DESC LIMIT 1',
+    taskId, title,
+  );
+}
+
+/** The project's commit when a version is posted (its main checkout's HEAD), or null. */
+function headCommit(path: string): string | null {
+  try {
+    return execFileSync('git', ['-C', path, 'rev-parse', '--short=12', 'HEAD'], { timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/** The preview an id names now: itself, or for an id grouped into another as an earlier version, that one. */
+export function resolvePreviewId(id: string): string | null {
+  if (get('SELECT 1 AS x FROM previews WHERE id = ?', id)) return id;
+  return (get('SELECT preview_id FROM preview_versions WHERE old_id = ? LIMIT 1', id)?.preview_id as string | undefined) ?? null;
+}
+
+/** Every version of a preview, oldest first, the last being the preview row itself (its latest). */
+export function previewVersions(id: string): Row[] | null {
+  const head = get('SELECT p.*, a.name AS agent_name FROM previews p LEFT JOIN agents a ON a.id = p.agent_id WHERE p.id = ?', id);
+  if (!head) return null;
+  const older = all('SELECT v.*, a.name AS agent_name FROM preview_versions v LEFT JOIN agents a ON a.id = v.agent_id WHERE v.preview_id = ? ORDER BY v.version', id);
+  const shape = (r: Row, version: number) => ({ id, version, project_id: head.project_id, task_id: head.task_id, agent_id: r.agent_id, agent_name: r.agent_name ?? null, kind: r.kind, title: r.title, caption: r.caption, file: r.file, content: r.content, commit_sha: r.commit_sha ?? null, created_at: r.created_at });
+  return [...older.map((r) => shape(r, r.version)), shape(head, head.version ?? older.length + 1)];
+}
+
+/** Old preview ids grouped into another (preview_versions.old_id), for a project: links to them open the preview they are part of. */
+export const previewAliases = (projectId: string): Record<string, string> =>
+  Object.fromEntries(all('SELECT v.old_id, v.preview_id FROM preview_versions v JOIN previews p ON p.id = v.preview_id WHERE p.project_id = ? AND v.old_id IS NOT NULL', projectId).map((r) => [r.old_id, r.preview_id]));
+
+/** Files of a preview's earlier versions, for removing them with it. */
+export function deletePreviewVersionFiles(previewId: string) {
+  for (const v of all('SELECT * FROM preview_versions WHERE preview_id = ?', previewId)) deletePreviewFiles(v);
+  run('DELETE FROM preview_versions WHERE preview_id = ?', previewId);
+}
+
+export function addPreview(project: Row, agentId: string | null, input: PreviewInput): { id: string; note?: string; version?: number } | { error: string } {
+  // Files are named for this post (a new version never overwrites an earlier one's files).
   const id = newId('pv');
   let kind = input.kind ?? '';
   let file: string | null = null;
@@ -312,9 +383,30 @@ export function addPreview(project: Row, agentId: string | null, input: PreviewI
     return { error: 'Give one of path, content or url; or before and after for a comparison; or steps for a guide.' };
   }
 
+  // The agent's turn count, constant through a turn: the previews of one turn are one burst (pins.ts autoPin).
+  const turn = agentId ? ((get('SELECT turns FROM agents WHERE id = ?', agentId)?.turns as number | undefined) ?? null) : null;
+  const commit = headCommit(project.path);
+  const key = input.key?.trim() || null;
+  const head = previewToVersion(input.task_id, input.title, input.key, input.fresh);
+  if (head) {
+    // A new version under the same id: the current one is kept as an earlier version, the row becomes the new one.
+    const version = Number(head.version ?? 1) + 1;
+    tx(() => {
+      run(
+        'INSERT INTO preview_versions (preview_id, version, agent_id, kind, title, caption, file, content, source, commit_sha, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        head.id, head.version ?? 1, head.agent_id, head.kind, head.title, head.caption, head.file, head.content, head.source, head.commit_sha ?? null, head.created_at,
+      );
+      run(
+        'UPDATE previews SET agent_id = ?, kind = ?, title = ?, caption = ?, file = ?, content = ?, source = ?, created_at = ?, turn = ?, commit_sha = ?, version = ?, first_at = COALESCE(first_at, ?), pkey = COALESCE(?, pkey) WHERE id = ?',
+        agentId, kind, input.title, input.caption ?? '', file, content, source, now(), turn, commit, version, head.created_at, key, head.id,
+      );
+    });
+    touchProject(project.id);
+    return { id: head.id, version, ...(note ? { note } : {}) };
+  }
   run(
-    'INSERT INTO previews (id, project_id, agent_id, kind, title, caption, file, content, source, created_at, task_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-    id, project.id, agentId, kind, input.title, input.caption ?? '', file, content, source, now(), input.task_id ?? null,
+    'INSERT INTO previews (id, project_id, agent_id, kind, title, caption, file, content, source, created_at, task_id, turn, pkey, commit_sha, first_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    id, project.id, agentId, kind, input.title, input.caption ?? '', file, content, source, now(), input.task_id ?? null, turn, key, commit, now(),
   );
   touchProject(project.id);
   return note ? { id, note } : { id };
@@ -328,9 +420,102 @@ export function withFeedback(p: Row): Row {
   return feedback.length ? { ...p, feedback } : p;
 }
 
-export function agentView(a: Row): Row {
+/**
+ * The tier an agent runs at now with its model and effort, as the runtime sets them (runtime.ts tierFor: the director the
+ * strongest, a quick helper the lightest, an area agent its current task's tier, else its area's default). A builder's
+ * subagent has its tier's. `structure`: the project's, parsed once by a caller listing many agents.
+ */
+export function runningTier(a: Row, structure?: Structure): { run_tier: string; run_tier_name: string; run_model: string; run_effort: string } {
+  let id: TierId;
+  if (a.role_id === 'subagent' && isTier(a.sub_tier)) id = a.sub_tier;
+  else {
+    const s = structure ?? (JSON.parse(getProject(a.project_id)?.structure ?? '{}') as Structure);
+    const role = s.roles?.find((r) => r.id === a.role_id);
+    id = agentTier(a, { root: !a.parent_id && a.role_id === s.root, quick: !!a.quick, areaTier: role?.tier ?? (role ? nearestTier(role.model, role.effort) : nearestTier(a.model, '')) });
+  }
+  const t = tierOf(id);
+  return { run_tier: t.id, run_tier_name: tierName(t.id), run_model: t.model, run_effort: t.effort };
+}
+
+// ---------- status per task ----------
+
+/** Tasks an agent has in hand: its current task, then the Active tasks it drives beside it (a builder's), oldest first. */
+export function tasksInHand(agent: Row): string[] {
+  const driven = all("SELECT id FROM tasks WHERE driver_agent_id = ? AND state = 'active' AND kind = 'task' ORDER BY started_at", agent.id).map((t) => String(t.id));
+  return [...new Set([...(agent.task_id ? [String(agent.task_id)] : []), ...driven])];
+}
+
+/**
+ * Sets an agent's status line for one task (agent_task_status). On its current task (or with none) it is also the
+ * agent's own line, agents.status_line, as before.
+ */
+export function setTaskLine(agentId: string, taskId: string | null, line: string, progress?: number | null) {
+  const a = get('SELECT task_id FROM agents WHERE id = ?', agentId);
+  if (!a) return;
+  if (taskId) {
+    run(
+      'INSERT INTO agent_task_status (agent_id, task_id, status_line, progress, updated_at) VALUES (?,?,?,?,?) ON CONFLICT(agent_id, task_id) DO UPDATE SET status_line = excluded.status_line, progress = COALESCE(excluded.progress, progress), updated_at = excluded.updated_at',
+      agentId, taskId, line, progress ?? null, now(),
+    );
+  }
+  if (!taskId || taskId === a.task_id) run('UPDATE agents SET status_line = ?, progress = COALESCE(?, progress), status_at = ?, updated_at = ? WHERE id = ?', line, progress ?? null, now(), now(), agentId);
+}
+
+/** An agent's status line and progress for a task it runs alongside (not its current one), or undefined. */
+export const taskLine = (agentId: string, taskId: string): { status_line: string; progress: number | null } | undefined =>
+  get('SELECT status_line, progress, updated_at FROM agent_task_status WHERE agent_id = ? AND task_id = ?', agentId, taskId) as any;
+
+/**
+ * An agent's line on a task it runs alongside (a builder's): what its subagent on it does now, unless the agent set the
+ * task's line itself (report_status task) since; else that line.
+ */
+export function alongsideLine(agentId: string, taskId: string): { status_line: string; progress: number | null } {
+  const own = taskLine(agentId, taskId);
+  const sub = subagentLine(agentId, taskId);
+  const mine = own?.status_line && (!sub || Number((own as Row).updated_at ?? 0) > sub.since);
+  return { status_line: mine ? own!.status_line : (sub?.line ?? own?.status_line ?? ''), progress: own?.progress ?? null };
+}
+
+/**
+ * An agent's progress on a task: from what Helm counts (the task's Done when ticks and the worklist, donewhen.ts), else
+ * the number it reported.
+ */
+export const progressOn = (taskId: string | null | undefined, checklist: Row[], reported: number | null | undefined): number | null =>
+  taskProgress(taskId ? get('SELECT description, done_when_ticks FROM tasks WHERE id = ?', taskId) : undefined, checklistProgress(checklist)) ?? reported ?? null;
+
+/** What a task row shows of its driver: live status (busy.ts) and its worklist; far cheaper than agentView. */
+export function driverView(row: Row, taskId?: string): Row {
+  const a = withBusy(row);
+  // On a task it runs alongside (a builder's): its worklist and status line for that task, not its own task's.
+  const own = taskId === undefined || a.task_id === taskId;
+  const checklist = getChecklist(a.id, own ? undefined : taskId);
+  const other = own ? undefined : alongsideLine(a.id, taskId!);
+  return { id: a.id, name: a.name, status: a.status, status_line: own ? a.status_line : (other?.status_line ?? ''), progress: progressOn(own ? a.task_id : taskId, checklist, own ? a.progress : other?.progress), checklist };
+}
+
+/**
+ * What an agent is doing right now: its newest tool call that has no result yet, with when it started. Null when it
+ * is not working or its last call returned.
+ */
+export function currentTool(agentId: string, taskId?: string): { name: string; summary: string; since: number } | null {
+  const last = get("SELECT ts, data FROM events WHERE agent_id = ? AND kind = 'tool' ORDER BY id DESC LIMIT 1", agentId);
+  if (!last) return null;
+  const d = JSON.parse(String(last.data));
+  const done = get("SELECT 1 AS x FROM events WHERE agent_id = ? AND kind = 'tool_result' AND ts >= ? AND data LIKE ? LIMIT 1", agentId, last.ts, `%"id":"${d.id}"%`);
+  if (done) return null;
+  // A builder's call that started a subagent for another task shows on that task (its subagent row), not this one.
+  if (taskId && d.id) {
+    const sub = get("SELECT task_id FROM agents WHERE sdk_tool_use_id = ? AND role_id = 'subagent' LIMIT 1", String(d.id));
+    if (sub && sub.task_id !== taskId) return null;
+  }
+  return { name: String(d.name ?? ''), summary: String(d.summary ?? '').slice(0, 160), since: Number(last.ts) };
+}
+
+export function agentView(row: Row, structure?: Structure): Row {
+  // Work in hand between turns reads Working, with what it waits on (busy.ts).
+  const a = withBusy(row);
   const checklist = getChecklist(a.id);
-  return { ...a, checklist, progress: a.progress ?? checklistProgress(checklist) };
+  return { ...a, checklist, progress: progressOn(a.task_id, checklist, a.progress), resume_text: resumesText(a.resume_at, a.project_id), tokens: agentTokens(a.id), ...runningTier(a, structure) };
 }
 
 export function projectState(projectId: string) {
@@ -338,17 +523,18 @@ export function projectState(projectId: string) {
   if (!project) return null;
   return {
     project: { ...project, structure: JSON.parse(project.structure) },
-    agents: all('SELECT * FROM agents WHERE project_id = ? ORDER BY created_at', projectId).map(agentView),
+    agents: all('SELECT * FROM agents WHERE project_id = ? ORDER BY created_at', projectId).map((a) => agentView(a, JSON.parse(project.structure))),
     docs: all("SELECT d.*, (SELECT COUNT(*) FROM attachments a WHERE a.owner_kind = 'doc' AND a.owner_id = d.id) AS attach_count FROM docs d WHERE d.project_id = ? ORDER BY d.importance DESC, d.updated_at DESC", projectId),
-    inbox: all("SELECT * FROM inbox WHERE project_id = ? AND (decided_by IS NULL OR decided_by != 'auto') ORDER BY created_at DESC LIMIT 300", projectId).map(inboxView),
+    inbox: all("SELECT * FROM inbox WHERE project_id = ? AND status != 'held' AND (decided_by IS NULL OR decided_by != 'auto') ORDER BY created_at DESC LIMIT 300", projectId).map(inboxView),
     previews: all('SELECT * FROM previews WHERE project_id = ? ORDER BY created_at DESC LIMIT 500', projectId).map(withFeedback),
+    preview_aliases: previewAliases(projectId),
     journal: all('SELECT * FROM journal WHERE project_id = ? ORDER BY ts DESC LIMIT 500', projectId),
   };
 }
 
 export function inboxView(r: Row): Row {
   const payload = JSON.parse(r.payload);
-  const task = r.task_id ? get('SELECT title FROM tasks WHERE id = ?', r.task_id) : undefined;
+  const task = r.task_id ? get('SELECT title, kind FROM tasks WHERE id = ?', r.task_id) : undefined;
   // Previews attached to a request travel with it, so the inbox can show them without the project's gallery.
   const ids: string[] = Array.isArray(payload.previews) ? payload.previews : [];
   const previews = ids.map((id) => get('SELECT * FROM previews WHERE id = ?', id)).filter(Boolean);
@@ -362,7 +548,21 @@ export function inboxView(r: Row): Row {
     body = f.body;
     payload.steps = f.steps;
   } else if (r.kind === 'question' && body) body = formatRequestText(body);
-  return { ...r, body, options: JSON.parse(r.options), payload, previews, task_title: task?.title ?? null, line: requestLine(r.kind, r.title, payload), ...(queue ? { director_queue: { count: queue.count, oldest: queue.oldest } } : {}) };
+  // An agent that stopped with an error: times in the user's zone now, the shared limit, a scheduled resume (errorview.ts).
+  if (r.kind === 'agent_error') {
+    Object.assign(payload, errorPayload(r, payload));
+    body = payload.plain ?? body;
+  }
+  // Answered "not now" (reminders.ts): when Helm asks again, while that is pending.
+  const rem = r.status === 'answered' ? get("SELECT id, due_at FROM request_reminders WHERE request_id = ? AND status = 'pending'", r.id) : undefined;
+  const reminder = rem ? { id: rem.id, due_text: rem.due_at == null ? 'next session' : null, due_at: rem.due_at ?? null } : null;
+  // Spec edit cards it is about (speccards.ts), shown inside it: those a newer proposal replaced are left out.
+  if (Array.isArray(payload.spec_cards) && payload.spec_cards.length) {
+    const cards = all(`SELECT id, status FROM doc_proposals WHERE id IN (${payload.spec_cards.map(() => '?').join(',')})`, ...payload.spec_cards);
+    payload.spec_cards = payload.spec_cards.filter((id: string) => cards.some((c) => c.id === id && c.status !== 'superseded'));
+    payload.spec_open = cards.filter((c) => c.status === 'open').length;
+  }
+  return { ...r, body, options: JSON.parse(r.options), payload, previews, reminder, task_title: task?.title ?? null, task_kind: task?.kind ?? null, line: requestLine(r.kind, r.title, payload), ...(queue ? { director_queue: { count: queue.count, oldest: queue.oldest } } : {}) };
 }
 
 /**
@@ -384,7 +584,7 @@ export function requestLine(kind: string, title: string, payload: Row): string {
 
 export function projectSummaries() {
   return all('SELECT * FROM projects ORDER BY archived, position, created_at').map((p) => {
-    const agents = all('SELECT * FROM agents WHERE project_id = ?', p.id).map(agentView);
+    const agents = all('SELECT * FROM agents WHERE project_id = ?', p.id).map((a) => agentView(a));
     const active = agents.filter((a) => !FINISHED.includes(a.status));
     const measured = active.filter((a) => a.progress !== null);
     return {
@@ -398,9 +598,15 @@ export function projectSummaries() {
       agents: active.length,
       working: agents.filter((a) => a.status === 'working').length,
       waiting: agents.filter((a) => a.status === 'waiting').length,
+      // Scheduled or active tasks: queued work, so a project with none running reads Waiting, not Idle.
+      queued: (get("SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND state IN ('scheduled','active')", p.id)?.n as number) ?? 0,
+      // Stopped with an error and not yet running again (agenterrors.ts): a badge of its own on the project.
+      errored: agents.filter((a) => a.status === 'error').length,
       progress: measured.length ? Math.round(measured.reduce((n, a) => n + a.progress, 0) / measured.length) : null,
       openInbox: (get("SELECT COUNT(*) AS n FROM inbox WHERE project_id = ? AND status = 'open'", p.id)?.n as number) ?? 0,
       statusLine: agents.find((a) => !a.parent_id)?.status_line ?? '',
+      // Running, winding_down, at_rest or stopped (projectmode.ts): a chip on the project row when not running.
+      mode: p.mode ?? 'running',
     };
   });
 }

@@ -7,7 +7,28 @@ import { fileURLToPath } from 'node:url';
 import { writeFileAtomic } from './safefs.ts';
 
 export const APP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-export const DATA_DIR = resolve(process.env.HELM_DATA ?? join(homedir(), '.helm'));
+const explicitData = (process.env.HELM_DATA ?? '').trim();
+export const DATA_DIR = resolve(explicitData || join(homedir(), '.helm'));
+
+/**
+ * The default data folder (~/.helm) must not land inside a git checkout: started with HOME pointing into one (or
+ * relative, as "."), Helm once wrote its database, passphrase and previews into the repository it was started from.
+ * Only an explicit HELM_DATA may put it there.
+ */
+function insideCheckout(dir: string): string | null {
+  for (let d = dirname(dir); ; d = dirname(d)) {
+    if (existsSync(join(d, '.git'))) return d;
+    if (dirname(d) === d) return null;
+  }
+}
+if (!explicitData) {
+  const repo = insideCheckout(DATA_DIR);
+  if (repo) {
+    throw new Error(
+      `Refusing to keep Helm's data in ${DATA_DIR}: that is inside the git checkout ${repo} (HOME is "${process.env.HOME ?? ''}"). Set HELM_DATA to the folder you want.`,
+    );
+  }
+}
 export const ARTIFACT_DIR = join(DATA_DIR, 'artifacts');
 mkdirSync(ARTIFACT_DIR, { recursive: true });
 

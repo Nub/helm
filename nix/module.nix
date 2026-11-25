@@ -9,14 +9,76 @@
   lu = cfg.liveUpdate;
   liveDir = "${cfg.dataDir}/live";
 
-  # What helm.service runs with live update on: the build the current link points at, if there is one, else the
-  # packaged build. The link is replaced only by helm-live-update, after a successful build.
-  start = pkgs.writeShellScript "helm-start" ''
-    if [ -x ${lib.escapeShellArg liveDir}/current/bin/helm ]; then
-      exec ${lib.escapeShellArg liveDir}/current/bin/helm "$@"
-    fi
-    exec ${lib.getExe cfg.package} "$@"
-  '';
+  # What helm.service and helm-web.service run (nix/helm-start.sh): with live update on, the build the current (or web)
+  # link points at, if there is one, else the packaged build, in the mode that build supports. The links are replaced
+  # only by helm-live-update, after a successful build.
+  start = pkgs.writeShellApplication {
+    name = "helm-start";
+    runtimeInputs = [pkgs.coreutils pkgs.curl pkgs.gnugrep];
+    text = builtins.readFile ./helm-start.sh;
+  };
+  startEnv = {
+    HELM_START_LIVE =
+      if lu.enable
+      then liveDir
+      else "";
+    HELM_START_PACKAGE = "${cfg.package}";
+  };
+
+  # The environment of Helm and its agents, the same for the runner and the web service.
+  baseEnv =
+    {
+      HOME = home;
+      # Agents run commands as this user, so they get what a login shell would: setuid wrappers first (sudo
+      # must be the setuid one), then the user's and the system's profiles. Helm's own node comes after those.
+      PATH = lib.concatStringsSep ":" ([
+          "/run/wrappers/bin"
+          "/etc/profiles/per-user/${cfg.user}/bin"
+          "/run/current-system/sw/bin"
+          "${cfg.package.nodejs}/bin"
+        ]
+        # The tools agents are promised (the Spec's hosting entry): a headless browser, ffmpeg and the GitHub CLI.
+        ++ map (p: "${lib.getBin p}/bin") cfg.agentTools
+        ++ map (p: "${lib.getBin p}/bin") cfg.extraPath
+        # git for the dashboard's view of what an update would bring (server/liveupdate.ts).
+        ++ lib.optional lu.enable "${pkgs.git}/bin");
+      HELM_PORT = toString cfg.port;
+      HELM_HOST = cfg.host;
+      HELM_DATA = cfg.dataDir;
+      HELM_CLAUDE_PATH = cfg.claudePath;
+      HELM_ATTACH_MAX_MB = toString cfg.attachmentMaxMB;
+      NODE_NO_WARNINGS = "1";
+    }
+    // optionalAttrs (cfg.projectsRoot != null) {HELM_PROJECTS = cfg.projectsRoot;}
+    // optionalAttrs cfg.lanNoLogin {HELM_LAN_NO_LOGIN = "1";}
+    // optionalAttrs (cfg.nginx.enable && cfg.nginx.signedInBy != null) {HELM_TRUST_PROXY_SIGNIN = cfg.nginx.signedInBy;}
+    // optionalAttrs (cfg.lanAllowedHosts != []) {HELM_LAN_ALLOWED_HOSTS = lib.concatStringsSep "," cfg.lanAllowedHosts;}
+    // optionalAttrs lu.enable {
+      # Read by server/liveupdate.ts: where to look for what is available, and which units to start.
+      HELM_LIVE_UPDATE_REPO = lu.repo;
+      HELM_LIVE_UPDATE_REF = lu.ref;
+      HELM_LIVE_UPDATE_DIR = liveDir;
+    }
+    // cfg.environment
+    // startEnv;
+  helmEnv =
+    baseEnv
+    // {
+      PATH = lib.mkForce baseEnv.PATH;
+      # Changes whenever what the units run with changes (this module's settings, the environment, the start script,
+      # and the package when it is what runs). Split with live update, a system rebuild restarts only the web service;
+      # the runner keeps the stamp it started with, and the Helm page says the configuration changed until agents
+      # restart (server/runner.ts, server/liveupdate.ts).
+      HELM_UNIT_STAMP = builtins.substring 0 16 (builtins.hashString "sha256" (builtins.toJSON {
+        env = baseEnv;
+        start = "${start}";
+        package =
+          if lu.enable
+          then ""
+          else "${cfg.package}";
+        inherit (cfg) split;
+      }));
+    };
 
   liveUpdateScript = pkgs.writeShellApplication {
     name = "helm-live-update";
@@ -32,6 +94,10 @@
     HELM_LU_ATTR = lu.attr;
     HELM_LU_PACKAGE = "${cfg.package}";
     HELM_LU_SERVICE = "helm.service";
+    HELM_LU_WEB_SERVICE =
+      if cfg.split
+      then "helm-web.service"
+      else "";
     HELM_LU_SCOPE = "system";
     HELM_LU_URL = upstream;
     HELM_LU_TIMEOUT = toString lu.healthTimeout;
@@ -43,7 +109,11 @@
     description =
       if mode == "update"
       then "Build Helm from ${lu.flake} and switch to it"
-      else "Switch Helm back to its previous build";
+      else if mode == "rollback"
+      then "Switch Helm back to its previous build"
+      else if mode == "adopt"
+      then "Replace the one-process Helm left running by a rebuild with the runner and the web service"
+      else "Restart Helm's agent runner once no agent is mid-turn";
     # Not wanted by anything: started on request (the dashboard's Update / Roll back, or systemctl start).
     environment = liveUpdateEnv;
     serviceConfig = {
@@ -54,8 +124,12 @@
       Group = cfg.group;
       WorkingDirectory = home;
       ExecStart = "${lib.getExe liveUpdateScript} ${mode}";
-      # A first build can download a lot.
-      TimeoutStartSec = "1h";
+      # A first build can download a lot. Split, an update that changes the runner then waits for agents to be idle,
+      # which has no time limit (the dashboard offers Restart agents now).
+      TimeoutStartSec =
+        if cfg.split && mode != "rollback"
+        then "infinity"
+        else "1h";
     };
   };
   home = config.users.users.${cfg.user}.home;
@@ -105,6 +179,26 @@ in {
       description = "The Helm package. The flake's nixosModules.default sets it to the flake's own build.";
     };
 
+    split = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Run Helm as two services: helm.service, the runner, holds the agents; helm-web.service serves the dashboard on
+        the port. An update that changes only the dashboard then restarts only helm-web.service, and agents keep
+        working; one that changes the runner restarts it once no agent is mid-turn, or when you press Restart agents
+        now (liveUpdate). With liveUpdate on, a system rebuild does not restart the runner either: the Helm page says
+        the configuration changed, and applies it when agents are idle. Off: one process, as before.
+
+        Switching it on with liveUpdate depends on the build Helm runs (dataDir/live/current) when you rebuild:
+        - already a build with the split (updated to it first, Helm still one process under the old module): the rebuild
+          is all; helm-split-adopt replaces that process with the runner and helm-web once no agent is mid-turn.
+        - a build from before the split: the rebuild changes nothing visible (that build keeps running as one process,
+          helm-web stays down); the next Update to a build with the split switches both at once, recording the agents
+          it interrupts and resuming them when it is healthy.
+        Without liveUpdate the rebuild restarts helm.service as before.
+      '';
+    };
+
     user = mkOption {
       type = types.str;
       example = "alice";
@@ -150,6 +244,13 @@ in {
       type = types.str;
       default = "/run/current-system/sw/bin/claude";
       description = "The Claude Code binary agents run (the SDK's bundled one doesn't run on NixOS).";
+    };
+
+    agentTools = mkOption {
+      type = types.listOf types.package;
+      default = [pkgs.chromium pkgs.ffmpeg pkgs.gh];
+      defaultText = lib.literalExpression "[ pkgs.chromium pkgs.ffmpeg pkgs.gh ]";
+      description = "Tools every agent finds on its PATH: a headless browser (screenshots, helm-ui-check), ffmpeg and the GitHub CLI. Set to [] to leave them out.";
     };
 
     extraPath = mkOption {
@@ -367,52 +468,31 @@ in {
       ];
 
       systemd.services.helm = {
-        description = "Helm agent dashboard";
+        description =
+          if cfg.split
+          then "Helm agent runner"
+          else "Helm agent dashboard";
         wantedBy = ["multi-user.target"];
         after = ["network-online.target"];
-        wants = ["network-online.target"];
 
-        environment =
-          {
-            HOME = home;
-            # Agents run commands as this user, so they get what a login shell would: setuid wrappers first (sudo
-            # must be the setuid one), then the user's and the system's profiles. Helm's own node comes after those.
-            PATH = lib.mkForce (lib.concatStringsSep ":" ([
-                "/run/wrappers/bin"
-                "/etc/profiles/per-user/${cfg.user}/bin"
-                "/run/current-system/sw/bin"
-                "${cfg.package.nodejs}/bin"
-              ]
-              ++ map (p: "${lib.getBin p}/bin") cfg.extraPath
-              # git for the dashboard's view of what an update would bring (server/liveupdate.ts).
-              ++ lib.optional lu.enable "${pkgs.git}/bin"));
-            HELM_PORT = toString cfg.port;
-            HELM_HOST = cfg.host;
-            HELM_DATA = cfg.dataDir;
-            HELM_CLAUDE_PATH = cfg.claudePath;
-            HELM_ATTACH_MAX_MB = toString cfg.attachmentMaxMB;
-            NODE_NO_WARNINGS = "1";
-          }
-          // optionalAttrs (cfg.projectsRoot != null) {HELM_PROJECTS = cfg.projectsRoot;}
-          // optionalAttrs cfg.lanNoLogin {HELM_LAN_NO_LOGIN = "1";}
-          // optionalAttrs (cfg.nginx.enable && cfg.nginx.signedInBy != null) {HELM_TRUST_PROXY_SIGNIN = cfg.nginx.signedInBy;}
-          // optionalAttrs (cfg.lanAllowedHosts != []) {HELM_LAN_ALLOWED_HOSTS = lib.concatStringsSep "," cfg.lanAllowedHosts;}
-          // optionalAttrs lu.enable {
-            # Read by server/liveupdate.ts: where to look for what is available, and which units to start.
-            HELM_LIVE_UPDATE_REPO = lu.repo;
-            HELM_LIVE_UPDATE_REF = lu.ref;
-            HELM_LIVE_UPDATE_DIR = liveDir;
-          }
-          // cfg.environment;
+        environment = helmEnv;
+
+        # Split with live update: a system rebuild leaves the agents alone. The dashboard (helm-web) restarts with the
+        # new configuration and offers to restart the runner once agents are idle (helm-restart-agents).
+        restartIfChanged = !(cfg.split && lu.enable);
+        # Starting (or restarting) the runner starts the dashboard if it is not running, whatever state it was left in.
+        # Not the other way round: a runner that crashes and restarts leaves the dashboard up ("Agents are restarting").
+        wants = lib.optional cfg.split "helm-web.service" ++ ["network-online.target"];
 
         serviceConfig = {
           User = cfg.user;
           Group = cfg.group;
           WorkingDirectory = home;
-          ExecStart =
-            if lu.enable
-            then start
-            else lib.getExe cfg.package;
+          ExecStart = "${lib.getExe start} ${
+            if cfg.split
+            then "runner"
+            else "all"
+          }";
           Restart = "on-failure";
           RestartSec = 3;
           # On stop only Helm gets SIGTERM: it closes its agents' Claude processes itself, then whatever is left in
@@ -427,25 +507,72 @@ in {
       networking.firewall.allowedTCPPorts = mkIf cfg.openFirewall [cfg.port];
     }
 
+    (mkIf cfg.split {
+      # The dashboard: API, live-update stream, web app and preview files on the port (server/web-main.ts). It reaches
+      # agents through the database (server/runner.ts), so it restarts without interrupting them, and keeps working
+      # while the runner restarts. With a runner build from before the split it exits at once (nix/helm-start.sh).
+      systemd.services.helm-web = {
+        description = "Helm dashboard";
+        wantedBy = ["multi-user.target"];
+        # Independent of the runner: a runner restart or crash leaves it up, showing "Agents are restarting"; it is
+        # started with the runner (helm.service wants it) and restarted on its own by updates that change only it.
+        after = ["helm.service" "network-online.target"];
+        # No start limit: whatever state an earlier failure left it in, the next start or restart works.
+        startLimitIntervalSec = 0;
+        wants = ["network-online.target"];
+        environment = helmEnv;
+        serviceConfig = {
+          User = cfg.user;
+          Group = cfg.group;
+          WorkingDirectory = home;
+          ExecStart = "${lib.getExe start} web";
+          Restart = "on-failure";
+          RestartSec = 2;
+          TimeoutStopSec = 15;
+          # Light hardening only: the dashboard creates and clones projects anywhere in the home, serves files from
+          # project folders, runs git and starts the update units, so the file system stays as the runner's.
+          NoNewPrivileges = true;
+          RestrictSUIDSGID = true;
+          LockPersonality = true;
+          ProtectKernelTunables = true;
+          ProtectKernelModules = true;
+          ProtectControlGroups = true;
+        };
+      };
+    })
+
     (mkIf lu.enable {
       systemd.services.helm-update = liveUpdateUnit "update";
       systemd.services.helm-rollback = liveUpdateUnit "rollback";
+      # Split: restart the runner once agents are idle, to apply a changed system configuration (the Helm page).
+      systemd.services.helm-restart-agents = mkIf cfg.split (liveUpdateUnit "restart-runner");
+      # The first deploy: the rebuild that turns the split on leaves the one-process Helm running (helm.service is not
+      # restarted by a rebuild). This replaces it with the runner and the web service once no agent is mid-turn, or at
+      # once with the interrupted agents recorded and resumed (live-update.sh adopt). At any other time (a boot, a later
+      # rebuild) it finds Helm already split, or nothing up yet, and exits.
+      systemd.services.helm-split-adopt = mkIf cfg.split (lib.recursiveUpdate (liveUpdateUnit "adopt") {
+        wantedBy = ["multi-user.target"];
+        after = ["helm.service" "helm-web.service"];
+        # Started by the activation without holding it up: the wait for idle agents can take a while.
+        serviceConfig.Type = lib.mkForce "simple";
+      });
 
       # The one privilege live update needs: the service user may start the two units above and restart Helm, and
       # nothing else (no other units, no stop, no enable, no unit-file changes). See liveUpdate.enable.
       security.polkit.enable = true;
       security.polkit.extraConfig = ''
-        // services.helm.liveUpdate: ${cfg.user} may start helm-update / helm-rollback and restart helm.
+        // services.helm.liveUpdate: ${cfg.user} may start helm-update / helm-rollback (and, split, helm-restart-agents and helm-split-adopt)
+        // and restart helm (and, split, helm-web).
         polkit.addRule(function(action, subject) {
           if (action.id != "org.freedesktop.systemd1.manage-units" || subject.user != ${builtins.toJSON cfg.user}) {
             return polkit.Result.NOT_HANDLED;
           }
           var unit = action.lookup("unit");
           var verb = action.lookup("verb");
-          if ((unit == "helm-update.service" || unit == "helm-rollback.service") && verb == "start") {
+          if ((unit == "helm-update.service" || unit == "helm-rollback.service"${lib.optionalString cfg.split " || unit == \"helm-restart-agents.service\" || unit == \"helm-split-adopt.service\""}) && verb == "start") {
             return polkit.Result.YES;
           }
-          if (unit == "helm.service" && verb == "restart") {
+          if ((unit == "helm.service"${lib.optionalString cfg.split " || unit == \"helm-web.service\""}) && verb == "restart") {
             return polkit.Result.YES;
           }
           return polkit.Result.NOT_HANDLED;
@@ -476,6 +603,7 @@ in {
         # real client address or this limits the CDN instead.
         appendHttpConfig = ''
           limit_req_zone $binary_remote_addr zone=helm_login:1m rate=5r/m;
+          limit_req_zone $binary_remote_addr zone=helm_dl:1m rate=30r/m;
         '';
         virtualHosts.${cfg.nginx.domain} = {
           forceSSL = true;
@@ -508,6 +636,18 @@ in {
           locations."= /api/login" = gated ''
             limit_req zone=helm_login burst=5 nodelay;
             limit_req_status 429;
+          '';
+          # Release download links (server/dllinks.ts): shared with people who are not signed in, so outside the sign-in
+          # gate. Only GET and HEAD, never the X-Helm-Signed-In header (signedIn false clears it), rate-limited per
+          # address; Helm itself answers 404 to anything but a live link and serves nothing but release files. The token
+          # is in the URL, so this location keeps no access log (Helm logs each download by the link's id only).
+          locations."^~ /dl/" = proxyTo ''
+            access_log off;
+            limit_except GET { deny all; }
+            limit_req zone=helm_dl burst=10 nodelay;
+            limit_req_status 429;
+            proxy_buffering off;
+            proxy_read_timeout 1h;
           '';
           # Static and public: browsers fetch the web app manifest (and with it the icons) without cookies.
           locations."= /manifest.webmanifest" = proxyTo "";

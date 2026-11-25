@@ -1,32 +1,44 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { isFinished, isSubagent } from './agentlists';
+import { ShareButton } from './share';
+import { TaskTestBuilds } from './testbuilds';
+import { ConsolidateButton, ConsolidationCard } from './consolidate';
+import { EntriesCard, FindingsCard } from './specwork';
+import { useStoredForm } from './drafts';
 import type { ReactNode } from 'react';
-import { api, useLive } from './api';
-import type { Agent, Origin, ProjectState, Task, TaskDetail, TaskState, TimelineItem, Attachment } from './api';
-import { HostBadges } from './hosts';
+import { ApiError, api, prefetch, useLive } from './api';
+import type { Agent, Origin, Preview, ProjectState, TaskPart, Task, TaskDetail, TaskState, TimelineItem, Attachment } from './api';
 import { InboxCard, RequestOutcome } from './inbox';
+import { TaskTimeCard } from './tasktime';
 import { AutoAllowedGroup } from './decisions';
 import type { InboxItem } from './api';
 import { NeedsGroup, needsResponse } from './needs';
-import { DiscussionStateTag } from './discussions';
-import type { DiscussionState } from './api';
-import { PreviewTile } from './preview';
-import { Checklist, progressLabel } from './project';
+import { PreviewThumb, PreviewTile, hasThumb } from './preview';
+import { Checklist } from './project';
 import { openChat } from './chat';
-import { DiscussionView, NewTaskSheet, ThreadLinks } from './discussions';
-import { TaskReports } from './reports';
+import { ConcludeButton, DiscussionView, NewTaskSheet, ThreadLinks } from './discussions';
+import { lazyNamed, loadReleases, loadReports } from './lazy';
+const RecipeProposalCard = lazyNamed<{ body: string; s: ProjectState }>(loadReleases, 'RecipeProposalCard');
+const TaskReports = lazyNamed<{ reports: import('./api').Report[]; pid: string; inline?: boolean }>(loadReports, 'TaskReports');
+import { TaskScopeBlock } from './dashscope';
 import { Thread } from './thread';
 import { ChangeCard, TaskSpecBlock } from './spec';
 import { ProposalCard, SnapshotCard } from './specdiscuss';
 import { useDragReorder } from './drag';
-import { ImportanceControl, ImportancePicker, ImportanceTag, LEVEL, TieredList, recentChange } from './importance';
+import { ImportancePicker, ImportanceTag, LEVEL, TieredList, recentChange } from './importance';
 import type { ThreadLine } from './thread';
 import { ClipCount, References } from './attachments';
-import { HappeningNow, Latest, NeedsYou, PlanBlock, TaskTiming, WhatChanged } from './tasknow';
+import { NeedsYou, PlanBlock, TaskAgents, TaskCommands, TaskTiming } from './tasknow';
+import { TaskPreviews } from './previewlist';
 import { PinToggle, ProposalArea, ProposalStrip, linkedRequestId, pinCtx } from './proposal';
+import { Fold, FoldHead, StickyHead, jumpTo, useFold } from './fold';
 import type { PinCtx } from './proposal';
-import { Chips, Clamp, Empty, Icon, Markdown, Progress, Sheet, Status, Tag, ago, clock, go, href, useAction, PlainRefs } from './ui';
-import { withPeriodDividers } from './sessions';
+import { Chips, Clamp, EdgeProgress, Empty, Icon, Markdown, Sheet, Status, Tag, ago, clock, go, href, modelLabel, useAction, PlainRefs, openPreview } from './ui';
+import { RunTimer, withPeriodDividers } from './sessions';
 import { QuickDone } from './team';
+import { tokensText } from './usage.ts';
+import { when } from './time';
+import { TaskStanding, TaskStatus } from './taskstatus';
 
 // ---------- states and actions ----------
 
@@ -46,7 +58,7 @@ export function TaskStateTag({ state }: { state: TaskState }) {
   return <Tag tone={`task-st ts-${state}`}>{TASK_STATE_LABEL[state]}</Tag>;
 }
 
-type Action = 'approve' | 'start' | 'interrupt' | 'resume' | 'drop';
+type Action = 'approve' | 'start' | 'interrupt' | 'resume' | 'drop' | 'unschedule';
 
 /** The one-tap action a task offers in its state, if any. */
 function primaryAction(state: TaskState): { action: Action; label: string; icon: string; tone: string } | null {
@@ -58,13 +70,33 @@ function primaryAction(state: TaskState): { action: Action; label: string; icon:
   return null;
 }
 
+/**
+ * The control beside the bell on a Work row, one tap and no confirmation (undone by the same control): Pause an Active
+ * task (it stops its agents) and Resume a Paused one; Start now on a Scheduled task (Unschedule is in its menu) and
+ * Schedule a Waiting one.
+ */
+function quickAction(state: TaskState): { action: Action; label: string; icon: string } | null {
+  if (state === 'active') return { action: 'interrupt', label: 'Pause', icon: 'pause' };
+  if (state === 'paused') return { action: 'resume', label: 'Resume', icon: 'play' };
+  if (state === 'scheduled') return { action: 'start', label: 'Start now', icon: 'play' };
+  if (state === 'waiting') return { action: 'approve', label: 'Schedule', icon: 'plus' };
+  return null;
+}
+
 function useTaskActions(task: Task, onDone?: (state: TaskState) => void) {
   const { busy, error, run } = useAction();
   const act = (action: Action) => {
     if (action === 'drop' && !confirm(`Drop the task “${task.title}”? The director is told to stop any work on it.`)) return;
     void run(async () => {
-      await api(`/api/tasks/${task.id}/${action}`, { method: 'POST', body: {} });
-      const to: Record<Action, TaskState> = { approve: 'scheduled', start: 'active', interrupt: 'paused', resume: 'active', drop: 'dropped' };
+      try {
+        await api(`/api/tasks/${task.id}/${action}`, { method: 'POST', body: {} });
+      } catch (err) {
+        // Winding down, at rest or stopped (server/projectmode.ts): starting a task asks first, and starts only it.
+        if (!(err instanceof ApiError && err.data?.needsConfirm)) throw err;
+        if (!confirm(err.message)) return;
+        await api(`/api/tasks/${task.id}/${action}`, { method: 'POST', body: { anyway: true } });
+      }
+      const to: Record<Action, TaskState> = { approve: 'scheduled', start: 'active', interrupt: 'paused', resume: 'active', drop: 'dropped', unschedule: 'waiting' };
       onDone?.(to[action]);
     });
   };
@@ -166,10 +198,21 @@ const GROUPS: { id: string; title: string; states: TaskState[] }[] = [
   { id: 'paused', title: 'Paused', states: ['paused'] },
 ];
 
+const TIMELINE_KEY = 'helm.work.timeline';
+const TimelineView = lazyNamed<{ s: ProjectState }>(() => import('./timeline'), 'TimelineView');
+
 /** `embedded`: a section of the Work page (work.tsx), under its heading. */
 export function TasksSection({ s, page = false, initialSort = 'queue', embedded = false }: { s: ProjectState; page?: boolean; initialSort?: TaskSort; embedded?: boolean }) {
   const [sort, setSort] = useState<TaskSort>(initialSort);
   const [showClosed, setShowClosed] = useState(false);
+  // The Timeline (timeline.tsx) instead of the list, on the Work page; remembered on this device.
+  const canTimeline = page && initialSort !== 'needs';
+  const [timelineOn, setTimelineOn] = useState(() => localStorage.getItem(TIMELINE_KEY) === '1');
+  const timeline = canTimeline && timelineOn;
+  const showTimeline = (on: boolean) => {
+    setTimelineOn(on);
+    localStorage.setItem(TIMELINE_KEY, on ? '1' : '0');
+  };
   const [editing, setEditing] = useState<Task | 'new' | null>(null);
   // Optimistic state and queue order until the project refetches.
   const [stateOverride, setStateOverride] = useState<Record<string, TaskState>>({});
@@ -192,9 +235,23 @@ export function TasksSection({ s, page = false, initialSort = 'queue', embedded 
   const closed = rest.filter((t) => !OPEN.includes(t.state)).sort((a, b) => b.updated_at - a.updated_at);
   // The Needs-response filter (and where the old Inbox tab leads): discussions awaiting a response are listed too.
   const discNeeds = sort === 'needs' ? [...s.discussions.filter((d) => d.kind !== 'task'), ...(s.request_holders ?? [])].filter(needsResponse) : [];
+  // Dragging a Scheduled row (by its handle) into the Active section starts it, as Start now does.
+  const [dragging, setDragging] = useState(false);
+  const [overActive, setOverActive] = useState(false);
+  const startTask = (id: string) => {
+    const act = async (anyway: boolean) => api(`/api/tasks/${id}/start`, { method: 'POST', body: anyway ? { anyway: true } : {} });
+    setStateOverride((o) => ({ ...o, [id]: 'active' }));
+    void act(false)
+      .catch(async (err) => {
+        // Winding down, at rest or stopped: starting a task asks first, and starts only it.
+        if (!(err instanceof ApiError && err.data?.needsConfirm) || !confirm(err.message)) throw err;
+        await act(true);
+      })
+      .catch(() => setStateOverride((o) => { const n = { ...o }; delete n[id]; return n; }));
+  };
   const setState = (id: string) => (state: TaskState) => setStateOverride((o) => ({ ...o, [id]: state }));
 
-  const row = (t: Task, reorder?: ReorderProps) => <TaskRow key={t.id} t={t} s={s} onEdit={() => setEditing(t)} onState={setState(t.id)} reorder={reorder} showReason={sort === 'importance'} />;
+  const row = (t: Task, reorder?: ReorderProps) => <TaskRow key={t.id} t={t} s={s} onEdit={() => setEditing(t)} onState={setState(t.id)} reorder={reorder} showState={sort !== 'queue'} />;
 
   const moveScheduled = (ids: string[], id: string, to: number) => {
     const without = ids.filter((x) => x !== id);
@@ -209,17 +266,15 @@ export function TasksSection({ s, page = false, initialSort = 'queue', embedded 
 
   return (
     <section className={`tasks ${page ? 'tasks-page' : ''}`}>
-      <div className="section-head">
-        {page && !embedded ? <h1 className="page-title">Tasks</h1> : <h2>{initialSort === 'needs' ? 'Needs response' : 'Tasks'}</h2>}
-        <button className="btn small" onClick={() => setEditing('new')}>
-          <Icon name="plus" size={15} /> Add task
-        </button>
-      </div>
-      {tasks.length > 0 && (
-        <div className="toolbar">
+      {/* One row: the order on the left, Add on the right. */}
+      <div className="section-head tasks-head">
+        {page && !embedded && <h1 className="page-title">Tasks</h1>}
+        {canTimeline && (
+          <Chips value={timeline ? 'timeline' : 'list'} onChange={(v) => showTimeline(v === 'timeline')} options={[{ id: 'list', label: 'List' }, { id: 'timeline', label: 'Timeline' }]} />
+        )}
+        {tasks.length > 0 && !timeline && (
           <label className="sort">
-            Order
-            <select value={sort} onChange={(e) => setSort(e.target.value as TaskSort)}>
+            <select aria-label="Order" value={sort} onChange={(e) => setSort(e.target.value as TaskSort)}>
               <option value="queue">Queue order</option>
               <option value="importance">Priorities</option>
               <option value="state">State</option>
@@ -227,30 +282,39 @@ export function TasksSection({ s, page = false, initialSort = 'queue', embedded 
               <option value="needs">Needs response only</option>
             </select>
           </label>
-        </div>
-      )}
-      <NeedsGroup list={needs} stateTag={(t) => <TaskStateTag state={t.state as TaskState} />} />
-      {sort === 'needs' && <NeedsGroup list={discNeeds} title="Discussions needing response" stateTag={(d) => <DiscussionStateTag state={d.state as DiscussionState} />} />}
-      {sort === 'needs' && !needs.length && !discNeeds.length && <Empty title="Nothing needs your response">When an agent asks you something or needs a permission, the task or discussion it concerns shows here with the answer controls.</Empty>}
+        )}
+        <span className="spacer" />
+        {/* A discussion with the director about merging, ordering or chaining the tasks not running (consolidate.tsx). */}
+        <ConsolidateButton pid={s.project.id} />
+        <button className="btn small" onClick={() => setEditing('new')}>
+          <Icon name="plus" size={16} /> Add task
+        </button>
+      </div>
+      {timeline ? <TimelineView s={s} /> : <>
+      <NeedsGroup list={needs} />
+      {sort === 'needs' && <NeedsGroup list={discNeeds} title="Discussions needing response" />}
+      {sort === 'needs' && !needs.length && !discNeeds.length && <Empty title="Nothing needs you" />}
       {sort === 'needs' && (
         <p className="muted small decisions-link">
-          <a href={href('p', s.project.id, 'setup', 'decisions')}>Decisions made for you</a>: permission requests Helm answered without asking.
+          <a href={href('p', s.project.id, 'setup', 'decisions')}>Decisions made for you</a>
         </p>
       )}
       {tasks.length === 0 && sort !== 'needs' && (
-        <Empty title="No tasks yet">Tasks are the units of work: what is happening now, what is lined up, and what waits to be scheduled. The director adds them as it breaks work down; you can add your own.</Empty>
+        <Empty title="No tasks yet" />
       )}
 
       {sort === 'queue' &&
         GROUPS.map((g) => {
-          const list = open.filter((t) => g.states.includes(t.state));
-          if (!list.length) return null;
+          // Within a group, tasks waiting on others go after the ready ones (a stable sort keeps the queue order).
+          const list = open.filter((t) => g.states.includes(t.state)).sort((a, b) => Number(blocked(a)) - Number(blocked(b)));
+          // While a Scheduled row is dragged, an empty Active section shows as the place to drop it.
+          if (!list.length && !(g.id === 'active' && dragging)) return null;
           return (
-            <div key={g.id} className={`task-group group-${g.id}`}>
+            <div key={g.id} className={`task-group group-${g.id} ${g.id === 'active' && dragging ? 'drop-target' : ''} ${g.id === 'active' && overActive ? 'drop-over' : ''}`}>
               <h3 className="group-title">
-                {g.title} <span className="muted">{list.length}</span>
+                {g.title}
               </h3>
-              {g.id === 'scheduled' ? <ReorderList tasks={list} render={row} onMove={moveScheduled} /> : <div className="stack">{list.map((t) => row(t))}</div>}
+              {g.id === 'scheduled' ? <ReorderList tasks={list} render={row} onMove={moveScheduled} onDragging={setDragging} onOverActive={setOverActive} onActivate={startTask} /> : <div className="stack">{list.map((t) => row(t))}</div>}
             </div>
           );
         })}
@@ -272,7 +336,7 @@ export function TasksSection({ s, page = false, initialSort = 'queue', embedded 
                 <span className="row wrap">
                   <b>{i.t.title}</b>
                   <TaskStateTag state={i.t.state} />
-                  {i.pinned && <Icon name="pin" size={12} />}
+                  {i.pinned && <Icon name="pin" size={16} />}
                   <ImportanceTag level={i.t.importance} change={recentChange(s, i.t.id)} compact onlyMove />
                 </span>
                 {i.t.importance_reason && <span className="muted small one-line">{i.t.importance_reason}</span>}
@@ -287,11 +351,12 @@ export function TasksSection({ s, page = false, initialSort = 'queue', embedded 
       {closed.length > 0 && sort !== 'needs' && (
         <div className="task-group group-closed">
           <button className="group-toggle" onClick={() => setShowClosed(!showClosed)} aria-expanded={showClosed}>
-            <Icon name="chevron" size={14} /> Done and dropped <span className="muted">{closed.length}</span>
+            <Icon name="chevron" size={16} /> Done and dropped <span className="muted">{closed.length}</span>
           </button>
           {showClosed && <div className="stack">{closed.map((t) => row(t))}</div>}
         </div>
       )}
+      </>}
       {editing && <TaskEditor s={s} task={editing === 'new' ? null : editing} onClose={() => setEditing(null)} />}
     </section>
   );
@@ -301,26 +366,45 @@ export function TasksSection({ s, page = false, initialSort = 'queue', embedded 
 
 type ReorderProps = { handle: ReactNode; dragging: boolean; offset: number };
 
-function ReorderList({ tasks, render, onMove }: { tasks: Task[]; render: (t: Task, r: ReorderProps) => ReactNode; onMove: (ids: string[], id: string, to: number) => void }) {
+function ReorderList({ tasks, render, onMove, onDragging, onOverActive, onActivate }: { tasks: Task[]; render: (t: Task, r: ReorderProps) => ReactNode; onMove: (ids: string[], id: string, to: number) => void; onDragging?: (on: boolean) => void; onOverActive?: (on: boolean) => void; onActivate?: (id: string) => void }) {
   const box = useRef<HTMLDivElement>(null);
   const ids = tasks.map((t) => t.id);
   const toRef = useRef<number | null>(null);
   const [to, setTo] = useState<number | null>(null);
+  const overRef = useRef(false);
+  // Is the pointer inside the Active section (the drop target for starting the task)?
+  const inActive = (y: number) => {
+    const r = box.current?.closest('.tasks')?.querySelector('.group-active')?.getBoundingClientRect();
+    return !!r && y >= r.top && y <= r.bottom;
+  };
   // Where the dragged row would land: the number of other rows whose middle is above the pointer.
   const { drag, gripProps, rowProps } = useDragReorder({
     onMove: (id, y) => {
       const rows = [...(box.current?.children ?? [])] as HTMLElement[];
       toRef.current = rows.filter((r, i) => ids[i] !== id && r.getBoundingClientRect().top + r.getBoundingClientRect().height / 2 < y).length;
       setTo(toRef.current);
+      const over = !!onActivate && inActive(y);
+      if (over !== overRef.current) {
+        overRef.current = over;
+        onOverActive?.(over);
+      }
     },
     onDrop: (id) => {
       const dest = toRef.current;
       toRef.current = null;
       setTo(null);
+      const over = overRef.current;
+      overRef.current = false;
+      onOverActive?.(false);
+      if (over && onActivate) return onActivate(id);
       if (dest !== null && dest !== ids.indexOf(id)) onMove(ids, id, dest);
     },
   });
   const from = drag ? ids.indexOf(drag.id) : -1;
+  const isDragging = !!drag;
+  useEffect(() => {
+    onDragging?.(isDragging);
+  }, [isDragging]);
 
   return (
     <div className={`stack reorder ${drag ? 'is-dragging' : ''}`} ref={box}>
@@ -349,102 +433,86 @@ function ReorderList({ tasks, render, onMove }: { tasks: Task[]; render: (t: Tas
 
 // ---------- one task row ----------
 
-function DriverLine({ driver, live, s }: { driver: Task['driver']; live?: Agent; s: ProjectState }) {
-  if (!driver) return null;
-  const a = live ?? driver;
-  return (
-    <div className="task-driver">
-      <div className="row">
-        <span className="task-driver-name">{a.name}</span>
-        <Status status={a.status} />
-        <HostBadges agentId={a.id} s={s} />
-        <span className="spacer" />
-        {a.progress !== null && <span className="mono small muted">{progressLabel(a as Agent)}</span>}
-      </div>
-      {a.status_line && <p className="muted small one-line"><PlainRefs text={a.status_line} /></p>}
-      {a.progress !== null && <Progress value={a.progress} tone={a.status === 'working' ? 'live' : ''} />}
-    </div>
-  );
-}
-
-/** Who wrote the thread's newest message and what, as markdown; shown as one plain line (PlainRefs strip). */
-function lastLine(t: Task): string | null {
-  if (!t.last) return null;
-  const who = t.last.author === 'user' ? 'You' : t.last.author_name;
-  return `${who}: ${t.last.body}`;
-}
-
-function TaskRow({ t, s, onEdit, onState, reorder, showReason = false }: { t: Task; s: ProjectState; onEdit: () => void; onState: (st: TaskState) => void; reorder?: ReorderProps; showReason?: boolean }) {
+function TaskRow({ t, s, onEdit, onState, reorder, showState = true }: { t: Task; s: ProjectState; onEdit: () => void; onState: (st: TaskState) => void; reorder?: ReorderProps; showState?: boolean }) {
   const { busy, error, act, move, toDiscussion } = useTaskActions(t, onState);
   const primary = primaryAction(t.state);
-  const live = s.agents.find((a) => a.id === t.driver?.id);
+  const [waitsOpen, setWaitsOpen] = useState(false);
+  // The agent named on the row: one working on the task (an engineer the driver started, often), else the driver.
+  const live = s.agents.find((a) => (a.id === t.driver?.id || a.task_id === t.id) && (a.status === 'working' || a.status === 'waiting')) ?? s.agents.find((a) => a.id === t.driver?.id);
   const isOpen = OPEN.includes(t.state);
   const link = href('p', s.project.id, 'tasks', t.id);
-  const last = lastLine(t);
+  // One meta line under the title, the same on every row: priority, reports, what it waits for, running time.
+  // (No excerpt of the thread or the agent's status: that is in the task.)
+  const quick = t.kind !== 'discussion' ? quickAction(t.state) : null;
+  const merged = t.merged_into ? `Merged into ${t.merged_into_title ?? 'another task'}` : '';
+  const fromReports = t.report_count ? `From ${t.report_count} ${t.report_count === 1 ? 'report' : 'reports'}` : '';
+  const flag = t.kind !== 'discussion' && t.state === 'active' && (t.stalled || t.awaiting_review);
+  // Done: a muted check before the title and "Done · time" in the meta line, instead of the state badge on the right.
+  const done = t.state === 'done' && !t.merged_into;
 
   return (
-    <article className={`card task task-${t.state} ${reorder?.dragging ? 'dragging' : ''}`}>
+    <article className={`card task task-${t.state} ${reorder?.dragging ? 'dragging' : ''}`} data-kctx={`task:${t.id}`} data-kpreview={t.thumb ? `${t.project_id}/${t.thumb.id}` : undefined}>
       <div className="task-top">
         {reorder?.handle}
-        <a className="task-link" href={link}>
+        <a className="task-link" href={link} onPointerEnter={() => prefetch(`/api/tasks/${t.id}`)} onTouchStart={() => prefetch(`/api/tasks/${t.id}`)}>
           <div className="task-title-row">
             <h3>
+              {done && <span className="task-done-check"><Icon name="check" size={16} /></span>}
               {t.title}
               <ClipCount n={t.attach_count} />
             </h3>
-            <TaskStateTag state={t.state} />
+            {t.merged_into ? <Tag tone="task-st ts-dropped">Merged</Tag> : !blocked(t) && !done && (showState || !isOpen) && <TaskStateTag state={t.state} />}
           </div>
-          {t.kind !== 'discussion' && (
-            <span className="task-imp small">
-              <ImportancePicker id={t.id} level={t.importance} pinned={!!t.importance_pinned} change={recentChange(s, t.id)} compact />
-              {showReason && t.importance_reason && <span className="muted one-line"> {t.importance_reason}</span>}
-            </span>
-          )}
-          {t.doc && (
-            <span className="task-doc small">
-              <Tag tone="tone-spec">Spec</Tag> {t.doc.title}
-            </span>
-          )}
-          {t.needs_response > 0 && (
-            <span className="task-asks small">
-              Needs response: {t.needs_response} {t.needs_response === 1 ? 'request' : 'requests'}
-            </span>
+          {(t.kind !== 'discussion' || done) && (
+            <div className="task-meta small">
+              {done && <span className="muted">Done{t.finished_at ? ` · ${when(t.finished_at)}` : ''}</span>}
+              {/* Priority stays on every row; tap it to change, or drag in Priority order. */}
+              {t.kind !== 'discussion' && <ImportanceButton t={t} />}
+              {merged && <span className="muted">{merged}</span>}
+              {fromReports && <span className="muted">{fromReports}</span>}
+              {/* What it waits for (instead of its state), or what waits on it. */}
+              {isOpen && <WaitsLine t={t} pid={s.project.id} only={blocked(t) ? 'waits' : 'blocks'} />}
+              {flag ? <TaskTiming t={t} /> : t.state === 'active' ? <RunTimer t={t} check={t.check} /> : null}
+            </div>
           )}
           <ProposalStrip p={t.proposal} />
-          {t.kind !== 'discussion' && <TaskTiming t={t} />}
-          {last && <p className="task-last small one-line"><PlainRefs text={last} strip /></p>}
         </a>
-        {t.thumb && t.thumb.kind === 'image' && t.thumb.file && (
-          <a className="task-thumb" href={link} aria-hidden="true" tabIndex={-1}>
-            <img src={`/artifacts/${t.thumb.file}`} alt="" loading="lazy" />
-          </a>
-        )}
-      </div>
-      {t.waiting_on_user_without_request && <UnfiledNeed t={t} compact />}
-      {isOpen && <DriverLine driver={t.driver} live={live} s={s} />}
-      <div className="row task-actions">
-        {primary && (
-          <button className={`btn ${primary.tone}`} disabled={busy} onClick={() => act(primary.action)}>
-            <Icon name={primary.icon} size={15} /> {primary.label}
-          </button>
-        )}
-        <span className="spacer" />
-        {!isOpen && <span className="muted small">{ago(t.updated_at)}</span>}
+        {/* The latest previews show as the thumbnails above (ProposalStrip); the menu, and under it how long it has run. */}
+        <div className="task-side">
+        <div className="task-side-top">
+        {/* Bell, the one-tap control and the menu: three slots of one width, so they line up on every row. */}
+        <span className="task-slot"><BellButton t={t} /></span>
+        <span className="task-slot">
+          {quick && (
+            <button className={`icon-btn task-quick ${quick.action === 'start' ? 'start' : ''}`} disabled={busy} aria-label={`${quick.label}: ${t.title}`} title={quick.label} onClick={(e) => (e.preventDefault(), e.stopPropagation(), act(quick.action))}>
+              <Icon name={quick.icon} size={20} />
+            </button>
+          )}
+        </span>
         <Menu
           label={`More actions for ${t.title}`}
           items={[
+            // A Scheduled row shows Start now as its own button; its menu has Unschedule instead.
+            primary && t.state !== 'scheduled' ? { label: primary.label, onSelect: () => act(primary.action) } : false,
+            t.state === 'scheduled' && t.kind !== 'discussion' && { label: 'Unschedule', onSelect: () => act('unschedule') },
+            t.state === 'paused' && t.kind !== 'discussion' && { label: 'Schedule', onSelect: () => act('approve') },
             { label: 'Edit', onSelect: onEdit },
-            (t.state === 'planning' || t.state === 'waiting') && { label: 'Start now', onSelect: () => act('start') },
+            isOpen && t.kind !== 'discussion' && { label: 'Waits for…', onSelect: () => setWaitsOpen(true) },
+            (t.state === 'planning' || t.state === 'waiting') && !blocked(t) && { label: 'Start now', onSelect: () => act('start') },
             isOpen && { label: 'Move up', onSelect: () => move('up') },
             isOpen && { label: 'Move down', onSelect: () => move('down') },
             isOpen && { label: 'Move to top', onSelect: () => move('top') },
-            { label: 'Open thread', onSelect: () => go('p', s.project.id, 'tasks', t.id) },
             movable(t) && { label: 'Move to discussions', onSelect: toDiscussion },
             isOpen && { label: 'Drop', onSelect: () => act('drop'), danger: true },
           ]}
         />
+        </div>
+        </div>
       </div>
+      {waitsOpen && <WaitsPicker t={t} s={s} onClose={() => setWaitsOpen(false)} />}
+      {t.waiting_on_user_without_request && <UnfiledNeed t={t} compact />}
       {error && <p className="error-text">{error}</p>}
+      {isOpen && <EdgeProgress value={(live ?? t.driver)?.progress} live={(live ?? t.driver)?.status === 'working'} />}
     </article>
   );
 }
@@ -459,10 +527,10 @@ function UnfiledNeed({ t, compact = false }: { t: Task; compact?: boolean }) {
   return (
     <div className={`unfiled-need ${compact ? 'compact' : ''}`} title={compact && t.unfiled_need ? `It says: ${t.unfiled_need}` : undefined}>
       <span className="unfiled-head">
-        <Icon name="inbox" size={14} /> {compact ? 'Says it needs you, nothing filed' : 'Says it needs you, but nothing was filed'}
+        <Icon name="inbox" size={16} /> {compact ? 'Says it needs you, nothing filed' : 'Says it needs you, but nothing was filed'}
       </span>
       {!compact && t.unfiled_need && <q className="small one-line">{t.unfiled_need}</q>}
-      <button className={`btn ${compact ? 'quiet small-btn' : 'req-btn'}`} disabled={busy || asked} onClick={() => void run(async () => { await api(`/api/tasks/${t.id}/ask-needs`, { method: 'POST' }); setAsked(true); })}>
+      <button className={`btn ${compact ? 'quiet small' : ''}`} disabled={busy || asked} onClick={() => void run(async () => { await api(`/api/tasks/${t.id}/ask-needs`, { method: 'POST' }); setAsked(true); })}>
         {asked ? 'Asked the director' : compact ? 'Ask the director' : 'Ask the director what it needs'}
       </button>
       {error && <p className="error-text small">{error}</p>}
@@ -473,13 +541,18 @@ function UnfiledNeed({ t, compact = false }: { t: Task; compact?: boolean }) {
 // ---------- add / edit ----------
 
 function TaskEditor({ s, task, onClose }: { s: ProjectState; task: Task | null; onClose: () => void }) {
-  const [form, setForm] = useState({ title: task?.title ?? '', description: task?.description ?? '', doc_id: task?.doc_id ?? '', scheduled: false });
+  // A task being written or edited keeps what is typed until it is saved (drafts.ts).
+  const draftKey = task ? `task-edit:${task.id}` : `new-task:${s.project.id}`;
+  const [form, setForm, clearForm] = useStoredForm(draftKey, { title: task?.title ?? '', description: task?.description ?? '', doc_id: task?.doc_id ?? '', scheduled: false });
   const { busy, error, run } = useAction();
   const docs = s.docs.filter((d) => d.kind === 'entry' || d.kind === 'goal' || d.kind === 'design');
   const save = async () => {
     const body = { title: form.title, description: form.description, doc_id: form.doc_id || null, scheduled: form.scheduled };
     const done = await run(() => (task ? api(`/api/tasks/${task.id}`, { method: 'PATCH', body }) : api(`/api/projects/${s.project.id}/tasks`, { body })));
-    if (done) onClose();
+    if (done) {
+      clearForm();
+      onClose();
+    }
   };
   return (
     <Sheet title={task ? 'Edit task' : 'New task'} onClose={onClose}>
@@ -542,32 +615,133 @@ function matches(i: TimelineItem, f: Filter): boolean {
 /** The page a row belongs on: a discussion's, or a task's (a discussion that became a task lives there now). */
 const pageOf = (kind?: string) => (kind === 'discussion' ? 'discussions' : 'tasks');
 
+/** The latest status summary's first line: one muted line on the title card and its strip. */
+function statusLineOf(t: Task) {
+  return t.status_summary ? (
+    <p className="task-head-status muted small one-line" title={t.status_summary}>
+      <PlainRefs text={t.status_summary.split('\n')[0]} strip />
+    </p>
+  ) : null;
+}
+
+/**
+ * What the task's title card holds, shared by the task page and Home's running cards: state, importance, running time and
+ * share; the title; the status line; its agents with what each is doing now; the commands running; and Interrupt /
+ * Interject / Edit, the bell and the menu. `shot`: the latest preview as a large panel on the card's right (above the
+ * rest on a phone), which Home turns on.
+ */
+export function TaskHeadBody({ t, pid, agents, driverId, commands, reportCount = 0, shot, titleHref, onState, onEdit, onWaits, onAnother, canBeDiscussion }: { t: Task; pid: string; agents: Agent[]; driverId?: string | null; commands?: TaskDetail['commands']; reportCount?: number; shot?: Preview | null; titleHref?: string; onState: (s: TaskState) => void; onEdit: () => void; onWaits?: () => void; onAnother?: () => void; canBeDiscussion: boolean }) {
+  const statusLine = statusLineOf(t);
+  const picture = hasThumb(shot);
+  const main = (
+    <>
+        <div className="row task-head-meta">
+          <TaskStateTag state={t.state} />
+          {t.kind !== 'discussion' && <ImportanceButton t={t} />}
+          <span className="spacer" />
+          {/* One line, right-aligned: "took 47 min · 2 min ago"; " ago" goes first when the row is narrow (styles.css). */}
+          <span className="muted small task-head-when">
+            <TaskTiming t={t} />
+            {t.started_at && t.state !== 'dropped' ? ' · ' : ''}
+            {ago(t.updated_at).replace(/ ago$/, '')}
+            {/ ago$/.test(ago(t.updated_at)) && <span className="task-head-ago"> ago</span>}
+          </span>
+          <ShareButton route={href('p', pid, 'tasks', t.id)} title={t.title} />
+        </div>
+        {t.origin === 'away' && t.origin_note && <p className="found-note small"><span className="tag tone-warning">Found while away</span> {t.origin_note}</p>}
+        <h1 className="page-title">
+          {titleHref ? (
+            <a className="head-title-link" href={titleHref}>
+              {t.title}
+            </a>
+          ) : (
+            t.title
+          )}
+        </h1>
+        {/* The progress check's reason, spelled out: a phone has no hover (server/progress.ts). */}
+        {t.check && <p className="task-head-check small one-line" title={t.check}><span className="task-check">Check:</span> {t.check}</p>}
+        {statusLine}
+        {/* The reports it is for: one muted line; they are listed in About. */}
+        {reportCount > 0 && (
+          <button type="button" className="task-head-reports muted small" onClick={() => jumpTo('.task-about', { fold: 'about' })}>
+            From {reportCount} {reportCount === 1 ? 'report' : 'reports'}
+          </button>
+        )}
+        {OPEN.includes(t.state) && <TaskAgents agents={agents} driverId={driverId} pid={pid} />}
+        {OPEN.includes(t.state) && <TaskCommands commands={commands} />}
+    </>
+  );
+  const actions = <TaskHeadActions t={t} tokens={tokensText(t.tokens)} onWaits={onWaits} onEdit={onEdit} onAnother={onAnother} onState={onState} canBeDiscussion={canBeDiscussion} />;
+  return shot && picture ? (
+    <>
+        {shot && picture && (
+          <button type="button" className="task-head-shot" onClick={() => openPreview(pid, shot.id)} aria-label={`Open the latest preview: ${shot.title}`}>
+            <PreviewThumb p={shot} />
+          </button>
+        )}
+      <div className="task-head-main">{main}</div>
+      {/* The actions run along the card's whole bottom, under the text and the preview. */}
+      <div className="task-head-foot">{actions}</div>
+    </>
+  ) : (
+    <>
+      {main}
+      {actions}
+    </>
+  );
+}
+
+/**
+ * A running task on Home: the task page's title card itself (TaskHeadBody), so Share, the importance, Interrupt,
+ * Interject, Edit, the bell and the menu come with it, with the latest preview as a large panel on its right.
+ */
+export function RunningTaskCard({ s, t: row }: { s: ProjectState; t: Task }) {
+  const pid = s.project.id;
+  const [editing, setEditing] = useState(false);
+  const [waitsOpen, setWaitsOpen] = useState(false);
+  const [another, setAnother] = useState(false);
+  const [override, setOverride] = useState<TaskState | null>(null);
+  useEffect(() => setOverride(null), [row.state, row.updated_at]);
+  const t = override ? { ...row, state: override } : row;
+  const agents = s.agents.filter((a) => a.task_id === t.id || a.id === t.driver?.id);
+  const shot = hasThumb(t.thumb) ? t.thumb : null;
+  return (
+    <>
+      {/* The title is a link and the card's empty space opens the task too; buttons, links, the preview panel and the menus keep their own taps. */}
+      <header
+        className={`card task-head home-run ${shot ? 'with-shot' : ''}`}
+        data-kctx={`task:${t.id}`}
+        data-kpreview={shot ? `${t.project_id}/${shot.id}` : undefined}
+        onClick={(e) => {
+          if (e.defaultPrevented || (e.target as HTMLElement).closest('a, button, input, textarea, select, summary, [role="menu"], [role="dialog"]')) return;
+          go('p', pid, 'tasks', t.id);
+        }}
+      >
+        <TaskHeadBody t={t} pid={pid} agents={agents} driverId={t.driver?.id} shot={shot} titleHref={href('p', pid, 'tasks', t.id)} onWaits={() => setWaitsOpen(true)} onEdit={() => setEditing(true)} onAnother={t.became_task_at ? () => setAnother(true) : undefined} onState={setOverride} canBeDiscussion={!agents.length} />
+      </header>
+      {editing && <TaskEditor s={s} task={t} onClose={() => setEditing(false)} />}
+      {waitsOpen && <WaitsPicker t={t} s={s} onClose={() => setWaitsOpen(false)} />}
+      {another && <NewTaskSheet from={t} another onClose={() => setAnother(false)} />}
+    </>
+  );
+}
+
 export function TaskPage({ s, taskId, tab }: { s: ProjectState; taskId: string; tab: string }) {
   const pid = s.project.id;
-  const { data, error } = useLive<TaskDetail>(`/api/tasks/${taskId}`, (m) => m.type === 'project' && m.projectId === pid);
+  // Live: the project's changes, and every event of an agent on this task (its Status shows the call in progress).
+  const onTask = useRef<Set<string>>(new Set());
+  const { data, error } = useLive<TaskDetail>(`/api/tasks/${taskId}`, (m) => (m.type === 'project' && m.projectId === pid) || (m.type === 'event' && onTask.current.has(m.agentId)));
+  onTask.current = new Set((data?.agents ?? []).filter((a) => a.on_task || a.role_id === 'subagent').map((a) => a.id));
   const [filter, setFilter] = useState<Filter>('all');
   const [editing, setEditing] = useState(false);
+  const [waitsOpen, setWaitsOpen] = useState(false);
   const [another, setAnother] = useState(false);
   // Which discussion blocks the reader opened or closed; unset means the default (collapsed when long).
   const [eraOpen, setEraOpen] = useState<Record<string, boolean>>({});
   const toggleEra = (id: string, open: boolean) => setEraOpen((m) => ({ ...m, [id]: open }));
   const [override, setOverride] = useState<TaskState | null>(null);
-  // What changed → its place in the history: show everything, then scroll the entry into view and mark it.
-  const [jumpTo, setJumpTo] = useState<string | null>(null);
-  const jump = (key: string) => {
-    setFilter('all');
-    setJumpTo(key);
-  };
-  useEffect(() => {
-    if (!jumpTo) return;
-    const el = document.querySelector(`.task-thread [data-key="${jumpTo}"]`);
-    setJumpTo(null);
-    if (!el) return;
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    el.classList.add('jumped');
-    setTimeout(() => el.classList.remove('jumped'), 2200);
-  }, [jumpTo]);
   useEffect(() => setOverride(null), [data]);
+  const [histOpen, toggleHist] = useFold('history', true);
   // Old URLs keep working: a discussion that became a task, or an old task id merged into one, goes to where it is now.
   const canonical = data && (data.task.id !== taskId || pageOf(data.task.kind) !== tab) ? href('p', pid, pageOf(data.task.kind), data.task.id) : null;
   useEffect(() => {
@@ -593,13 +767,37 @@ export function TaskPage({ s, taskId, tab }: { s: ProjectState; taskId: string; 
     ...(became ? eraLines({ id: 'own', items: shown(data.timeline.filter((i) => i.ts < became)), all: data.timeline.filter((i) => i.ts < became), pid, s, directorName, open: eraOpen.own, toggle: toggleEra }) : []),
     ...withPeriodDividers(toThreadLines(shown(became ? data.timeline.filter((i) => i.ts >= became) : data.timeline), s, directorName, pinCtx(t.id, data.proposal)), data.periods),
   ];
-  const count = (f: Filter) => data.timeline.filter((i) => matches(i, f)).length + (data.origins ?? []).reduce((n, o) => n + o.timeline.filter((i) => matches(i, f)).length, 0);
   const working = root?.status === 'working' ? { name: root.name, line: root.status_line } : driver?.status === 'working' ? { name: driver.name, line: driver.status_line } : null;
   // Everyone on the task, with live status from the project state.
   const liveAgents = [driver, ...others].filter((a): a is Agent => !!a);
   const closed = t.state === 'done' || t.state === 'dropped';
-  // Open tasks reply through the chat (its docked bar, and the button under the history); a closed one keeps the history's own composer.
+  // Open tasks reply through the chat (Interject or Message on the title card, and the docked bar); a closed one keeps the history's own composer.
   const docked = !closed;
+  // The latest status summary: one muted line on the title card and its strip (the whole text is in the History).
+  const statusLine = statusLineOf(t);
+  // Every agent on the task and what each is doing now (tasknow.tsx); the strip keeps the first working one.
+  const driverLine = OPEN.includes(t.state) && <TaskAgents agents={liveAgents} driverId={driver?.id} pid={pid} />;
+  const stripAgent = OPEN.includes(t.state) && <TaskAgents agents={liveAgents} driverId={driver?.id} pid={pid} max={1} />;
+  // Jumps to the page's sections that exist, on the strip once the title card is scrolled away: one line, sideways if needed.
+  const hasReview = !!data.proposal || !!data.review?.items?.length || !!t.needs_from_user || !!t.waiting_on_user_without_request || (t.requests ?? []).some((r) => r.status === 'open');
+  const jumps = (
+    <nav className="title-strip-jumps" aria-label="Jump to">
+      {hasReview && (
+        <button type="button" onClick={() => jumpTo('.prop-area, .needs-from-you, .unfiled-need, .now-needs')}>
+          Review
+        </button>
+      )}
+      <button type="button" onClick={() => jumpTo('.task-thread, .task-thread-folded', { fold: 'history' })}>
+        History
+      </button>
+      <button type="button" onClick={() => jumpTo('.task-about', { fold: 'about' })}>
+        About
+      </button>
+      <button type="button" onClick={() => jumpTo('.task-thread', { fold: 'history', end: true })}>
+        Latest
+      </button>
+    </nav>
+  );
 
   return (
     <section className="task-page">
@@ -607,81 +805,58 @@ export function TaskPage({ s, taskId, tab }: { s: ProjectState; taskId: string; 
         <Icon name="back" size={16} /> Work
       </a>
 
-      {/* The Now area (tasknow.tsx): header, Needs you, Happening now, Latest, What changed. */}
-      <header className="card task-head">
-        <div className="row wrap task-head-meta">
-          <TaskStateTag state={t.state} />
-          {t.kind !== 'discussion' && <ImportancePicker id={t.id} level={t.importance} pinned={!!t.importance_pinned} change={recentChange(s, t.id)} compact />}
-          <TaskTiming t={t} />
-          {!t.started_at && <span className="muted small">updated {ago(t.updated_at)}</span>}
-        </div>
-        {t.origin === 'away' && t.origin_note && <p className="found-note small"><span className="found-tag">Found while away</span> {t.origin_note}</p>}
-        <h1 className="page-title">{t.title}</h1>
-        {driver && OPEN.includes(t.state) && (
-          <div className="row task-head-driver">
-            <span className="label">Driver</span>
-            <a href={href('p', pid, 'agents', driver.id)}>{driver.name}</a>
-            <Status status={driver.status} />
-            {driver.progress !== null && driver.progress !== undefined && <span className="mono small muted">{progressLabel(driver as Agent)}</span>}
-          </div>
-        )}
-        <TaskHeadActions t={t} onEdit={() => setEditing(true)} onAnother={became ? () => setAnother(true) : undefined} onState={setOverride} canBeDiscussion={!data.agents.length} />
-      </header>
+      {/* The title card; once scrolled away, a compact strip of it stays under the top bar (fold.tsx). */}
+      <StickyHead
+        className="card task-head"
+        strip={
+          <>
+            <div className="row title-strip-top">
+              <TaskStateTag state={t.state} />
+              <strong className="title-strip-title one-line">{t.title}</strong>
+              <ChatButton t={t} compact />
+            </div>
+            {statusLine}
+            {stripAgent}
+            {jumps}
+          </>
+        }
+      >
+        <TaskHeadBody t={t} pid={pid} agents={liveAgents} driverId={driver?.id} commands={data.commands} reportCount={data.reports?.length ?? 0} onWaits={() => setWaitsOpen(true)} onEdit={() => setEditing(true)} onAnother={became ? () => setAnother(true) : undefined} onState={setOverride} canBeDiscussion={!data.agents.length} />
+      </StickyHead>
 
-      {/* A planning task leads with its plan: the requests on it are about the plan. */}
-      {t.state === 'planning' && <PlanBlock text={t.description} />}
-      {/* The pinned proposal: the options the director asks the user to look at, with the question to choose (proposal.tsx). */}
-      <ProposalArea proposal={data.proposal} taskId={t.id} pid={pid} s={s} />
-      {t.needs_from_user && <NeedsFromYou t={t} pid={pid} />}
-      {t.waiting_on_user_without_request && <UnfiledNeed t={t} />}
-      <NeedsYou t={t} s={s} except={linkedRequestId(data.proposal)} />
-      {t.state === 'active' && <HappeningNow agents={liveAgents} driverId={driver?.id} pid={pid} />}
-      {/* Pinned previews are already at the top. */}
-      <Latest t={t} latest={data.latest.filter((p) => !pinCtx(t.id, data.proposal).pinned.has(p.id))} pid={pid} final={closed} />
-      <WhatChanged changes={data.changes ?? []} onJump={jump} />
+      {/* Where it stands at a glance: worklist, latest status, Done when, evidence, time against similar tasks. */}
+      <TaskStatus t={t} data={data} pid={pid} />
 
-      {data.reports && <TaskReports reports={data.reports} pid={pid} />}
-
-      <section className="card task-about">
-        <div className="section-head">
-          <h2>About this task</h2>
-          <button className="btn small quiet" onClick={() => setEditing(true)}>
-            <Icon name="edit" size={15} /> Edit
-          </button>
-        </div>
-        <p className="muted small">
-          {t.origin === 'user' ? 'Added by you' : t.origin === 'doc' ? (t.state === 'planning' || data.timeline.some((x) => x.type === 'change') ? 'From your Spec edit' : 'Lined up from a goal') : t.origin === 'report' ? 'From a report' : 'Added by the director'} · updated {ago(t.updated_at)}
-        </p>
-        {t.state === 'planning' ? <p className="muted small">The plan is at the top of the page.</p> : t.description ? <Markdown text={t.description} /> : <p className="muted">No description yet.</p>}
+      {/* About this task: right under the title, collapsed unless the user opened it (remembered on this device). */}
+      <Fold kind="about" title="About this task" openByDefault={false} className="task-about" label="About this task">
+        {/* Several parts: each with its source and its own Features and Done when, the merged picture in one place. */}
+        {/* The details kept off the rows and the header: its tier, parts and waits. */}
+        {/* Where it stands, then the one Done when list, ticked as items are met (Status only counts it). */}
+        <TaskStanding t={t} doneWhen={data.status?.done_when ?? []} />
+        <TaskDetails t={t} pid={pid} parts={data.parts?.length ?? 0} parallel={data.parallel} />
+        {(data.parts?.length ?? 0) > 1 ? <TaskParts parts={data.parts!} /> : t.state === 'planning' ? <p className="muted small">The plan is at the top of the page.</p> : t.description ? <TaskDescription text={t.description} /> : <p className="muted">No description yet.</p>}
+        {/* Its Spec entries and related work as links (server/taskrefs.ts); the Spec card keeps only what it changed. */}
+        <TaskRefs refs={data.references} />
+        {data.reports && <TaskReports reports={data.reports} pid={pid} inline />}
+        <TaskTestBuilds builds={data.test_builds} pid={pid} />
         <ThreadLinks pid={pid} label="From the discussion" links={t.discussions ?? []} />
         <ThreadLinks pid={pid} label="Also led to" links={t.tasks ?? []} />
-        {t.kind !== 'discussion' && (
-          <div className="task-importance">
-            <span className="label">Importance</span>
-            <ImportanceControl id={t.id} level={t.importance} reason={t.importance_reason} pinned={!!t.importance_pinned} what="task" />
-          </div>
-        )}
-        <References projectId={pid} owner={`task:${t.id}`} version={t.attach_count} hint="Screenshots, mockups, recordings or documents for this task. Files sent in its history are listed here too." />
-        {t.doc && (
-          <p className="task-doc">
-            <Tag tone="tone-spec">Spec</Tag> {t.doc.title}
-          </p>
-        )}
+        <References projectId={pid} owner={`task:${t.id}`} version={t.attach_count} title="Files" />
         {(driver || others.length > 0) && (
           <div className="task-agents">
             <span className="label">Agents on it</span>
-            {taskAgentRows(driver, others).map(({ a, done }) =>
+            {/* A finished subagent shows in the History only (its end is posted there, server/subagents.ts). */}
+            {taskAgentRows(driver, others.filter((a) => !(isSubagent(a) && isFinished(a)))).map(({ a, done }) =>
               done ? (
                 <QuickDone key={`${a.id}-done`} helpers={done} pid={pid} depth={1} />
               ) : (
-              <details key={a.id} className={`task-agent ${a.quick ? 'quick' : ''}`} open={a.id === driver?.id && OPEN.includes(t.state)}>
+              <details key={a.id} className={`task-agent ${a.quick ? 'quick' : ''}`} open={a.id === driver?.id && OPEN.includes(t.state) && !isFinished(a)}>
                 <summary>
                   <a href={href('p', pid, 'agents', a.id)}>{a.name}</a>
                   {a.id === driver?.id && <span className="muted small"> · driver</span>}
                   {a.quick ? <span className="muted small"> · quick job</span> : null}
                   <span className="spacer" />
-                  <Status status={a.status} />
-                  <HostBadges agentId={a.id} s={s} />
+                  {isFinished(a) ? <span className="muted small">finished</span> : <Status status={a.status} />}
                 </summary>
                 {a.checklist?.length ? <Checklist agent={a} /> : a.quick ? <Clamp text={a.task} lines={3} /> : <p className="muted small">No worklist yet.</p>}
               </details>
@@ -689,24 +864,48 @@ export function TaskPage({ s, taskId, tab }: { s: ProjectState; taskId: string; 
             )}
           </div>
         )}
-      </section>
+        <TaskSpecBlock projectId={pid} spec={data.references && data.spec ? { ...data.spec, implements: [] } : data.spec} />
+        <NoSpecLine t={t} spec={data.spec} pid={pid} />
+        {/* Time to ship, under its own name: created to done on the clock, and where it went (server/worktime.ts). */}
+        {t.ship_text && <p className="muted small task-ship">{t.ship_text.charAt(0).toUpperCase() + t.ship_text.slice(1)}</p>}
+      </Fold>
 
-      <TaskSpecBlock projectId={pid} spec={data.spec} />
+      {/* A planning task leads with its plan: the requests on it are about the plan. */}
+      {t.state === 'planning' && <PlanBlock text={t.description} />}
+      {/* The pinned proposal: the options the director asks the user to look at, with the question to choose (proposal.tsx). */}
+      {/* With the latest previews, pinned by Helm itself (server/pins.ts autoPin). */}
+      <ProposalArea proposal={data.proposal} taskId={t.id} pid={pid} s={s} />
+      {/* Every preview of the task, its latest version first (previewlist.tsx); the pinned proposal's options stay above. */}
+      <TaskPreviews s={s} taskId={t.id} exclude={(data.proposal?.items ?? []).map((i) => i.item_id)} />
+      {t.needs_from_user && <NeedsFromYou t={t} pid={pid} />}
+      {t.waiting_on_user_without_request && <UnfiledNeed t={t} />}
+      <NeedsYou t={t} s={s} except={linkedRequestId(data.proposal)} />
 
+      {data.dashboard && (
+        <a className="card task-dashboard-link" href={href('p', pid, 'dashboards', data.dashboard.id)}>
+          <Icon name="dashboards" size={20} /> <span className="one-line">Dashboard: {data.dashboard.title}</span>
+          <Tag tone={data.dashboard.state === 'ready' ? 'st-done' : 'tone-warning'}>{data.dashboard.state === 'ready' ? 'Ready' : 'Being built'}</Tag>
+        </a>
+      )}
+      {!histOpen ? (
+        <section className="card fold closed task-thread-folded" aria-label={`History of ${t.title}`}>
+          <FoldHead open={false} onToggle={toggleHist} title="History" />
+        </section>
+      ) : (
       <Thread
         className="task-thread"
         label={`History of ${t.title}`}
         head={
           <div className="task-thread-head">
-            <h2 className="convo-name">History</h2>
+            <FoldHead open onToggle={toggleHist} title="History" />
             <Chips
               value={filter}
               onChange={setFilter}
               options={[
-                { id: 'all', label: 'All', count: count('all') },
-                { id: 'conversation', label: 'Conversation', count: count('conversation') },
-                { id: 'previews', label: 'Previews', count: count('previews') },
-                { id: 'decisions', label: 'Decisions', count: count('decisions') },
+                { id: 'all', label: 'All' },
+                { id: 'conversation', label: 'Conversation' },
+                { id: 'previews', label: 'Previews' },
+                { id: 'decisions', label: 'Decisions' },
               ]}
             />
           </div>
@@ -714,20 +913,23 @@ export function TaskPage({ s, taskId, tab }: { s: ProjectState; taskId: string; 
         lines={lines}
         loaded
         working={filter === 'all' || filter === 'conversation' ? working : null}
-        composer={!docked}
+        // The message box under the newest entry, always: Send asks without changing the work; while an agent works on
+        // the task, Interject beside it stops the work to re-evaluate (server: taskapi.ts sendThreadMessage).
+        second={t.state === 'active' && liveAgents.some((a) => a.status === 'working' || a.status === 'waiting') ? { label: 'Interject', empty: true, onSend: (text, attachments) => api(`/api/tasks/${t.id}/message`, { body: { text, attachments, interject: true } }) } : undefined}
         empty={<div className="convo-empty">{filter === 'all' ? <p>Nothing said about this task yet. Ask the director anything about it here.</p> : <p>Nothing of this kind yet.</p>}</div>}
-        placeholder="Message about this task"
+        placeholder={closed ? 'Message about this task' : 'Ask or tell the director about this task'}
         onSend={(text, attachments) => api(`/api/tasks/${t.id}/message`, { body: { text, attachments } })}
         attachTo={pid}
+        draftKey={`thread:${t.id}`}
       />
-      {docked && (
-        // Replies and interjections go through the chat (chat.tsx), opened here on this task.
-        <button className="btn task-chat-btn" onClick={() => openChat()}>
-          <Icon name="discuss" size={18} /> {t.state === 'active' ? `Interject or reply to ${directorName}` : 'Reply about this task'}
-        </button>
       )}
 
+      {/* The bottom of the page: History, then where the time went, then the dashboard tiles the task affected. */}
+      {t.kind !== 'discussion' && t.started_at && <TaskTimeCard taskId={t.id} />}
+      {data.dashboards && <TaskScopeBlock scope={data.dashboards} pid={pid} />}
+
       {editing && <TaskEditor s={s} task={t} onClose={() => setEditing(false)} />}
+      {waitsOpen && <WaitsPicker t={t} s={s} onClose={() => setWaitsOpen(false)} />}
       {another && <NewTaskSheet from={t} another onClose={() => setAnother(false)} />}
     </section>
   );
@@ -741,6 +943,209 @@ const ERA_OPEN_UP_TO = 6;
  * the message count), its entries as ordinary thread lines, and a closing marker. `origin`: the block is
  * another row's discussion, shown read-only with a link to it.
  */
+/**
+ * A description written as "## Features" and "## Done when" (the director's convention) shows as those two parts,
+ * with any text before them first; one without them shows as written.
+ */
+export function splitDescription(text: string): { lead: string; parts: { label: string; body: string }[] } | null {
+  const heads = [...text.matchAll(/^#{1,3}\s*(Features|Done when)\s*:?\s*$/gim)];
+  if (!heads.length) return null;
+  const parts = heads.map((h, i) => ({
+    label: /^f/i.test(h[1]) ? 'Features' : 'Done when',
+    body: text.slice(h.index! + h[0].length, i + 1 < heads.length ? heads[i + 1].index : undefined).trim(),
+  }));
+  return { lead: text.slice(0, heads[0].index).trim(), parts: parts.filter((p) => p.body) };
+}
+
+function TaskDescription({ text }: { text: string }) {
+  const split = splitDescription(text);
+  if (!split) return <Markdown text={text} />;
+  return (
+    <div className="task-desc">
+      {split.lead && <Markdown text={split.lead} />}
+      {split.parts.map((p, i) => (
+        <div key={i} className="task-refs-group">
+          <span className="label">{p.label}</span>
+          <Markdown text={p.body} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const touchList = (v?: string): string[] => {
+  try {
+    const l = JSON.parse(v ?? '[]');
+    return Array.isArray(l) ? l.map(String) : [];
+  } catch {
+    return [];
+  }
+};
+
+/** In About: the task's tier and the director's reason, how many parts it has, and what it waits for or blocks. */
+function TaskDetails({ t, pid, parts, parallel }: { t: Task; pid: string; parts: number; parallel?: string | null }) {
+  // parallel: whether the builder can run it alongside its work, or why it stays serial (server/subagents.ts parallelHint).
+  const touches = touchList(t.touches);
+  const bits = [parts > 1 ? `${parts} parts` : '', touches.length ? `Touches ${touches.join(', ')}` : '', parallel ?? ''].filter(Boolean);
+  return (
+    <div className="task-details">
+      {t.kind !== 'discussion' && <TierPicker t={t} />}
+      {bits.map((b) => (
+        <p key={b} className="muted small task-tier">
+          <PlainRefs text={b} />
+        </p>
+      ))}
+      <WaitsLine t={t} pid={pid} full />
+    </div>
+  );
+}
+
+type TierRow = { id: string; name: string; model: string; effort: string };
+
+/**
+ * About's tier line as a button: it opens the four tiers in place, each with its model and effort (server/tiers.ts).
+ * The user's pick is pinned (agents cannot change it) and the agent on the task takes it at its next turn.
+ */
+function TierPicker({ t, startOpen = false, onDone }: { t: Task; startOpen?: boolean; onDone?: () => void }) {
+  const [open, setOpen] = useState(startOpen);
+  const label = t.tier ? `${TIER_LABEL[t.tier] ?? t.tier} tier` : 'No tier yet';
+  return (
+    <div className="tier-pick">
+      <p className="muted small task-tier">
+        <button className="btn bare small" aria-expanded={open} aria-label={`${label}. Change`} onClick={() => setOpen(!open)}>
+          {label} ▾
+        </button>
+        {t.tier_reason && <span> · {t.tier_pinned ? 'set by you' : <PlainRefs text={t.tier_reason} />}</span>}
+      </p>
+      {open && (
+        <TierChoices
+          t={t}
+          onDone={() => {
+            setOpen(false);
+            onDone?.();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function TierChoices({ t, onDone }: { t: Task; onDone: () => void }) {
+  const { data } = useLive<{ tiers: TierRow[] }>('/api/tiers', (m) => m.type === 'projects');
+  const { busy, error, run } = useAction();
+  if (!data) return <p className="muted small">Loading the tiers…</p>;
+  const pick = async (id: string) => {
+    if (id === t.tier && t.tier_pinned) return onDone();
+    if (await run(() => api(`/api/tasks/${t.id}/tier`, { body: { tier: id } }))) onDone();
+  };
+  return (
+    <div className="tier-choices" role="group" aria-label="Set the tier">
+      {data.tiers.map((x) => (
+        <button key={x.id} className={`btn small ${x.id === t.tier ? 'on' : 'quiet'}`} disabled={busy} onClick={() => void pick(x.id)}>
+          {x.name} — {modelLabel(x.model)}
+          {x.effort ? `, ${x.effort}` : ''}
+        </button>
+      ))}
+      <span className="muted small">Agents cannot change the tier you set.</span>
+      {error && <span className="error-text small">{error}</span>}
+    </div>
+  );
+}
+
+/** The tier picker from the task's menu. */
+function TierSheet({ t, onClose }: { t: Task; onClose: () => void }) {
+  return (
+    <Sheet title="Tier" onClose={onClose}>
+      <TierPicker t={t} startOpen onDone={onClose} />
+    </Sheet>
+  );
+}
+
+/** The priority tag as a button: one tap opens the importance picker (rows, the title card). */
+function ImportanceButton({ t }: { t: Task }) {
+  // Tap the tag: the levels open in place (the picker stops the tap from opening the row).
+  return <ImportancePicker id={t.id} level={t.importance} pinned={!!t.importance_pinned} compact />;
+}
+
+/** The importance level, from the task's menu, the priority tag, or dragging in Priority order. */
+function ImportanceSheet({ t, onClose }: { t: Task; onClose: () => void }) {
+  return (
+    <Sheet title="Importance" onClose={onClose}>
+      <ImportancePicker id={t.id} level={t.importance} pinned={!!t.importance_pinned} startOpen />
+    </Sheet>
+  );
+}
+
+/** About's Parts list: each piece of work folded in, its source, and its own Features and Done when. */
+function TaskParts({ parts }: { parts: TaskPart[] }) {
+  return (
+    <div className="task-parts">
+      <span className="label">Parts</span>
+      <ol className="task-parts-list">
+        {parts.map((p) => (
+          <li key={p.id}>
+            <details open={parts.length <= 4}>
+              <summary>
+                <b>{p.title}</b>
+                <span className="muted small task-part-src">
+                  {p.source.label}
+                  {p.source.ref && (
+                    <>
+                      {' '}
+                      <Markdown className="inline-md" text={`[[${p.source.ref}]]`} />
+                    </>
+                  )}
+                </span>
+              </summary>
+              {p.source.excerpt && <p className="muted small task-part-quote">“{p.source.excerpt}”</p>}
+              {p.body ? <TaskDescription text={p.body} /> : null}
+            </details>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+/** A task's Spec entries and related work: one link per line, each showing the item's title and state. */
+function TaskRefs({ refs }: { refs?: TaskDetail['references'] }) {
+  if (!refs || (!refs.spec.length && !refs.related.length)) return null;
+  const group = (label: string, ids: string[]) =>
+    ids.length > 0 && (
+      <div className="task-refs-group">
+        <span className="label">{label}</span>
+        <Markdown text={ids.map((id) => `[[${id}]]`).join('\n\n')} />
+      </div>
+    );
+  return (
+    <div className="task-refs">
+      <span className="label task-refs-title">References</span>
+      {group('Spec', refs.spec)}
+      {group('Related work', refs.related)}
+    </div>
+  );
+}
+
+/** A task implementing no Spec entry: one muted line, and Discuss opens (or reuses) the discussion about which entry it belongs to. */
+function NoSpecLine({ t, spec, pid }: { t: Task; spec: TaskDetail['spec']; pid: string }) {
+  const { busy, error, run } = useAction();
+  if (spec?.implements.length || t.doc_id || ['done', 'dropped'].includes(t.state) || t.merged_into) return null;
+  const discuss = () =>
+    void run(async () => {
+      const r = await api<{ id: string }>(`/api/tasks/${t.id}/spec-discussion`, { body: {} });
+      go('p', pid, 'discussions', r.id);
+    });
+  return (
+    <div className="task-nospec">
+      <span className="muted small">No Spec entry</span>
+      <button className="btn small" disabled={busy} onClick={discuss}>
+        <Icon name="discuss" size={16} /> Discuss
+      </button>
+      {error && <p className="error-text">{error}</p>}
+    </div>
+  );
+}
+
 function eraLines({ id, items, all, origin, pid, s, directorName, open, toggle }: {
   id: string;
   items: TimelineItem[];
@@ -764,7 +1169,7 @@ function eraLines({ id, items, all, origin, pid, s, directorName, open, toggle }
       <div className={`era-head ${isOpen ? 'open' : ''}`}>
         <button className="era-toggle" aria-expanded={isOpen} onClick={() => toggle(id, !isOpen)}>
           <Icon name="chevron" size={16} />
-          <span className="era-title">{origin ? <>Discussion this task came from</> : <>Discussion, before this became a task</>}</span>
+          <span className="era-title">{origin?.merged ? <>Merged from</> : origin ? <>Discussion this task came from</> : <>Discussion, before this became a task</>}</span>
           <span className="era-count muted small">
             {messages} {messages === 1 ? 'message' : 'messages'}
             {items.length !== all.length && ` · ${items.length} shown`}
@@ -797,39 +1202,165 @@ function eraLines({ id, items, all, origin, pid, s, directorName, open, toggle }
   return [head, ...body, foot];
 }
 
-function TaskHeadActions({ t, onEdit, onAnother, onState, canBeDiscussion }: { t: Task; onEdit: () => void; onAnother?: () => void; onState: (s: TaskState) => void; canBeDiscussion: boolean }) {
+/**
+ * The way to talk to the director about this task, on the title card and its strip: Interject while it is active (the
+ * chat opens on this task in interject mode, with Pause the work), Message otherwise. A closed task is answered in its
+ * history's own composer.
+ */
+const TIER_LABEL: Record<string, string> = { light: 'Light', routine: 'Routine', skilled: 'Skilled', deep: 'Deep' };
+
+const blocked = (t: Task) => OPEN.includes(t.state) && !!t.waits_for?.length;
+
+/**
+ * What a task waits for and what waits for it (server/waits.ts), as muted links. `full` (About): "Waits for <task>, <task>"
+ * and "Blocks <task>". Compact (a row's meta line): "Waits for <task>" or "Waits for 2 tasks", and "Then: N tasks", each
+ * linked to the first of them.
+ */
+function WaitsLine({ t, pid, full = false, only }: { t: Task; pid: string; full?: boolean; only?: 'waits' | 'blocks' }) {
+  const link = (x: { id: string }, text: string) => (
+    <a href={href('p', pid, 'tasks', x.id)} onClick={(e) => e.stopPropagation()}>
+      {text}
+    </a>
+  );
+  const count = (n: number) => `${n} ${n === 1 ? 'task' : 'tasks'}`;
+  const part = (label: string, list: { id: string; title: string }[] | undefined, counted = false) =>
+    !list?.length ? null : (
+      <span>
+        {label}{' '}
+        {!full && (counted || list.length > 1)
+          ? link(list[0], count(list.length))
+          : list.map((x, i) => (
+              <span key={x.id}>
+                {i > 0 && ', '}
+                {link(x, x.title)}
+              </span>
+            ))}
+      </span>
+    );
+  const w = only === 'blocks' ? null : part('Waits for', t.waits_for);
+  const b = only === 'waits' ? null : full ? part('Blocks', t.blocks) : part('Then:', t.blocks, true);
+  if (!w && !b) return null;
+  const El = full ? 'p' : 'span';
+  return (
+    <El className="task-waits muted small one-line">
+      {w}
+      {w && b && ' · '}
+      {b}
+    </El>
+  );
+}
+
+/** The user sets what a task waits for: open tasks of the project, ticked. */
+function WaitsPicker({ t, s, onClose }: { t: Task; s: ProjectState; onClose: () => void }) {
+  const [ids, setIds] = useState<string[]>((t.waits_for ?? []).map((x) => x.id));
+  const { busy, error, run } = useAction();
+  const options = s.tasks.filter((x) => x.id !== t.id && x.kind !== 'discussion' && OPEN.includes(x.state));
+  const toggle = (id: string) => setIds((l) => (l.includes(id) ? l.filter((x) => x !== id) : [...l, id]));
+  return (
+    <Sheet title="Waits for" onClose={onClose}>
+      <div className="waits-pick">
+        {options.map((x) => (
+          <label key={x.id} className="waits-option">
+            <input type="checkbox" checked={ids.includes(x.id)} onChange={() => toggle(x.id)} />
+            <span className="one-line">{x.title}</span>
+          </label>
+        ))}
+        {!options.length && <p className="muted small">No other open tasks.</p>}
+      </div>
+      {error && <p className="error-text small">{error}</p>}
+      <div className="row">
+        <button className="btn primary" disabled={busy} onClick={async () => (await run(() => api(`/api/tasks/${t.id}/waits`, { body: { ids } }))) && onClose()}>
+          Save
+        </button>
+      </div>
+    </Sheet>
+  );
+}
+
+/** The bell: one notification when this open task finishes, then it clears (server/bell.ts). Filled when on. */
+function BellButton({ t }: { t: Task }) {
+  const [on, setOn] = useState<boolean | null>(null);
+  useEffect(() => setOn(null), [t.bell]);
+  if (t.kind === 'discussion' || !OPEN.includes(t.state)) return null;
+  const lit = on ?? !!t.bell;
+  const flip = () => {
+    setOn(!lit);
+    api(`/api/tasks/${t.id}/bell`, { body: { on: !lit } }).catch(() => setOn(null));
+  };
+  return (
+    <button className={`icon-btn task-bell ${lit ? 'on' : ''}`} aria-pressed={lit} aria-label={lit ? 'Bell on: you will be told when it finishes. Turn off' : 'Tell me when it finishes'} title={lit ? 'You will be told when it finishes' : 'Tell me when it finishes'} onClick={(e) => (e.preventDefault(), e.stopPropagation(), flip())}>
+      <Icon name="bell" size={20} />
+    </button>
+  );
+}
+
+/** Takes the user to the message box at the end of the History (scrolled into view and focused); the chat if the History is folded. */
+export function focusThreadBox(open: () => void) {
+  const box = document.querySelector<HTMLTextAreaElement>('.task-thread .composer textarea');
+  if (!box) return open();
+  box.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  box.focus({ preventScroll: true });
+}
+
+function ChatButton({ t, compact = false }: { t: Task; compact?: boolean }) {
+  if (t.state === 'done' || t.state === 'dropped') return null;
+  const active = t.state === 'active';
+  return (
+    <button className={`btn ${active ? 'primary' : ''} ${compact ? 'small' : ''}`} onClick={() => focusThreadBox(() => openChat({ kind: 'task', id: t.id }))}>
+      <Icon name="discuss" size={16} /> {active ? 'Interject' : 'Message'}
+    </button>
+  );
+}
+
+function TaskHeadActions({ t, tokens, onEdit, onAnother, onState, canBeDiscussion, onWaits }: { t: Task; tokens: string | null; onWaits?: () => void; onEdit: () => void; onAnother?: () => void; onState: (s: TaskState) => void; canBeDiscussion: boolean }) {
   const { busy, error, act, move, toDiscussion } = useTaskActions(t, onState);
-  const primary = primaryAction(t.state);
+  // A running task has one control, Interject (it stops the work; empty, it just stops): no separate Interrupt.
+  const primary = t.state === 'active' ? null : primaryAction(t.state);
+  const [importance, setImportance] = useState(false);
+  const [tier, setTier] = useState(false);
   const isOpen = OPEN.includes(t.state);
   return (
     <>
       <div className="row wrap task-actions">
         {primary && (
           <button className={`btn ${primary.tone}`} disabled={busy} onClick={() => act(primary.action)}>
-            <Icon name={primary.icon} size={15} /> {primary.label}
+            <Icon name={primary.icon} size={16} /> {primary.label}
           </button>
         )}
-        {(t.state === 'planning' || t.state === 'waiting') && (
+        {(t.state === 'planning' || t.state === 'waiting') && !blocked(t) && (
           <button className="btn" disabled={busy} onClick={() => act('start')}>
-            <Icon name="play" size={15} /> Start now
+            <Icon name="play" size={16} /> Start now
           </button>
         )}
+        <ChatButton t={t} />
         <button className="btn quiet" onClick={onEdit}>
-          <Icon name="edit" size={15} /> Edit
+          <Icon name="edit" size={16} /> Edit
         </button>
         <span className="spacer" />
+        {/* Tokens its agents used (server/usage.ts), muted, beside the menu. */}
+        {tokens && <span className="muted small task-head-tokens">{tokens}</span>}
+        <BellButton t={t} />
         <Menu
           label="More actions"
           items={[
+            t.state === 'scheduled' && { label: 'Unschedule', onSelect: () => act('unschedule') },
+            t.state === 'paused' && { label: 'Schedule', onSelect: () => act('approve') },
+            t.kind !== 'discussion' && { label: 'Importance…', onSelect: () => setImportance(true) },
+            t.kind !== 'discussion' && { label: 'Tier…', onSelect: () => setTier(true) },
+            // Review is opt-in (server/builder.ts isRisky): only a task marked here is reviewed before it lands.
+            isOpen && t.kind !== 'discussion' && { label: t.risky === 1 ? '✓ Review before it lands' : 'Review before it lands', onSelect: () => void api(`/api/tasks/${t.id}/review`, { body: { on: t.risky !== 1 } }).catch(() => {}) },
             isOpen && { label: 'Move up', onSelect: () => move('up') },
             isOpen && { label: 'Move down', onSelect: () => move('down') },
             isOpen && { label: 'Move to top', onSelect: () => move('top') },
+            isOpen && t.kind !== 'discussion' && !!onWaits && { label: 'Waits for…', onSelect: onWaits },
             !!onAnother && { label: 'Create another task from this', onSelect: onAnother },
             canBeDiscussion && movable(t) && { label: 'Move to discussions', onSelect: toDiscussion },
             isOpen && { label: 'Drop', onSelect: () => act('drop'), danger: true },
           ]}
         />
       </div>
+      {importance && <ImportanceSheet t={t} onClose={() => setImportance(false)} />}
+      {tier && <TierSheet t={t} onClose={() => setTier(false)} />}
       {error && <p className="error-text">{error}</p>}
     </>
   );
@@ -865,13 +1396,21 @@ function threadLine(i: TimelineItem, s: ProjectState, directorName: string, pid:
   return ((i): ThreadLine => {
     if (i.type === 'message') {
       if (i.author === 'user') return { type: 'you', key: i.key, ts: i.ts, text: i.body, attachments: i.attachments, note: i.interject ? 'interjection' : undefined, attachmentAction };
-      return { type: 'reply', key: i.key, ts: i.ts, text: i.body, name: i.name || directorName };
+      // A proposed conclusion in an open discussion: Conclude closes it with this text and the director plans the work.
+      return { type: 'reply', key: i.key, ts: i.ts, text: i.body, name: i.name || directorName, action: i.conclude ? <ConcludeButton task={i.conclude.task} message={i.conclude.message} /> : undefined };
     }
     if (i.type === 'state') return { type: 'system', key: i.key, ts: i.ts, text: i.body };
     if (i.type === 'change') return { type: 'node', key: i.key, ts: i.ts, node: <ChangeCard body={i.body} ts={i.ts} projectId={pid} /> };
     // A discussion about a Spec entry: the entry as it read at the start, and the edits the director proposed (specdiscuss.tsx).
     if (i.type === 'spec') return { type: 'node', key: i.key, ts: i.ts, node: <SnapshotCard body={i.body} ts={i.ts} /> };
     if (i.type === 'proposal') return { type: 'node', key: i.key, ts: i.ts, node: <ProposalCard body={i.body} ts={i.ts} projectId={pid} /> };
+    // A release recipe the director proposed (releases.tsx): Apply, Change or Not this.
+    if (i.type === 'recipe') return { type: 'node', key: i.key, ts: i.ts, node: <RecipeProposalCard body={i.body} s={s} /> };
+    // A change the director proposes in a Consolidate tasks discussion: Apply or Not this.
+    // Spec work (specwork.tsx): a Review's findings for a section, and proposed new entries.
+    if (i.type === 'findings') return { type: 'node', key: i.key, ts: i.ts, node: <FindingsCard messageKey={i.key} s={s} /> };
+    if (i.type === 'entries') return { type: 'node', key: i.key, ts: i.ts, node: <EntriesCard messageKey={i.key} s={s} /> };
+    if (i.type === 'consolidate') return { type: 'node', key: i.key, ts: i.ts, node: <ConsolidationCard body={i.body} s={s} /> };
     if (i.type === 'summary') {
       return {
         type: 'node',
@@ -912,7 +1451,7 @@ function threadLine(i: TimelineItem, s: ProjectState, directorName: string, pid:
               </span>
               <strong>{item.title}</strong>
               <button className="btn small quiet" onClick={() => document.querySelector('.prop-area')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}>
-                <Icon name="top" size={14} /> Answer it in the proposal at the top
+                <Icon name="top" size={16} /> Answer it in the proposal at the top
               </button>
             </div>
           ),
@@ -924,14 +1463,14 @@ function threadLine(i: TimelineItem, s: ProjectState, directorName: string, pid:
         ts: i.ts,
         node: (
           <div id={`req-${item.id}`} className="req-anchor">
-            {['open', 'director', 'check'].includes(item.status) ? <InboxCard item={item} agentName={asker} /> : <RequestOutcome item={item} asker={asker} />}
+            {['open', 'director', 'check'].includes(item.status) ? <InboxCard item={item} agentName={asker} context={false} /> : <RequestOutcome item={item} asker={asker} />}
           </div>
         ),
       };
     }
     if (i.type === 'consult') return { type: 'node', key: i.key, ts: i.ts, node: <ConsultCard c={i} /> };
     if (i.type === 'preview') {
-      const tile = <PreviewTile p={i.preview} onOpen={() => go('p', pid, 'previews', i.preview.id)} />;
+      const tile = <PreviewTile p={i.preview} onOpen={() => openPreview(pid, i.preview.id)} />;
       if (!pin) return { type: 'node', key: i.key, ts: i.ts, node: tile };
       return {
         type: 'node',

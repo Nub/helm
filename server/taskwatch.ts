@@ -2,6 +2,7 @@ import { all, get, now, run } from './db.ts';
 import type { Row } from './db.ts';
 import { notifyDirector } from './sessions.ts';
 import { addTaskMessage, taskRef } from './tasks.ts';
+import { isStopped } from './projectmode.ts';
 
 /**
  * Keeps a task's state honest about who is working on it. Nothing else ties an agent finishing to its task: whether an
@@ -97,6 +98,8 @@ export function attention(projectId: string) {
 /** One reminder per task when it becomes stalled (again after any activity on it). Run from the sessions timer. */
 export function checkStalls(at = now()) {
   for (const t of all("SELECT t.* FROM tasks t JOIN projects p ON p.id = t.project_id WHERE p.archived = 0 AND t.kind = 'task' AND t.state = 'active'")) {
+    // Stopped: the user interrupted everything on purpose; nothing is stalled.
+    if (isStopped(t.project_id)) continue;
     const st = stallState(t, at);
     if (!st.stalled || (t.stall_noted_at && t.stall_noted_at >= st.since)) continue;
     run('UPDATE tasks SET stall_noted_at = ? WHERE id = ?', at, t.id);

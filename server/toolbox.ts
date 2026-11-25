@@ -12,6 +12,8 @@ import { writeFileAtomic } from './safefs.ts';
 import { all, get, newId, now, run } from './db.ts';
 import { addJournal } from './store.ts';
 import type { Row } from './db.ts';
+import { dateText } from './clock.ts';
+import { createRequest } from './requests.ts';
 
 // The Toolbox: skills, plugins and MCP servers the owner approved, pinned to
 // what they reviewed, and handed to agent sessions per project.
@@ -596,7 +598,6 @@ async function buildFlake(id: string, launch: Row) {
 export function declineItem(id: string, note: string): string | null {
   const item = getItem(id);
   if (!item) return 'No such item.';
-  if (!note.trim()) return 'Give a reason; it is kept so the item is not proposed again.';
   if (item.status !== 'proposed' && item.status !== 'failed') return `It is ${item.status}.`;
   removeTree(join(STAGING, id));
   setItem(id, { status: 'declined', decided_note: note.trim(), decided_at: now() });
@@ -765,7 +766,7 @@ export function toolboxText(projectId: string | null): string {
   return items
     .map((i) => {
       const applies = projectId && i.status === 'installed' ? (appliesTo(i, projectId) ? ', enabled for this project' : ', not enabled for this project') : '';
-      const why = i.status === 'declined' ? `\n  declined: ${i.decided_note}` : i.status === 'failed' ? `\n  install failed: ${i.error}` : '';
+      const why = i.status === 'declined' ? `\n  declined${i.decided_note ? `: ${i.decided_note}` : " (no reason given)"}` : i.status === 'failed' ? `\n  install failed: ${i.error}` : '';
       const flag = i.integrity ? `\n  problem: ${i.integrity}` : '';
       return `- ${i.name} (${i.kind}, ${i.status}${applies}; id ${i.id}): ${i.summary}${why}${flag}`;
     })
@@ -820,19 +821,20 @@ export function proposeFromAgent(agent: Row, input: Partial<ProposalInput> & { u
   if (!prev) {
     const eq = findEquivalent(p.name, p.source);
     if (eq?.status === 'declined' && !input.reconsider) {
-      return err(`An equivalent item, "${eq.name}" (${eq.id}), was declined by the user on ${new Date(eq.decided_at ?? eq.updated_at).toISOString().slice(0, 10)}: "${eq.decided_note}". Do not propose it again unless something material has changed; if it has, call again with reconsider explaining what.`);
+      return err(`An equivalent item, "${eq.name}" (${eq.id}), was declined by the user on ${dateText(eq.decided_at ?? eq.updated_at)}${eq.decided_note ? `: "${eq.decided_note}"` : " (no reason given)"}. Do not propose it again unless something material has changed; if it has, call again with reconsider explaining what.`);
     }
     if (eq && eq.status !== 'declined') return err(`The Toolbox already has "${eq.name}" (${eq.id}, ${eq.status}). Use update_of to revise an open proposal, or list_toolbox to see it.`);
   }
   if (prev) {
     updateProposal(prev.id, p);
     addItemMessage(prev.id, 'system', 'Helm', `${agent.name} revised the proposal.`);
-    return done(`Revised "${p.name}" (${prev.id}). It is back in the user's Proposed list.`);
+    return done(`Revised "${p.name}" (${prev.id}). It is back with the user in System › Tools.`);
   }
   const item = createProposal(p, { agentId: agent.id, projectId: agent.project_id, origin: 'agent' });
   if (input.reconsider) addItemMessage(item.id, 'director', agent.name, `Proposed again after an earlier decline. What changed: ${input.reconsider}`);
   addJournal(agent.project_id, agent.id, 'note', `Proposed for the Toolbox: ${item.name}`, `${item.summary}\n\nRecommendation: ${p.recommendation}. ${p.recommendation_reason}`);
-  return done(`Proposed "${item.name}" (${item.id}). It is on the Toolbox page for the user's review${item.installable ? '' : `; Helm cannot install it itself: ${item.not_installable_reason.replace(/\.$/, '')}`}. The user's decision shows in list_toolbox; do not wait for it.`);
+  fileProposalRequest(item, agent);
+  return done(`Proposed "${item.name}" (${item.id}). It is a request in the user's Needs you (Install or Decline)${item.installable ? '' : `; Helm cannot install it itself: ${item.not_installable_reason.replace(/\.$/, '')}`}. The user's decision shows in list_toolbox; do not wait for it.`);
 }
 
 /** Put the reviewed copy back in place after the installed files were changed or lost. */
@@ -847,4 +849,40 @@ export function repairItem(id: string): string | null {
   } catch (err: any) {
     return String(err?.message ?? err);
   }
+}
+
+/** What the user sees of a proposal in Needs you: the evidence in a few lines, and Install or Decline. */
+function proposalText(item: Row, p: Row): string {
+  const bits = [item.summary, p.problem && `Problem: ${p.problem}`, p.evidence && `Evidence: ${p.evidence}`, p.access && `Access: ${p.access}`, p.risks && `Risks: ${p.risks}`];
+  return bits.filter(Boolean).join('\n\n').slice(0, 1800);
+}
+
+/**
+ * A new proposal becomes a request (a question with Install and Decline) so it reaches the user where they look, not on
+ * a page nobody opens. Install rides on the option (reqactions.ts install_tool) and installs for every project; one
+ * that needs credentials or that Helm cannot install carries Decline only, and says to finish it in System › Tools.
+ */
+export function fileProposalRequest(item: Row, agent: Row) {
+  const p = parse(item.proposal);
+  const launch = parse(item.launch);
+  const direct = !!item.installable && !(launch.secrets ?? []).length;
+  const note = direct ? '' : `\n\nInstall it from System › Tools${item.installable ? ' (it needs credentials)' : `: Helm cannot install it itself (${String(item.not_installable_reason).replace(/\\.$/, '')})`}.`;
+  createRequest({
+    projectId: agent.project_id,
+    agentId: agent.id,
+    kind: 'question',
+    title: `Install ${item.name}? (${item.kind.replace('_', ' ')})`,
+    body: proposalText(item, p) + note,
+    options: direct ? [{ label: 'Install', detail: 'For every project' }, { label: 'Decline' }] : [{ label: 'Decline' }],
+    payload: { toolbox: item.id, recommendation: [p.recommendation, p.recommendation_reason].filter(Boolean).join(': '), ...(direct ? { act: { kind: 'install_tool', target: item.id, option: 'Install' } } : {}) },
+    importance: 2,
+    blocking: false,
+  });
+}
+
+/** A proposal's request was answered: Decline declines the item, as its card's Decline does; Install ran through the action. */
+export function onToolboxAnswer(item: Row, choice: string | undefined, text: string | undefined) {
+  const id = parse(item.payload).toolbox;
+  if (!id) return;
+  if (choice === 'Decline') declineItem(id, text ?? '');
 }

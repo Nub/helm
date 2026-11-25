@@ -74,7 +74,8 @@ export function registerWeb(app: FastifyInstance, root: string) {
 
   app.get('/*', async (req, reply) => {
     const path = req.url.split('?')[0];
-    if (path.startsWith('/api/') || path.startsWith('/artifacts/')) return reply.callNotFound();
+    // /dl/ is the release download links' (dllinks.ts): anything there that is not a link is a plain 404, never the app.
+    if (path.startsWith('/api/') || path.startsWith('/artifacts/') || path === '/dl' || path.startsWith('/dl/')) return reply.callNotFound();
     let rel: string;
     try {
       rel = normalize(decodeURIComponent(path)).replace(/^[/\\]+/, '');

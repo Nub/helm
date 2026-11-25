@@ -2,9 +2,31 @@ import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { DATA_DIR } from './config.ts';
+import { SEARCH_SCHEMA_VERSION, SEARCH_TABLES_SQL, searchSchemaSql } from './searchschema.ts';
 
 export const db = new DatabaseSync(join(DATA_DIR, 'helm.db'));
-db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
+// Two processes may share this file (the runner and the web service, server/runner.ts). WAL lets readers run beside
+// the one writer; busy_timeout makes a writer wait for the other's write instead of failing. synchronous NORMAL is
+// safe in WAL (a power cut may lose the last commits, never corrupt the file) and saves an fsync per small write.
+// Switching a new file to WAL needs a moment's exclusive lock; when the other process is creating the same file at that
+// moment SQLite answers "database is locked" without waiting on busy_timeout, so the switch is retried for a while.
+db.exec('PRAGMA busy_timeout = 5000;');
+for (let tries = 0; ; tries++) {
+  try {
+    db.exec('PRAGMA journal_mode = WAL;');
+    break;
+  } catch (err: any) {
+    if (err?.errcode !== 5 || tries >= 100) throw err;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+  }
+}
+db.exec('PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;');
+
+// The schema and its migrations run in one write transaction (committed at the end of this file), so two processes
+// starting together do not race: the second waits, then finds everything done. If anything throws, the process
+// exits and the transaction is rolled back with it. Migrations stay additive (new tables and columns only), so a
+// process one version older keeps working against a database the newer one migrated.
+db.exec('BEGIN IMMEDIATE');
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS projects (
@@ -264,13 +286,23 @@ CREATE INDEX IF NOT EXISTS reports_task ON reports(task_id);
 /** Add a column to a table created by an older version, once. */
 function addColumn(table: string, column: string, decl: string) {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
-  if (!cols.some((c) => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+  if (cols.some((c) => c.name === column)) return;
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+  } catch (err) {
+    // The runner and the web service start together on one database: the other may have added it meanwhile.
+    if (!/duplicate column name/i.test(String((err as Error).message))) throw err;
+  }
 }
 // The host an agent's own process runs on; null means this machine. Separate from the hosts it uses over SSH.
 addColumn('agents', 'run_host_id', 'TEXT');
+// The user's bell on a task: notify once when it finishes (bell.ts).
+addColumn('tasks', 'bell', 'INTEGER NOT NULL DEFAULT 0');
 // When the agent became done or closed (NULL while it is not): the disk guard waives its one-hour rule only for
 // folders untouched since then (server/diskusage.ts).
 addColumn('agents', 'finished_at', 'INTEGER');
+// When Helm resumes an agent stopped by a usage limit, as the user asked (agenterrors.ts); null when nothing is scheduled.
+addColumn('agents', 'resume_at', 'INTEGER');
 // The agent's own last activity (text, tool call, tool result, end of turn): a folder changed after it was not changed
 // by that agent (server/diskusage.ts).
 addColumn('agents', 'active_at', 'INTEGER');
@@ -287,6 +319,8 @@ for (const table of ['inbox', 'agents', 'previews', 'journal']) {
 addColumn('agents', 'toolbox_loaded', "TEXT NOT NULL DEFAULT ''");
 // 1 for a quick helper started with quick_job: it works for its parent (the caller) and Helm closes it when its job ends.
 addColumn('agents', 'quick', 'INTEGER NOT NULL DEFAULT 0');
+// The running token total its session's last result reported (usage.ts): each turn records what it added.
+addColumn('agents', 'usage_seen', 'INTEGER NOT NULL DEFAULT 0');
 
 // Discussions are rows in tasks with kind 'discussion' (states open/settled), so threads, previews and inbox links work for both.
 addColumn('tasks', 'kind', "TEXT NOT NULL DEFAULT 'task'");
@@ -296,6 +330,58 @@ addColumn('tasks', 'conclusion', "TEXT NOT NULL DEFAULT ''");
 addColumn('task_messages', 'event_id', 'INTEGER');
 // The user's message on an active task sent as an interjection: the director acts on it at once (taskapi.ts).
 addColumn('task_messages', 'interject', 'INTEGER NOT NULL DEFAULT 0');
+// The director's post in an open discussion proposing its conclusion: it shows a Conclude button (discussions.ts).
+addColumn('task_messages', 'conclude', 'INTEGER NOT NULL DEFAULT 0');
+// A discussion opened to find the Spec entry for a task ("No Spec entry · Discuss", specdiscuss.ts): that task's id.
+addColumn('tasks', 'about_task', 'TEXT');
+// The "## Done when" items an agent ticked (update_task done_when): JSON array of 1-based numbers (taskstatus.ts).
+addColumn('tasks', 'done_when_ticks', 'TEXT');
+// Why the task's named check was not run when it was finished (complete_task / finish_task check_not_run), or NULL.
+addColumn('tasks', 'check_not_run', 'TEXT');
+// Discussion reminders (discrevisit.ts): reminders sent in the current quiet stretch, when the last one was, how many
+// times the user said Not now, and when it went stale.
+addColumn('tasks', 'revisit_count', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('tasks', 'revisit_at', 'INTEGER');
+addColumn('tasks', 'revisit_later', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('tasks', 'stale_at', 'INTEGER');
+// Versioned previews (store.ts addPreview): the previews row is the latest version under its stable id; earlier
+// versions live in preview_versions. old_id: a preview that was its own row before versions were grouped (it resolves to
+// the preview it became a version of).
+addColumn('previews', 'pkey', 'TEXT');
+addColumn('previews', 'version', 'INTEGER NOT NULL DEFAULT 1');
+addColumn('previews', 'commit_sha', 'TEXT');
+addColumn('previews', 'first_at', 'INTEGER');
+db.exec(`CREATE TABLE IF NOT EXISTS preview_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  preview_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  agent_id TEXT,
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  caption TEXT NOT NULL DEFAULT '',
+  file TEXT,
+  content TEXT,
+  source TEXT NOT NULL DEFAULT '',
+  commit_sha TEXT,
+  created_at INTEGER NOT NULL,
+  old_id TEXT
+)`);
+db.exec('CREATE INDEX IF NOT EXISTS preview_versions_preview ON preview_versions(preview_id, version)');
+db.exec('CREATE INDEX IF NOT EXISTS preview_versions_old ON preview_versions(old_id)');
+// A host's last live sample (hoststats.ts): CPU, memory, disk and GPUs as JSON; null when offline or unknown.
+addColumn('hosts', 'stats', 'TEXT');
+// A task's parts: each piece of work folded into it and its source (taskparts.ts).
+db.exec(`CREATE TABLE IF NOT EXISTS task_parts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL,
+  position INTEGER NOT NULL DEFAULT 0,
+  title TEXT NOT NULL,
+  source_kind TEXT NOT NULL,
+  source_id TEXT,
+  body TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+)`);
+db.exec('CREATE INDEX IF NOT EXISTS task_parts_task ON task_parts(task_id, position)');
 // HANDOFF.md: its modified time when the user last sent it to the director or dismissed it (server/handoff.ts).
 addColumn('projects', 'handoff_seen', 'INTEGER');
 // Projects are listed in an order the user sets (drag to reorder), never by activity. Upgrading starts from creation order.
@@ -347,6 +433,125 @@ addColumn('tasks', 'paused_from', 'TEXT');
 // for it (requests.ts fileNeeds). Cleared when that request is answered.
 addColumn('tasks', 'needs_from_user', 'TEXT');
 addColumn('tasks', 'needs_request_id', 'TEXT');
+// Work tiers (server/tiers.ts): one table per install, the user's model and effort for each tier (defaults for unset rows).
+db.exec('CREATE TABLE IF NOT EXISTS tiers (id TEXT PRIMARY KEY, model TEXT NOT NULL, effort TEXT NOT NULL DEFAULT \'\')');
+// Checks run once (server/projectchecks.ts): a project's declared checks, and full runs kept against the commit.
+db.exec(`CREATE TABLE IF NOT EXISTS project_checks (
+  project_id TEXT PRIMARY KEY,
+  quick TEXT NOT NULL DEFAULT '[]',
+  full TEXT NOT NULL DEFAULT '[]',
+  minutes INTEGER,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS check_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL,
+  commit_sha TEXT NOT NULL,
+  status TEXT NOT NULL,
+  failed_check TEXT,
+  output TEXT NOT NULL DEFAULT '',
+  since_tasks TEXT NOT NULL DEFAULT '[]',
+  started_at INTEGER NOT NULL,
+  finished_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS check_runs_commit ON check_runs(project_id, commit_sha);`);
+// Builder mode (server/builder.ts): tasks the builder finished, until the batch record covers them; and a
+// task's risky mark (1 marked, 0 marked not risky, NULL judged from its text).
+// Builder is every project's default work mode. The update before this one recorded Team for every project that
+// existed then; the user chose Team nowhere, and those rows cannot be told apart from a choice, so the first boot with
+// mode_switches clears every Team row once and records the switch (builder.ts tells each director).
+const builderForAll = !db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mode_switches'").get();
+db.exec(`CREATE TABLE IF NOT EXISTS builder_batch (
+  project_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  finished_at INTEGER NOT NULL,
+  commits TEXT NOT NULL DEFAULT '[]',
+  result TEXT NOT NULL DEFAULT '',
+  noted INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (project_id, task_id)
+)`);
+addColumn('tasks', 'risky', 'INTEGER');
+// A task's tier and why (tiers.ts), how it will be shown to work (check_how), why it may run beside overlapping work
+// (parallel_reason), and from when its review rounds count (rounds_from: a manual re-tier or narrowing resets them).
+addColumn('tasks', 'tier', 'TEXT');
+addColumn('tasks', 'tier_reason', "TEXT NOT NULL DEFAULT ''");
+// A tier the user set is pinned: agents and the director may not change it, and escalation leaves it (workrules.ts).
+addColumn('tasks', 'tier_pinned', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('tasks', 'check_how', "TEXT NOT NULL DEFAULT ''");
+addColumn('tasks', 'parallel_reason', "TEXT NOT NULL DEFAULT ''");
+// touches: the files or globs a task will change (JSON list, create_task/update_task), for running tasks side by side.
+addColumn('tasks', 'touches', "TEXT NOT NULL DEFAULT '[]'");
+addColumn('tasks', 'rounds_from', 'INTEGER');
+// Pairs of a task and a running task it may affect, shown to the director and answered (server/affects.ts).
+db.exec(`CREATE TABLE IF NOT EXISTS affect_pairs (
+  task_id TEXT NOT NULL,
+  affected_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  shown_at INTEGER NOT NULL,
+  answered_at INTEGER,
+  how TEXT,
+  note TEXT NOT NULL DEFAULT '',
+  renoted INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (task_id, affected_id)
+)`);
+// The task whose related past work the agent was last given (server/related.ts), so it is given once per task.
+if (!(db.prepare('PRAGMA table_info(agents)').all() as { name: string }[]).some((c) => c.name === 'related_given')) {
+  addColumn('agents', 'related_given', 'TEXT');
+  // Agents already at work when this arrived are not handed related work for the task they are on.
+  db.exec('UPDATE agents SET related_given = task_id');
+}
+// Progress checks (server/progress.ts): per Active task, its allowance (time and tokens when it started), worklist
+// movement, the flags already put to the director (noted, JSON keys) and their text, and when Helm paused it.
+db.exec(`CREATE TABLE IF NOT EXISTS task_progress (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL,
+  base_at INTEGER NOT NULL,
+  base_ms INTEGER NOT NULL,
+  base_tokens INTEGER NOT NULL,
+  done_seen INTEGER NOT NULL DEFAULT 0,
+  moved_at INTEGER NOT NULL,
+  moved_ms INTEGER NOT NULL,
+  noted TEXT NOT NULL DEFAULT '[]',
+  flag_text TEXT NOT NULL DEFAULT '',
+  hard_at INTEGER
+)`);
+// The re-plan rule: strikes = flags since the user last resumed it (a re-plan keeps them), replan_due = the deadline for
+// the director's re-plan after a first flag (set while Re-planning), the first flag's text and what the re-plan changed,
+// and lifetime counts for telemetry.
+addColumn('task_progress', 'strikes', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('task_progress', 'replan_due', 'INTEGER');
+addColumn('task_progress', 'first_flag', "TEXT NOT NULL DEFAULT ''");
+addColumn('task_progress', 'replan_note', "TEXT NOT NULL DEFAULT ''");
+addColumn('task_progress', 'flags_total', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('task_progress', 'replans_total', 'INTEGER NOT NULL DEFAULT 0');
+// The allowance's start in work tokens (usage.ts taskWork): new input, output, subagents. NULL on rows from before:
+// set at the next check, which starts the token part of that allowance afresh.
+addColumn('task_progress', 'base_work_in', 'INTEGER');
+addColumn('task_progress', 'base_work_out', 'INTEGER');
+addColumn('task_progress', 'base_work_sub', 'INTEGER');
+// The watchdog (server/watchdog.ts): per Active task, its last look (state, idle spell, strikes, Stalled mark) and the
+// between-turn time spent idle with nothing pending, waiting on a request, and busy on commands.
+db.exec(`CREATE TABLE IF NOT EXISTS task_watch (
+  task_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT '',
+  tick_at INTEGER,
+  idle_since INTEGER,
+  strikes INTEGER NOT NULL DEFAULT 0,
+  strike_at INTEGER,
+  stalled_at INTEGER,
+  done_seen INTEGER NOT NULL DEFAULT 0,
+  idle_ms INTEGER NOT NULL DEFAULT 0,
+  waiting_ms INTEGER NOT NULL DEFAULT 0,
+  busy_ms INTEGER NOT NULL DEFAULT 0,
+  wakes INTEGER NOT NULL DEFAULT 0,
+  -- Stalled: whether it is put to the user (one request per project lists them; asked = in the last one filed), and
+  -- when it last was, so a task stalling again within the day goes to the director instead.
+  stall_user INTEGER NOT NULL DEFAULT 0,
+  stall_asked INTEGER NOT NULL DEFAULT 0,
+  user_stall_at INTEGER
+)`);
 // Sentences an agent was already told about by askcheck.ts (a prose-only ask), so a restart does not note them again.
 db.exec(`CREATE TABLE IF NOT EXISTS user_ask_notes (
   agent_id TEXT NOT NULL,
@@ -697,7 +902,363 @@ CREATE TABLE IF NOT EXISTS proposal_rounds (
   PRIMARY KEY (task_id, round)
 );
 CREATE INDEX IF NOT EXISTS proposal_rounds_request ON proposal_rounds(request_id);
+
+-- The runner and the web service (server/runner.ts). Commands the web service hands the runner (send a message,
+-- stop an agent, a permission answer, ...), done in order; op names are the protocol between the two.
+CREATE TABLE IF NOT EXISTS runner_commands (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  op TEXT NOT NULL,
+  args TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  done_at INTEGER,
+  error TEXT,
+  -- What a query (an op that answers, such as team-details) returned, as JSON.
+  result TEXT
+);
+CREATE INDEX IF NOT EXISTS runner_commands_pending ON runner_commands(done_at, id);
+-- Live-update messages the runner publishes (server/bus.ts), which the web service passes to browsers. Pruned after minutes.
+CREATE TABLE IF NOT EXISTS bus_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  msg TEXT NOT NULL,
+  ts INTEGER NOT NULL
+);
+-- One row: the running runner (its build, its heartbeat, the agents it holds).
+CREATE TABLE IF NOT EXISTS runner_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  pid INTEGER NOT NULL,
+  rev TEXT NOT NULL,
+  hash TEXT NOT NULL DEFAULT '',
+  protocol INTEGER NOT NULL,
+  started_at INTEGER NOT NULL,
+  beat_at INTEGER NOT NULL,
+  live TEXT NOT NULL DEFAULT '[]',
+  working INTEGER NOT NULL DEFAULT 0,
+  info TEXT NOT NULL DEFAULT '{}'
+);
+-- Which pages the user has open and visible (server/notify.ts): the web service records it, the runner reads it.
+CREATE TABLE IF NOT EXISTS page_presence (
+  client TEXT PRIMARY KEY,
+  hash TEXT NOT NULL,
+  visible INTEGER NOT NULL,
+  at INTEGER NOT NULL
+);
 `);
+// Which runner took a command and when (server/runner.ts drain): claimed by a conditional UPDATE, so none is done twice.
+addColumn('runner_commands', 'claimed_by', 'TEXT');
+addColumn('runner_commands', 'claimed_at', 'INTEGER');
+// The automatic "For review" pin (pins.ts autoPin): auto = 1 marks a pin Helm made itself from an agent's latest burst
+// of previews (round 0, never part of a proposal round); burst names that burst (agent and turn). previews.turn: the
+// posting agent's turn count when it was posted, so the previews of one turn form one burst.
+addColumn('pins', 'auto', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('pins', 'burst', "TEXT NOT NULL DEFAULT ''");
+addColumn('previews', 'turn', 'INTEGER');
+// A worklist belongs to a task (task_aeff7900b5): a builder with tasks alongside keeps one per task, and a task's Status
+// shows only its own. NULL: written before, read as the agent's current task's.
+addColumn('checklist', 'task_id', 'TEXT');
+// A status line per task an agent drives (task_3508723a80): a builder with tasks alongside reports each one's on its own
+// card. agents.status_line stays its current task's line.
+db.exec(`CREATE TABLE IF NOT EXISTS agent_task_status (
+  agent_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  status_line TEXT NOT NULL DEFAULT '',
+  progress INTEGER,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (agent_id, task_id)
+)`);
+db.exec('CREATE INDEX IF NOT EXISTS agent_task_status_task ON agent_task_status(task_id, updated_at)');
+
+// Per-project settings (settings.ts): one row per setting the user changed from its default. Settings are declared
+// in settings.ts with their default, so a new one needs no column and no migration.
+// Project knowledge (knowledge.ts): short notes of durable facts agents learned about the project, given to every new
+// agent session. added_by / updated_by: an agent's name or 'You'; *_agent: the agent's id (null for the user).
+// agents.knowledge_seen: what the agent was last given ({ note id: [updated_at, title] }), to tell it what changed.
+db.exec(`
+CREATE TABLE IF NOT EXISTS project_settings (
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (project_id, key)
+);
+CREATE TABLE IF NOT EXISTS knowledge_notes (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  topic TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  paths TEXT NOT NULL DEFAULT '[]',
+  added_by TEXT NOT NULL,
+  added_agent TEXT,
+  created_at INTEGER NOT NULL,
+  updated_by TEXT NOT NULL,
+  updated_agent TEXT,
+  updated_at INTEGER NOT NULL,
+  confirmed_at INTEGER,
+  confirmed_by TEXT
+);
+CREATE INDEX IF NOT EXISTS knowledge_notes_project ON knowledge_notes(project_id, topic);
+`);
+db.exec(`CREATE TABLE IF NOT EXISTS mode_switches (
+  project_id TEXT PRIMARY KEY,
+  from_mode TEXT NOT NULL,
+  to_mode TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  told INTEGER NOT NULL DEFAULT 0,
+  close_told INTEGER NOT NULL DEFAULT 0
+)`);
+if (builderForAll) {
+  const at = Date.now();
+  db.prepare("INSERT OR REPLACE INTO mode_switches (project_id, from_mode, to_mode, at) SELECT project_id, 'team', 'builder', ? FROM project_settings WHERE key = 'work_mode' AND value = 'team'").run(at);
+  db.exec("DELETE FROM project_settings WHERE key = 'work_mode' AND value = 'team'");
+  // Every other project now in builder mode that has no builder yet (the user switched some by hand, leaving no row):
+  // its director is told too. A very old database has no archived column yet at this point: then none is archived.
+  const hasArchived = (db.prepare('PRAGMA table_info(projects)').all() as { name: string }[]).some((c) => c.name === 'archived');
+  db.prepare(
+    `INSERT OR IGNORE INTO mode_switches (project_id, from_mode, to_mode, at) SELECT p.id, 'team', 'builder', ? FROM projects p
+     WHERE ${hasArchived ? 'p.archived = 0 AND ' : ''}NOT EXISTS (SELECT 1 FROM project_settings s WHERE s.project_id = p.id AND s.key = 'work_mode' AND s.value != 'builder')
+       AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.project_id = p.id AND a.role_id = 'builder' AND a.parent_id IS NOT NULL AND a.status != 'closed')`,
+  ).run(at);
+}
+// Builder mode is the only way work runs: a project still set to Team switches at its next idle moment
+// (builder.ts modeSwitchTick tells the director, waits for its area agents, then has the builder started), with a line
+// in its journal. Idempotent: the setting row is gone once switched.
+for (const r of db.prepare("SELECT project_id FROM project_settings WHERE key = 'work_mode' AND value != 'builder'").all() as { project_id: string }[]) {
+  const at = Date.now();
+  db.prepare("INSERT OR REPLACE INTO mode_switches (project_id, from_mode, to_mode, at, told, close_told) VALUES (?, 'team', 'builder', ?, 0, 0)").run(r.project_id, at);
+  db.prepare("INSERT INTO journal (project_id, agent_id, kind, phase, title, body, ts) VALUES (?, NULL, 'decision', '', 'Work now runs in builder mode', 'Team mode was retired: one builder takes the queue, and the area agents finish what they have first.', ?)").run(r.project_id, at);
+}
+db.exec("DELETE FROM project_settings WHERE key = 'work_mode'");
+addColumn('agents', 'knowledge_seen', 'TEXT');
+// complete_task asked this agent once to record what it learned (knowledge.ts, finishNudge).
+addColumn('agents', 'knowledge_asked', 'INTEGER');
+addColumn('projects', 'knowledge_over_noted', 'INTEGER');
+// When the user last opened the Knowledge page: notes agents added or changed since are marked for a human glance.
+addColumn('projects', 'knowledge_viewed_at', 'INTEGER');
+// The project's mode (server/projectmode.ts): running (Autopilot), queue_only, winding_down (Finish up), at_rest or stopped. Only the user changes it;
+// mode_data holds what the change recorded (tasks Active at a wind down, agents a stop interrupted, the at-rest tally).
+addColumn('projects', 'mode', "TEXT NOT NULL DEFAULT 'running'");
+addColumn('projects', 'mode_since', 'INTEGER');
+addColumn('projects', 'mode_note', "TEXT NOT NULL DEFAULT ''");
+addColumn('projects', 'mode_data', "TEXT NOT NULL DEFAULT '{}'");
+// Which mode change this agent was last told about ("mode@since"), so each agent hears of a change once.
+addColumn('agents', 'mode_seen', 'TEXT');
+// A builder's SDK subagent (subagents.ts): the Agent call it runs for, its tier, and whether it runs in the background.
+addColumn('agents', 'sdk_tool_use_id', 'TEXT');
+addColumn('agents', 'sub_tier', 'TEXT');
+addColumn('agents', 'background', 'INTEGER');
+addColumn('builder_batch', 'subagents', 'INTEGER NOT NULL DEFAULT 0');
+// A heavy claim: the one build, suite or render running on that host (commands.ts).
+addColumn('host_claims', 'heavy', 'INTEGER NOT NULL DEFAULT 0');
+// When an agent was asked to save before its context is summarised; cleared by the summary (contextsave.ts).
+addColumn('agents', 'save_asked_at', 'INTEGER');
+// When the agent last set its own status line (report_status): a line set after its current tool started wins over
+// the line Helm derives from that tool (busy.ts liveLine).
+addColumn('agents', 'status_at', 'INTEGER');
+db.exec(`
+CREATE TABLE IF NOT EXISTS held_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  text TEXT NOT NULL,
+  sender TEXT NOT NULL,
+  files TEXT NOT NULL DEFAULT '[]',
+  bind INTEGER NOT NULL DEFAULT 1,
+  viewing TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS held_messages_agent ON held_messages(agent_id, id);
+`);
+
+// Dashboards (dashboards.ts, tilescope.ts): named pages of tiles agents keep up to date. Created here, before any view
+// that reads them (the search index), so every process that opens the database has them.
+db.exec(`
+CREATE TABLE IF NOT EXISTS dashboards (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  -- The user's words: what the dashboard is to show. The director builds it from them.
+  description TEXT NOT NULL DEFAULT '',
+  -- building: the director is making it (its task); ready: the director checked it against the description.
+  state TEXT NOT NULL DEFAULT 'building',
+  -- The task that builds it, or carries the latest change the user asked for.
+  task_id TEXT,
+  -- Further tasks whose agents may create and edit its tiles (set_tile), as the director delegated (JSON array).
+  allow_tasks TEXT NOT NULL DEFAULT '[]',
+  position INTEGER NOT NULL DEFAULT 0,
+  created_by TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  ready_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS dashboards_project ON dashboards(project_id, position);
+CREATE TABLE IF NOT EXISTS tiles (
+  id TEXT PRIMARY KEY,
+  dashboard_id TEXT NOT NULL REFERENCES dashboards(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  caption TEXT NOT NULL DEFAULT '',
+  -- Tiles sharing a group show together (a gallery: one image tile per level or angle).
+  grp TEXT NOT NULL DEFAULT '',
+  position INTEGER NOT NULL DEFAULT 0,
+  -- What it depends on: {"paths": [globs], "docs": [Spec entry ids], "tags": [Spec tags]}.
+  deps TEXT NOT NULL DEFAULT '{}',
+  -- How to refresh it: {"command", "cwd", "host", "duration", "notes"}, written by the agent that built it.
+  recipe TEXT NOT NULL DEFAULT '{}',
+  -- 1: refreshed only when the director asks; a task that affects it leaves it Stale for the director.
+  expensive INTEGER NOT NULL DEFAULT 0,
+  -- Its place on the project's Home (1 or 2), 0 when not pinned.
+  pinned INTEGER NOT NULL DEFAULT 0,
+  -- The last good data (JSON, its shape by kind), and what it was built from: {"commit", "at", "agent_id", "agent", "task_id"}.
+  data TEXT,
+  built TEXT,
+  -- Why it is out of date: {"reason", "task_id", "files", "at"}; null when current.
+  stale TEXT,
+  -- The last refresh that failed: {"message", "at", "agent"}; the last good data stays.
+  error TEXT,
+  -- When the user last asked the director to refresh it.
+  asked_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS tiles_dashboard ON tiles(dashboard_id, position);
+CREATE INDEX IF NOT EXISTS tiles_project ON tiles(project_id);
+-- Each refresh of a tile, newest kept (dashboards.ts trims by count and size). file: an image or page in the artifact folder.
+CREATE TABLE IF NOT EXISTS tile_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tile_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  data TEXT NOT NULL,
+  file TEXT,
+  bytes INTEGER NOT NULL DEFAULT 0,
+  commit_sha TEXT,
+  task_id TEXT,
+  agent_id TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS tile_history_tile ON tile_history(tile_id, id);
+-- Which tiles a task's work may have affected (tilescope.ts) and what was done about each:
+-- pending, refreshed, unaffected, stale (left stale, or failed), expensive (for the director), extra (refreshed unasked).
+CREATE TABLE IF NOT EXISTS tile_checks (
+  task_id TEXT NOT NULL,
+  tile_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  files TEXT NOT NULL DEFAULT '[]',
+  docs TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  agent_id TEXT,
+  computed_at INTEGER NOT NULL,
+  resolved_at INTEGER,
+  PRIMARY KEY (task_id, tile_id)
+);
+-- The director's check of a task's dashboard scope (review_dashboard_scope).
+CREATE TABLE IF NOT EXISTS dashboard_reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_id TEXT,
+  agent_name TEXT NOT NULL DEFAULT '',
+  decision TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  changes TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS dashboard_reviews_task ON dashboard_reviews(task_id, id);
+-- Tokens each agent turn used (usage.ts): input + output + cache writes. task_id is the
+-- agent's task when the turn ended.
+CREATE TABLE IF NOT EXISTS token_usage (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  task_id TEXT,
+  tokens INTEGER NOT NULL,
+  at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS token_usage_agent ON token_usage(agent_id);
+CREATE INDEX IF NOT EXISTS token_usage_task ON token_usage(task_id);
+CREATE INDEX IF NOT EXISTS token_usage_project ON token_usage(project_id);
+-- The subscription's plan windows (five_hour, seven_day, ...) as the last rate_limit_event reported them (usage.ts).
+CREATE TABLE IF NOT EXISTS plan_usage (
+  name TEXT PRIMARY KEY,
+  percent REAL NOT NULL,
+  resets_at INTEGER,
+  at INTEGER NOT NULL
+);
+`);
+// The tier a turn ran at (usage by tier, server/tiers.ts), and whose turn it was: director, builder or agent.
+addColumn('token_usage', 'tier', 'TEXT');
+addColumn('token_usage', 'who', 'TEXT');
+// Work tokens (usage.ts, the progress check): the row's new input and output, without cache reads and context re-writes.
+addColumn('token_usage', 'work_in', 'INTEGER');
+addColumn('token_usage', 'work_out', 'INTEGER');
+// The context the agent's last call of the turn held (contextsave.ts contextOf): what each call of the next turn re-reads.
+addColumn('token_usage', 'context', 'INTEGER');
+
+// Releases (releases.ts): a project's release recipe (what it builds and how it publishes) and its releases, each
+// with its change log, the tasks in it and the files built for it (under artifacts/releases/<project>/<release>/).
+db.exec(`
+CREATE TABLE IF NOT EXISTS release_recipes (
+  project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  -- JSON array of {name, command, cwd, host, files, duration, notes}
+  artifacts TEXT NOT NULL DEFAULT '[]',
+  -- semver or date
+  scheme TEXT NOT NULL DEFAULT 'semver',
+  -- Markdown steps to publish a release (where it goes, how); empty: releases stay in Helm.
+  publish TEXT NOT NULL DEFAULT '',
+  updated_by TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS releases (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  version TEXT NOT NULL,
+  commit_sha TEXT NOT NULL,
+  -- drafting (change log being written), building, ready, failed, published
+  state TEXT NOT NULL DEFAULT 'drafting',
+  notes TEXT NOT NULL DEFAULT '',
+  -- JSON array of the ids of the tasks finished since the previous release
+  tasks TEXT NOT NULL DEFAULT '[]',
+  -- The Active task that carries the release's work and thread.
+  task_id TEXT,
+  tag TEXT,
+  error TEXT,
+  -- The inbox request asking the user to confirm publishing, and when they confirmed it (cleared once recorded).
+  publish_request TEXT,
+  publish_confirmed_at INTEGER,
+  published_at INTEGER,
+  published_how TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  ready_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS releases_project ON releases(project_id, created_at);
+CREATE TABLE IF NOT EXISTS release_artifacts (
+  id TEXT PRIMARY KEY,
+  release_id TEXT NOT NULL REFERENCES releases(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  -- Relative to the artifact folder; NULL once the file was removed (the record stays).
+  file TEXT,
+  bytes INTEGER NOT NULL DEFAULT 0,
+  sha256 TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  removed_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS release_artifacts_release ON release_artifacts(release_id);
+`);
+
+// The ranked search's full-text index (searchschema.ts): its tables always; its views and triggers whenever their
+// version is newer than the database's, which also empties the index for searchindex.ts to build again in the
+// background. Inside the migration transaction (BEGIN IMMEDIATE at the top of this file), so two processes starting
+// together do it once.
+db.exec(SEARCH_TABLES_SQL);
+const searchSchemaAt = () => Number((db.prepare("SELECT value FROM search_meta WHERE key = 'schema'").get() as { value?: string } | undefined)?.value ?? 0);
+if (searchSchemaAt() < SEARCH_SCHEMA_VERSION) {
+  db.exec(searchSchemaSql());
+  db.exec("DELETE FROM search_fts; DELETE FROM search_rows; DELETE FROM search_meta WHERE key LIKE 'cursor:%' OR key = 'ready'");
+  db.prepare("INSERT OR REPLACE INTO search_meta (key, value) VALUES ('schema', ?)").run(String(SEARCH_SCHEMA_VERSION));
+}
 
 type Param = string | number | bigint | null | Uint8Array;
 const clean = (params: unknown[]): Param[] =>
@@ -712,15 +1273,36 @@ export function get(sql: string, ...params: unknown[]): Row | undefined {
   return db.prepare(sql).get(...clean(params)) as Row | undefined;
 }
 export function run(sql: string, ...params: unknown[]) {
-  return db.prepare(sql).run(...clean(params));
+  const t = Date.now();
+  const out = db.prepare(sql).run(...clean(params));
+  slow(t, sql);
+  return out;
 }
-/** Run `fn` in one transaction: all of its writes land, or none do. A nested call joins the outer one. */
+
+/** Writes that hold (or waited for) the write lock long enough to stall the other process are logged (see tx). */
+const SLOW_MS = 150;
+function slow(t: number, what: string) {
+  const ms = Date.now() - t;
+  if (ms >= SLOW_MS && !db.isTransaction) console.warn(`db: a write took ${ms} ms: ${what.replace(/\s+/g, ' ').slice(0, 160)}`);
+}
+/**
+ * Run `fn` in one transaction: all of its writes land, or none do. A nested call joins the outer one.
+ *
+ * Keep transactions short. Split, the runner and the web service share this file, and a write waits for the other's
+ * open write transaction; node:sqlite waits synchronously, so the waiting process's whole event loop stops (agents'
+ * messages, the API, the stream). Measured: a 3 s transaction in one process froze the other's event loop for 2.8 s.
+ * Batch work (backfills, migrations of many rows) belongs in chunks of short transactions.
+ */
 export function tx<T>(fn: () => T): T {
   if (db.isTransaction) return fn();
-  db.exec('BEGIN');
+  // IMMEDIATE: take the write lock up front. A deferred BEGIN that read first and then writes fails at once with
+  // "database is locked" when the other process committed meanwhile; busy_timeout cannot retry that case.
+  const t = Date.now();
+  db.exec('BEGIN IMMEDIATE');
   try {
     const out = fn();
     db.exec('COMMIT');
+    slow(t, `transaction from ${new Error().stack?.split('\n')[2]?.trim() ?? '?'}`);
     return out;
   } catch (err) {
     db.exec('ROLLBACK');
@@ -812,3 +1394,318 @@ export function mergeConvertedDiscussions(): number {
 }
 const merged = mergeConvertedDiscussions();
 if (merged) console.log(`Merged ${merged} discussion(s) into the task made from each.`);
+db.exec('COMMIT');
+
+/**
+ * Previews posted under the same title on one task before previews had versions become one preview: the newest keeps
+ * its row and id, the older ones become its earlier versions (their ids resolve to it through preview_versions.old_id,
+ * and pins on them move to it). Previews pinned by hand (proposal options) stay apart. Idempotent: nothing to do once
+ * grouped, and new posts are versioned as they arrive (store.ts addPreview).
+ */
+export function groupPreviewVersions(): number {
+  const groups = all(
+    `SELECT task_id, lower(trim(title)) AS t, COUNT(*) AS n FROM previews p
+      WHERE task_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pins h WHERE h.preview_id = p.id AND h.auto = 0)
+      GROUP BY task_id, lower(trim(title)) HAVING COUNT(*) > 1`,
+  );
+  if (!groups.length) return 0;
+  return tx(() => {
+    let moved = 0;
+    for (const g of groups) {
+      const rows = all(
+        `SELECT * FROM previews p WHERE task_id = ? AND lower(trim(title)) = ? AND NOT EXISTS (SELECT 1 FROM pins h WHERE h.preview_id = p.id AND h.auto = 0) ORDER BY created_at, rowid`,
+        g.task_id, g.t,
+      );
+      if (rows.length < 2) continue;
+      const head = rows[rows.length - 1];
+      const older = rows.slice(0, -1);
+      older.forEach((r, i) => {
+        run(
+          'INSERT INTO preview_versions (preview_id, version, agent_id, kind, title, caption, file, content, source, commit_sha, created_at, old_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+          head.id, i + 1, r.agent_id, r.kind, r.title, r.caption, r.file, r.content, r.source, r.commit_sha ?? null, r.created_at, r.id,
+        );
+        // Its auto pin (For review) goes; the head carries the review now.
+        run('DELETE FROM pins WHERE preview_id = ? AND auto = 1', r.id);
+        run('DELETE FROM previews WHERE id = ?', r.id);
+        moved++;
+      });
+      run('UPDATE previews SET version = ?, first_at = ? WHERE id = ?', rows.length, older[0].created_at, head.id);
+    }
+    return moved;
+  });
+}
+const grouped = groupPreviewVersions();
+if (grouped) console.log(`Grouped ${grouped} preview(s) as earlier versions of the same-titled preview on their task.`);
+
+// Reminders of deferred requests (server/reminders.ts): a request the user answered "not now" is asked again as a new
+// request when due: at the user's next session at least 3 hours later (due_at NULL), or at due_at. root_id is the first
+// request of the chain, count how many times it was deferred. status: pending, sent, skipped, cancelled, stopped.
+db.exec(`CREATE TABLE IF NOT EXISTS request_reminders (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  root_id TEXT NOT NULL,
+  count INTEGER NOT NULL,
+  deferred_at INTEGER NOT NULL,
+  due_at INTEGER,
+  status TEXT NOT NULL DEFAULT 'pending',
+  sent_request_id TEXT,
+  reason TEXT NOT NULL DEFAULT '',
+  done_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS request_reminders_pending ON request_reminders(status, project_id);
+CREATE INDEX IF NOT EXISTS request_reminders_request ON request_reminders(request_id);`);
+
+// Dashboard sections, sizes, a shared series key and the rules (dashboards.ts): a dashboard is a few titled sections in
+// order (a section may sit under another, parent_id); every tile belongs to one (section_id), has a size on the grid
+// (s, m, l), an optional longer note behind an info tap (info), and a page tile states why it is free HTML (page_reason).
+// The key names a dashboard's series once (JSON [{name, color}]); lint_noted: when its director was told what breaks the rules.
+db.exec(`CREATE TABLE IF NOT EXISTS dashboard_sections (
+  id TEXT PRIMARY KEY,
+  dashboard_id TEXT NOT NULL REFERENCES dashboards(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  parent_id TEXT,
+  position INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS dashboard_sections_dash ON dashboard_sections(dashboard_id, position);`);
+addColumn('tiles', 'section_id', 'TEXT');
+{
+  // Tiles from before sizes keep how they looked: tables and pages across the grid, numbers small, the rest medium.
+  const had = (db.prepare('PRAGMA table_info(tiles)').all() as { name: string }[]).some((c) => c.name === 'size');
+  addColumn('tiles', 'size', "TEXT NOT NULL DEFAULT 'm'");
+  if (!had) db.exec("UPDATE tiles SET size = CASE WHEN kind IN ('table', 'page') THEN 'l' WHEN kind = 'number' THEN 's' ELSE 'm' END");
+}
+addColumn('tiles', 'info', "TEXT NOT NULL DEFAULT ''");
+addColumn('tiles', 'page_reason', "TEXT NOT NULL DEFAULT ''");
+addColumn('dashboards', 'series_key', "TEXT NOT NULL DEFAULT '[]'");
+addColumn('dashboards', 'lint_noted', 'INTEGER');
+
+// The release recipe worked out on the Releases page (recipework.ts): the director's proposed recipes, each a card in
+// the project's "Release recipe" discussion that the user applies (as is or changed) or declines; and test builds,
+// one artifact built now by an agent without a release, started only by the user, with its file or error.
+db.exec(`
+CREATE TABLE IF NOT EXISTS recipe_threads (
+  project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  discussion_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS recipe_proposals (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  discussion_id TEXT,
+  agent_id TEXT,
+  author_name TEXT NOT NULL DEFAULT '',
+  -- JSON {artifacts, scheme, publish}: the whole recipe it proposes
+  recipe TEXT NOT NULL,
+  rationale TEXT NOT NULL DEFAULT '',
+  -- open, applied, declined, superseded
+  status TEXT NOT NULL DEFAULT 'open',
+  note TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  decided_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS recipe_proposals_project ON recipe_proposals(project_id, status);
+CREATE TABLE IF NOT EXISTS recipe_tests (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  artifact TEXT NOT NULL,
+  commit_sha TEXT,
+  -- running, done, failed
+  status TEXT NOT NULL DEFAULT 'running',
+  file TEXT,
+  bytes INTEGER,
+  sha256 TEXT,
+  error TEXT,
+  started_at INTEGER NOT NULL,
+  finished_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS recipe_tests_project ON recipe_tests(project_id, artifact, started_at);
+`);
+
+// Merging tasks that are the same work (merge.ts): the closed ones point at the kept one; a report records what its
+// task fixed; pairs the director decided to keep apart are not raised again by the queue review; the review's last
+// note; the director's consolidation proposals (merge, back to back, wait for), each a card the user applies.
+addColumn('tasks', 'merged_into', 'TEXT');
+addColumn('reports', 'fix_note', "TEXT NOT NULL DEFAULT ''");
+db.exec(`
+CREATE TABLE IF NOT EXISTS task_pairs_apart (
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  a TEXT NOT NULL,
+  b TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (a, b)
+);
+CREATE TABLE IF NOT EXISTS queue_reviews (
+  project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  pairs_key TEXT NOT NULL DEFAULT '',
+  noted_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS consolidations (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  discussion_id TEXT NOT NULL,
+  agent_name TEXT NOT NULL DEFAULT '',
+  -- merge, adjacent (back to back), wait (the first waits for the second)
+  kind TEXT NOT NULL,
+  -- JSON array of task ids; for merge the first is the one kept
+  tasks TEXT NOT NULL,
+  gain TEXT NOT NULL DEFAULT '',
+  -- open, applied, declined
+  status TEXT NOT NULL DEFAULT 'open',
+  result TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  decided_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS consolidations_discussion ON consolidations(discussion_id, status);
+`);
+
+// The For review rule (pins.ts reviewNow): who took a pin off ('user', 'helm' or an agent's name), so a preview the
+// user unpinned is not pinned again; and whether a project's pins were set by the rule once (the repair).
+addColumn('pins', 'unpinned_by', 'TEXT');
+addColumn('projects', 'review_pins_repaired', 'INTEGER NOT NULL DEFAULT 0');
+
+// Test builds (testbuilds.ts): a task's build of the release recipe's artifacts at a commit, for the user to try; its
+// files are recipe_tests rows with build_id set. Kept apart from releases, cleaned up after feedback and a quiet spell.
+db.exec(`
+CREATE TABLE IF NOT EXISTS test_builds (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  task_id TEXT NOT NULL,
+  n INTEGER NOT NULL,
+  commit_sha TEXT NOT NULL,
+  -- JSON: the recipe's artifacts as built (name, command, cwd, host, files)
+  recipe TEXT NOT NULL DEFAULT '[]',
+  -- ready (made), waiting (its test request is open), feedback (answered), superseded, removed
+  state TEXT NOT NULL DEFAULT 'ready',
+  request_id TEXT,
+  made_by TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  feedback_at INTEGER,
+  superseded_at INTEGER,
+  removed_at INTEGER,
+  removed_why TEXT NOT NULL DEFAULT '',
+  -- why its files are kept past the rule (its commit is not in the repository)
+  flag TEXT NOT NULL DEFAULT '',
+  rebuild_of TEXT,
+  rebuild_asked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS test_builds_task ON test_builds(task_id, created_at);
+CREATE INDEX IF NOT EXISTS test_builds_project ON test_builds(project_id, state);
+`);
+addColumn('recipe_tests', 'build_id', 'TEXT');
+
+// Spec work (specwork.ts): Review, Revise and Create, each a discussion with the director started from the Spec page.
+// spec_work holds its mode and progress; spec_items the cards it posts: Review findings and proposed new entries.
+db.exec(`
+CREATE TABLE IF NOT EXISTS spec_work (
+  discussion_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  -- review, revise, create
+  mode TEXT NOT NULL,
+  -- the section it is limited to ('' for the whole Spec) and the user's ask
+  focus TEXT NOT NULL DEFAULT '',
+  ask TEXT NOT NULL DEFAULT '',
+  -- the user asked it to stop after the current section
+  stop INTEGER NOT NULL DEFAULT 0,
+  -- JSON array of the section ids done ('none' for entries with no section)
+  done TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS spec_work_project ON spec_work(project_id, mode);
+CREATE TABLE IF NOT EXISTS spec_items (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  discussion_id TEXT NOT NULL,
+  -- the thread message that shows it
+  message_id INTEGER,
+  -- match, gap, disagree (Review findings), entry (a proposed new entry)
+  kind TEXT NOT NULL,
+  section TEXT NOT NULL DEFAULT '',
+  text TEXT NOT NULL DEFAULT '',
+  doc_id TEXT,
+  -- for an entry: JSON {title, summary, body, section, tags}
+  data TEXT NOT NULL DEFAULT '{}',
+  -- open, picked (taken into a Revise), accepted (entry written), dropped
+  status TEXT NOT NULL DEFAULT 'open',
+  result TEXT,
+  created_at INTEGER NOT NULL,
+  decided_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS spec_items_discussion ON spec_items(discussion_id, message_id);
+-- Cross-project threads (crossproject.ts): one row per side, a discussion in project_id paired with one in the peer.
+CREATE TABLE IF NOT EXISTS project_threads (
+  task_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  peer_project_id TEXT NOT NULL,
+  -- the peer's side; NULL until a first message reaches it (a work request waits for the user's Allow)
+  peer_task_id TEXT,
+  -- 1: this side started the thread ("To <peer>"); 0: it arrived ("From <peer>")
+  started_here INTEGER NOT NULL DEFAULT 0,
+  -- the latest message from the peer, and when the user last opened this side
+  last_in_at INTEGER,
+  seen_at INTEGER,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS project_threads_project ON project_threads(project_id, peer_project_id);
+`);
+// A builder Helm started fresh for one task (dispatch.ts), as opposed to the standing Builder that held the queue
+// before (closed once its last task finishes) and the area agents of team mode.
+addColumn('agents', 'per_task', 'INTEGER NOT NULL DEFAULT 0');
+// Work the user tapped that a builder does (buildtask.ts): what to tell the director when it is done, and the task
+// that builds a release's artifacts (its builder may attach them, releasetools.ts).
+addColumn('tasks', 'done_note', 'TEXT');
+addColumn('releases', 'build_task_id', 'TEXT');
+// The Ideas board (ideas.ts): cards (a note, a link or an image) placed on a free canvas, and named frames drawn around
+// them. A card belongs to the smallest frame holding its centre (frame_id, kept by ideas.ts assignFrames); Discuss on a
+// frame starts a discussion (discussion_id). image_id is an attachment (owner_kind 'idea', owner_id the card): the
+// uploaded image, or a link's preview image fetched by the server.
+db.exec(`
+CREATE TABLE IF NOT EXISTS idea_frames (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL DEFAULT '',
+  x REAL NOT NULL, y REAL NOT NULL, w REAL NOT NULL, h REAL NOT NULL,
+  discussion_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idea_frames_project ON idea_frames(project_id);
+CREATE TABLE IF NOT EXISTS idea_cards (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  -- note | link | image
+  kind TEXT NOT NULL,
+  x REAL NOT NULL, y REAL NOT NULL, w REAL NOT NULL, h REAL NOT NULL,
+  z INTEGER NOT NULL DEFAULT 0,
+  frame_id TEXT,
+  -- a note's markdown; for a link, its title
+  text TEXT NOT NULL DEFAULT '',
+  url TEXT,
+  site TEXT,
+  image_id TEXT,
+  -- a link: '' fetched or failed, 'fetching' while its preview is fetched
+  status TEXT NOT NULL DEFAULT '',
+  author TEXT NOT NULL DEFAULT 'user',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idea_cards_project ON idea_cards(project_id);
+`);
+// Claude accounts (accounts.ts): the main login and extra ones, each with its own config folder under
+// HELM_DATA/accounts/<name>. A project runs every agent on its primary (projects.account, NULL = main) and moves to its
+// fallbacks in order (projects.account_fallbacks, JSON names) while the primary is limited (accounts.limited_until).
+db.exec(`
+CREATE TABLE IF NOT EXISTS accounts (
+  name TEXT PRIMARY KEY,
+  created_at INTEGER NOT NULL,
+  limited_until INTEGER,
+  limited_at INTEGER
+);
+INSERT OR IGNORE INTO accounts (name, created_at) VALUES ('main', 0);
+`);
+addColumn('projects', 'account', 'TEXT');
+addColumn('projects', 'account_fallbacks', "TEXT NOT NULL DEFAULT '[]'");
+// The account a turn ran on (NULL: the main one, and every row from before accounts).
+addColumn('token_usage', 'account', 'TEXT');

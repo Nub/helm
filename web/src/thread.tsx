@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Clamp, Composer, Markdown, clock , PlainRefs } from './ui';
+import { shortWhen } from './time';
 import { AttachmentList } from './attachments';
 import type { Attachment } from './api';
 
@@ -12,7 +13,7 @@ import type { Attachment } from './api';
  */
 export type ThreadLine =
   | { type: 'you'; key: string; ts: number; text: string; filed?: { title: string; href: string }[]; note?: string; attachments?: Attachment[]; attachmentAction?: (a: Attachment) => ReactNode; about?: { kind: string; id: string; title: string } }
-  | { type: 'reply'; key: string; ts: number; text: string; name: string; ok?: boolean; note?: string }
+  | { type: 'reply'; key: string; ts: number; text: string; name: string; ok?: boolean; note?: string; action?: ReactNode }
   | { type: 'system'; key: string; ts: number; text: string; tone?: '' | 'error'; href?: string }
   | { type: 'node'; key: string; ts: number; node: ReactNode };
 
@@ -29,9 +30,11 @@ export function Thread({
   placeholder,
   onSend,
   attachTo,
+  draftKey,
   className = '',
   composer = true,
   dock,
+  second,
 }: {
   label: string;
   head: ReactNode;
@@ -51,9 +54,13 @@ export function Thread({
   onSend: (text: string, attachments: string[]) => Promise<unknown>;
   /** A project id: the composer then takes files (see Composer). */
   attachTo?: string;
+  /** Where the composer keeps what is typed until it is sent (drafts.ts). */
+  draftKey?: string;
   className?: string;
   /** Off where the page docks its own composer. */
   composer?: boolean;
+  /** A second send beside the composer's (a running task's Interject). */
+  second?: { label: string; onSend: (text: string, attachments: string[]) => Promise<unknown>; empty?: boolean };
   /** A composer of the caller's own in place of the standard one (the chat sheet's), given the thread's send. */
   dock?: (send: (text: string, attachments: string[]) => Promise<unknown>) => ReactNode;
 }) {
@@ -142,11 +149,11 @@ export function Thread({
     box.current?.scrollTo({ top: box.current.scrollHeight, behavior: 'smooth' });
   };
 
-  const send = async (text: string, attachments: string[]) => {
+  const send = async (text: string, attachments: string[], how = onSend) => {
     pinned.current = true;
     setPending({ text, seen: count(text), files: attachments.length });
     try {
-      await onSend(text, attachments);
+      await how(text, attachments);
     } catch (err) {
       setPending(null);
       throw err;
@@ -198,6 +205,7 @@ export function Thread({
                     {l.note && <span className="msg-after"> · {l.note}</span>}
                   </span>
                   <Clamp text={l.text} lines={9} initiallyOpen={newest} />
+                  {l.action && <div className="msg-action">{l.action}</div>}
                 </div>
               );
             }
@@ -242,7 +250,7 @@ export function Thread({
       {dock && <div className="convo-dock">{dock(send)}</div>}
       {composer && !dock && (
         <div className="convo-dock">
-          <Composer placeholder={isEmpty && empty ? `${placeholder}…` : placeholder} onSend={send} attachTo={attachTo} />
+          <Composer placeholder={isEmpty && empty ? `${placeholder}…` : placeholder} onSend={(t, a) => send(t, a)} attachTo={attachTo} draftKey={draftKey} second={second && { label: second.label, empty: second.empty, onSend: (t, a) => send(t, a, second.onSend) }} />
         </div>
       )}
     </section>
@@ -250,8 +258,7 @@ export function Thread({
 }
 
 /** Time of day for today's rows, the date otherwise: system rows stay one glance wide. */
-const shortTime = (ts: number) =>
-  new Date(ts).toDateString() === new Date().toDateString() ? new Date(ts).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }) : new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+const shortTime = shortWhen;
 
 function SystemLine({ text, ts, tone, href, dataKey }: { text: string; ts: number; tone: string; href?: string; dataKey?: string }) {
   const [open, setOpen] = useState(false);

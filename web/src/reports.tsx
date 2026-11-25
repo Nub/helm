@@ -3,7 +3,7 @@ import { api, useLive } from './api';
 import type { ProjectState, Report, ReportSource, ReportStatus, SourceMode, SourcePreview, SourceType } from './api';
 import { TaskStateTag } from './tasks';
 import { openViewer } from './viewer';
-import { Chips, Empty, Icon, Markdown, Sheet, Tag, ago, clock, go, href, useAction } from './ui';
+import { Chips, Empty, Icon, Markdown, Sheet, Tag, ago, clock, go, href, useAction, PageHeader } from './ui';
 
 // ---------- shared bits ----------
 
@@ -25,8 +25,8 @@ const SOURCE_ICON: Record<SourceType, string> = { 'github-issues': 'github', fol
 function SourceBadge({ source }: { source: Report['source'] }) {
   if (!source) return null;
   return (
-    <span className="source-badge" title={`${source.label}: ${source.name}`}>
-      <Icon name={SOURCE_ICON[source.type] ?? 'reports'} size={13} />
+    <span className="tag plain source-label" title={`${source.label}: ${source.name}`}>
+      <Icon name={SOURCE_ICON[source.type] ?? 'reports'} size={16} />
       <span className="one-line">{source.name}</span>
     </span>
   );
@@ -36,9 +36,9 @@ const fileUrl = (file: string) => `/artifacts/${file}`;
 const thumbOf = (r: Report) => r.attachments.find((a) => a.kind === 'image');
 
 const MODES: { id: SourceMode; name: string; detail: string }[] = [
-  { id: 'act', name: 'Act', detail: 'The director triages each report. One complete enough to fix is started straight away; the rest come to you as questions.' },
-  { id: 'triage', name: 'Triage only', detail: 'The director triages and proposes tasks in Planning; nothing starts until you approve. Good for a public repository.' },
-  { id: 'collect', name: 'Collect only', detail: 'Reports are listed here and the director is not told. You can send any one to it.' },
+  { id: 'act', name: 'Act', detail: 'Fixes what is clear; asks about the rest.' },
+  { id: 'triage', name: 'Triage only', detail: 'Proposes tasks; you approve.' },
+  { id: 'collect', name: 'Collect only', detail: 'Listed only.' },
 ];
 const MODE_NAME: Record<SourceMode, string> = { act: 'Act', triage: 'Triage only', collect: 'Collect only' };
 
@@ -76,15 +76,14 @@ function ReportList({ s }: { s: ProjectState }) {
 
   return (
     <section className="reports-page">
-      <div className="section-head">
-        <h1 className="page-title">Reports</h1>
+      <PageHeader title="Reports">
         <a className="btn small quiet" href={href('p', pid, 'setup', 'reports')}>
-          <Icon name="setup" size={15} /> Sources
+          <Icon name="setup" size={16} /> Sources
         </a>
-      </div>
+      </PageHeader>
       {!data.sources.length ? (
         <Empty title="No report sources yet">
-          Connect GitHub issues, a folder of notes or a command in <a href={href('p', pid, 'setup', 'reports')}>Setup</a>. New reports then show up here and the director triages them.
+          <a href={href('p', pid, 'setup', 'reports')}>Add a source</a>
         </Empty>
       ) : (
         <>
@@ -134,7 +133,7 @@ function ReportList({ s }: { s: ProjectState }) {
               )}
             </ul>
           ) : (
-            <Empty title={filter === 'open' ? 'Nothing open' : 'No reports here'}>{filter === 'open' && data.reports.length ? 'Every report has been dealt with.' : null}</Empty>
+            <Empty title={filter === 'open' ? 'Nothing open' : 'No reports here'} />
           )}
         </>
       )}
@@ -157,7 +156,7 @@ function ReportRow({ r, pid }: { r: Report; pid: string }) {
           </div>
           {r.task && (
             <span className="report-task small">
-              <Icon name="check" size={13} /> <span className="one-line">{r.task.title}</span>
+              <Icon name="check" size={16} /> <span className="one-line">{r.task.title}</span>
             </span>
           )}
         </div>
@@ -214,11 +213,11 @@ function ReportDetail({ s, id }: { s: ProjectState; id: string }) {
         <div className="row wrap report-actions">
           {!r.task && (
             <button className="btn small" disabled={busy} onClick={() => run(async () => go('p', pid, 'tasks', (await api<{ id: string }>(`/api/reports/${r.id}/task`, { body: {} })).id))}>
-              <Icon name="plus" size={15} /> Create task
+              <Icon name="plus" size={16} /> Create task
             </button>
           )}
           <button className="btn small" disabled={busy} onClick={() => setAsking(true)}>
-            <Icon name="send" size={15} /> <span className="btn-label">Ask {directorName} to look</span>
+            <Icon name="send" size={16} /> <span className="btn-label">Ask {directorName} to look</span>
           </button>
           {closed ? (
             <button className="btn small quiet" disabled={busy} onClick={() => run(() => api(`/api/reports/${r.id}/status`, { body: { status: 'new' } }))}>
@@ -238,17 +237,23 @@ function ReportDetail({ s, id }: { s: ProjectState; id: string }) {
           )}
           {r.url && (
             <a className="btn small quiet" href={r.url} target="_blank" rel="noreferrer noopener">
-              <Icon name="external" size={15} /> Open at source
+              <Icon name="external" size={16} /> Open at source
             </a>
           )}
         </div>
         {actionError && <p className="error-text">{actionError}</p>}
-        {(r.triage_note || r.task || r.duplicate) && (
+        {(r.triage_note || r.task || r.duplicate || r.fix_note) && (
           <div className="report-triage">
             {r.triage_note && (
               <div>
                 <span className="label">Triage</span>
                 <Markdown text={r.triage_note} />
+              </div>
+            )}
+            {r.fix_note && (
+              <div>
+                <span className="label">Fixed</span>
+                <Markdown text={r.fix_note} />
               </div>
             )}
             {r.task && (
@@ -345,8 +350,20 @@ function AskSheet({ name, onClose, onSend }: { name: string; onClose: () => void
 
 // ---------- on a task page ----------
 
-export function TaskReports({ reports, pid }: { reports: Report[]; pid: string }) {
+export function TaskReports({ reports, pid, inline = false }: { reports: Report[]; pid: string; inline?: boolean }) {
   if (!reports.length) return null;
+  // In a task's About: a labelled list, no card of its own.
+  if (inline)
+    return (
+      <div className="task-reports inline">
+        <span className="label">From {reports.length === 1 ? 'a report' : `${reports.length} reports`}</span>
+        <ul className="report-list compact">
+          {reports.map((r) => (
+            <ReportRow key={r.id} r={r} pid={pid} />
+          ))}
+        </ul>
+      </div>
+    );
   return (
     <section className="card task-reports">
       <div className="section-head">
@@ -390,11 +407,10 @@ export function ReportSourcesSetup({ s, focus }: { s: ProjectState; focus?: stri
       <h2 id="report-sources" ref={ref}>
         Report sources
       </h2>
-      <p className="muted">Where this project's bug reports and feedback come from. Helm checks each one on its interval, lists what it finds under Reports, and tells the director, who triages them.</p>
       {data?.sources.map((x) => (
         <div key={x.id} className={`card source-card ${x.enabled ? '' : 'off'}`}>
           <div className="row wrap">
-            <Icon name={SOURCE_ICON[x.type]} size={18} />
+            <Icon name={SOURCE_ICON[x.type]} size={20} />
             <strong className="grow one-line">{x.name}</strong>
             <Tag tone={x.mode === 'act' ? 'tone-accent' : ''}>{MODE_NAME[x.mode]}</Tag>
             {!x.enabled && <Tag>Off</Tag>}
@@ -429,7 +445,7 @@ export function ReportSourcesSetup({ s, focus }: { s: ProjectState; focus?: stri
               Check now
             </button>
             <button className="btn small quiet" onClick={() => setEditing(x)}>
-              <Icon name="edit" size={15} /> Edit
+              <Icon name="edit" size={16} /> Edit
             </button>
             <button className="btn small quiet" disabled={busy} onClick={() => run(() => api(`/api/report-sources/${x.id}`, { method: 'PATCH', body: { enabled: !x.enabled } }))}>
               {x.enabled ? 'Turn off' : 'Turn on'}
@@ -442,7 +458,7 @@ export function ReportSourcesSetup({ s, focus }: { s: ProjectState; focus?: stri
         <span className="muted small grow">Add a source:</span>
         {(Object.keys(TYPE_LABEL) as SourceType[]).map((t) => (
           <button key={t} className="btn small" onClick={() => setEditing({ type: t })}>
-            <Icon name={SOURCE_ICON[t]} size={15} /> {TYPE_LABEL[t]}
+            <Icon name={SOURCE_ICON[t]} size={16} /> {TYPE_LABEL[t]}
           </button>
         ))}
       </div>
@@ -653,7 +669,7 @@ function SourceForm({ pid, initial, defaultGlob, onClose }: { pid: string; initi
                   });
               }}
             >
-              <Icon name="trash" size={15} /> Remove
+              <Icon name="trash" size={16} /> Remove
             </button>
           )}
         </div>
@@ -710,7 +726,7 @@ function SourcePreviewPanel({ type, preview, busy, onRun, canRun }: { type: Sour
               )}
               {type === 'folder' && (
                 <p className="small">
-                  <Icon name="previews" size={13} /> {it.images.length ? it.images.join(', ') : <span className="muted">no screenshot</span>}
+                  <Icon name="previews" size={16} /> {it.images.length ? it.images.join(', ') : <span className="muted">no screenshot</span>}
                 </p>
               )}
               {it.warnings.map((w, i) => (

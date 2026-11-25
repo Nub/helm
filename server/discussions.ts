@@ -3,9 +3,12 @@ import type { Row } from './db.ts';
 import { touchProject } from './store.ts';
 import { taskAttachmentCount } from './attachments.ts';
 import { NOT_HOLDER, holderView, needsView } from './requests.ts';
+import { settleCardRequests } from './speccards.ts';
 import { STATE_LABEL, addTaskMessage, noteTaskState, createTask, getTask, hasDiscussionEra, isDiscussion, linkedViews, setTaskSummary } from './tasks.ts';
 import type { Author } from './tasks.ts';
 import { proposalSummary, renderProposal } from './pins.ts';
+import { dateTimeText } from './clock.ts';
+import { peerView } from './crossproject.ts';
 
 /**
  * Discussions: questions, ideas and open topics kept as findable threads. They are
@@ -52,6 +55,8 @@ export function discussionView(d: Row, days = coldDays(d.project_id)): Row {
   const last = get("SELECT author, author_name, body, created_at FROM task_messages WHERE task_id = ? AND kind NOT IN ('state', 'spec') ORDER BY id DESC LIMIT 1", d.id);
   const messages = (get("SELECT COUNT(*) AS n FROM task_messages WHERE task_id = ? AND kind = 'message'", d.id)?.n as number) ?? 0;
   const needs = needsView(d.id);
+  // A thread with another project's director (crossproject.ts): who with, and whether a reply is unread.
+  const peer = peerView(d.id);
   return {
     ...d,
     last: last ?? null,
@@ -62,9 +67,11 @@ export function discussionView(d: Row, days = coldDays(d.project_id)): Row {
     proposal: proposalSummary(d.id),
     holder: holderView(d),
     last_active,
-    // Derived, never stored: an open discussion nothing has happened on for the project's cold period. One that
-    // needs the user's response is never cold.
-    cold: isDiscussion(d) && d.state === 'open' && !needs.needs_response && Date.now() - last_active > days * 86_400_000,
+    // Cold is gone: a quiet discussion gets a reminder, then goes stale (discrevisit.ts); kept false for old readers.
+    cold: false,
+    peer,
+    // Waiting on the user's reply: a request on it, or the director spoke last (not in a thread between directors).
+    awaiting: isDiscussion(d) && d.state === 'open' && (!!needs.needs_response || (!peer && last?.author === 'director')),
   };
 }
 
@@ -79,15 +86,25 @@ export function requestHolders(projectId: string): Row[] {
   return all("SELECT * FROM tasks WHERE project_id = ? AND requests_agent_id IS NOT NULL AND EXISTS (SELECT 1 FROM inbox i WHERE i.task_id = tasks.id AND i.status = 'open') ORDER BY updated_at DESC", projectId).map((d) => discussionView(d));
 }
 
+/** Where a discussion sorts in the list: waiting on the user's reply, open, stale, closed, archived. */
+export function discussionRank(d: Row): number {
+  if (d.state === 'archived') return 4;
+  if (d.state === 'settled') return 3;
+  if (d.state === 'stale') return 2;
+  const waiting = d.needs_response || (d.last && d.last.author === 'director');
+  return waiting ? 0 : 1;
+}
+
 export function listDiscussions(projectId: string, opts: { q?: string; state?: string; limit?: number } = {}): Row[] {
   const words = (opts.q ?? '').trim().split(/\s+/).filter(Boolean).slice(0, 8);
   // Request holders (an agent's standing requests holder, the old Inbox archive) are not discussions (requests.ts).
   const where = ['project_id = ?', words.length ? "(kind = 'discussion' OR became_task_at IS NOT NULL)" : "kind = 'discussion'", NOT_HOLDER()];
   const params: unknown[] = [projectId];
-  if (opts.state === 'open' || opts.state === 'settled') {
+  // States: open, stale, settled (Closed), archived. Archived ones are shown only when asked for, or found by a search.
+  if (opts.state && ['open', 'stale', 'settled', 'archived'].includes(opts.state)) {
     where.push('state = ?');
     params.push(opts.state);
-  }
+  } else if (!words.length && opts.state !== 'all') where.push("state != 'archived'");
   for (const w of words) {
     // Every word must appear somewhere: title, summary, conclusion, or a message in its thread.
     where.push(
@@ -97,14 +114,17 @@ export function listDiscussions(projectId: string, opts: { q?: string; state?: s
   }
   const limit = Math.max(1, Math.min(opts.limit ?? 500, 500));
   const days = coldDays(projectId);
-  return all(`SELECT * FROM tasks WHERE ${where.join(' AND ')} ORDER BY updated_at DESC LIMIT ${limit}`, ...params).map((d) => discussionView(d, days));
+  // Waiting on the user's reply first, then open by last activity, then stale, closed and archived (discrevisit.ts).
+  return all(`SELECT * FROM tasks WHERE ${where.join(' AND ')} ORDER BY updated_at DESC LIMIT ${limit}`, ...params)
+    .map((d) => discussionView(d, days))
+    .sort((a, b) => discussionRank(a) - discussionRank(b) || (b.last_active ?? b.updated_at) - (a.last_active ?? a.updated_at));
 }
 
 const oneLine = (s: string, n: number) => {
   const t = s.replace(/\s+/g, ' ').trim();
   return t.length > n ? `${t.slice(0, n)}…` : t;
 };
-const day = (ts: number) => new Date(ts).toISOString().slice(0, 16).replace('T', ' ');
+const day = (ts: number) => dateTimeText(ts);
 
 /** Plain-text list for agents. */
 export function renderDiscussions(list: Row[], q?: string): string {
@@ -112,7 +132,7 @@ export function renderDiscussions(list: Row[], q?: string): string {
   return list
     .map((d) => {
       if (!isDiscussion(d)) return `- [now a task, ${d.state}] ${d.title} [[${d.id}]]: this discussion became a task; its thread continues as the task's (task_post).`;
-      const bits = [`- [${d.cold ? 'open, cold' : d.state}${d.needs_response ? ', needs response' : ''}] ${d.title} [[${d.id}]], last activity ${day(d.last_active ?? d.updated_at)}, ${d.messages} message(s)`];
+      const bits = [`- [${d.state === 'settled' ? 'closed' : d.state}${d.needs_response ? ', needs response' : ''}] ${d.title} [[${d.id}]], last activity ${day(d.last_active ?? d.updated_at)}, ${d.messages} message(s)`];
       if (d.status_summary) bits.push(`  summary: ${oneLine(d.status_summary, 300)}`);
       if (d.state === 'settled' && d.conclusion) bits.push(`  conclusion: ${oneLine(d.conclusion, 300)}`);
       const proposal = renderProposal(d.id);
@@ -130,8 +150,67 @@ export function createDiscussion(projectId: string, input: { title: string; summ
 export function settleDiscussion(d: Row, conclusion: string, by: Author) {
   run("UPDATE tasks SET state = 'settled', conclusion = ?, updated_at = ? WHERE id = ?", conclusion, now(), d.id);
   // Proposed Spec edits still waiting in it are closed as not applied (server/specdiscuss.ts).
+  const closing = all("SELECT id FROM doc_proposals WHERE discussion_id = ? AND status = 'open'", d.id).map((r) => r.id);
   run("UPDATE doc_proposals SET status = 'closed', decided_at = ? WHERE discussion_id = ? AND status = 'open'", now(), d.id);
-  addTaskMessage(d, HELM, `${by.name} settled this discussion${conclusion ? `. Conclusion: ${conclusion}` : '.'}`, 'state');
+  settleCardRequests(closing);
+  addTaskMessage(d, HELM, `${by.name} closed this discussion${conclusion ? `. Conclusion: ${conclusion}` : '.'}`, 'state');
+}
+
+/** The director's latest proposed conclusion in an open discussion (task_post conclude), or undefined. */
+export const proposedConclusion = (d: Row, messageId?: number): Row | undefined =>
+  messageId != null
+    ? get('SELECT * FROM task_messages WHERE id = ? AND task_id = ? AND conclude = 1', messageId, d.id)
+    : get('SELECT * FROM task_messages WHERE task_id = ? AND conclude = 1 ORDER BY id DESC LIMIT 1', d.id);
+
+/**
+ * The user tapped Conclude: the discussion closes with that post's text as its conclusion, and the director plans the
+ * work. Concluding is the go-ahead: no planning approval after it. Returns an error, or null.
+ */
+export function concludeDiscussion(d: Row, messageId: number | undefined, by: Author): { text: string } | { error: string } {
+  if (!isDiscussion(d)) return { error: 'Only a discussion can be concluded.' };
+  if (d.state !== 'open') return { error: 'It is already closed.' };
+  const post = proposedConclusion(d, messageId);
+  if (!post) return { error: 'No conclusion was proposed in it; close it instead.' };
+  settleDiscussion(d, String(post.body), by);
+  return {
+    text: `The user concluded [[${d.id}]]: plan the work. Make the first task by converting it in place (convert to task), and any further ones with convert another: true. Concluding is the user's go-ahead: no planning approval after it; set the tasks waiting or schedule them.`,
+  };
+}
+
+/**
+ * Make a task, from the discussion's header: what Conclude does, without waiting for a proposed conclusion. It closes
+ * the discussion with the latest proposed conclusion, else its summary, else the user's one line, and tells the director
+ * to plan the work now (the discussion becomes the first task in place). `line`: what the user says the task should do.
+ */
+export function makeTaskFromDiscussion(d: Row, line: string | undefined, by: Author, messageId?: number): { text: string } | { error: string } {
+  if (!isDiscussion(d)) return { error: 'Only a discussion can become a task.' };
+  if (d.state !== 'open') return { error: 'It is already closed.' };
+  const say = String(line ?? '').trim().slice(0, 400);
+  // Make a task on a proposed conclusion's own post: that conclusion (what Conclude did); else the latest one.
+  const post = proposedConclusion(d, messageId);
+  if (messageId != null && !post) return { error: 'No such proposed conclusion in it.' };
+  const conclusion = String(post?.body ?? d.status_summary ?? '').trim() || say;
+  settleDiscussion(d, conclusion, by);
+  return {
+    text:
+      `The user made a task of [[${d.id}]] now: plan it. Make the first task by converting it in place (convert to task), and any further ones with convert another: true. It is the user's go-ahead: no planning approval after it; set the tasks waiting or schedule them.` +
+      (say ? ` What the user says the task should do: ${say}` : post ? '' : ' No conclusion was proposed: work from the thread and its summary.'),
+  };
+}
+
+/**
+ * The open discussion whose message started the agent's current turn, if any: the inbound messages since its last
+ * result. create_task is refused then (conclude the discussion first, or ask).
+ */
+export function turnDiscussion(agentId: string): Row | undefined {
+  const last = get("SELECT MAX(id) AS id FROM events WHERE agent_id = ? AND kind = 'result'", agentId)?.id ?? 0;
+  for (const e of all("SELECT data FROM events WHERE agent_id = ? AND kind = 'inbound' AND id > ? ORDER BY id", agentId, last)) {
+    const text = String(JSON.parse(e.data || '{}').text ?? '');
+    const id = /^<discussion-message discussion="([^"]+)"/.exec(text)?.[1];
+    const d = id ? getTask(id) : undefined;
+    if (d && isDiscussion(d) && d.state === 'open') return d;
+  }
+  return undefined;
 }
 
 export function reopenDiscussion(d: Row, by: Author, why = '') {

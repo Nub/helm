@@ -3,6 +3,7 @@ import type { ClipboardEvent, DragEvent, ReactNode } from 'react';
 import { api } from './api';
 import type { Attachment } from './api';
 import { Icon } from './ui';
+import { clearDraft, patchDraft, readDraft, usableFiles } from './drafts';
 import { closeViewer, openViewer } from './viewer';
 import { AnnotateButton, FeedbackCard, openAnnotator, projectFromHash } from './annotate';
 
@@ -25,7 +26,7 @@ const getLimits = () => (limits ??= api<{ fileBytes: number; files: number }>('/
  * here, so every browser can show it and agents can open it (Claude reads JPEG, PNG, GIF and WebP, not HEIC).
  * Where it cannot (Chrome, Firefox) it is uploaded as it is and shown as a download tile.
  */
-async function toJpegIfHeic(f: File): Promise<File> {
+export async function toJpegIfHeic(f: File): Promise<File> {
   const heic = /^image\/hei[cf]/i.test(f.type) || /\.(heic|heif)$/i.test(f.name);
   if (!heic) return f;
   try {
@@ -75,9 +76,21 @@ export type Pending = { key: string; name: string; size: number; thumb: string |
 
 let seq = 0;
 
-/** `owner`: "request:<id>" for files answering a request (the server takes them only while it is open). */
-export function useAttachDraft(projectId: string | undefined, owner: string | null = null) {
-  const [items, setItems] = useState<Pending[]>([]);
+/**
+ * `owner`: "request:<id>" for files answering a request (the server takes them only while it is open).
+ * `draftKey`: the place's draft (drafts.ts): files already uploaded are kept with the typed text and come back.
+ */
+export function useAttachDraft(projectId: string | undefined, owner: string | null = null, draftKey: string | null = null) {
+  const [items, setItems] = useState<Pending[]>(() =>
+    usableFiles(draftKey ? readDraft(draftKey) : null).map((att, i) => ({ key: `r${i}-${att.id}`, name: att.name, size: att.size, thumb: att.kind === 'image' ? att.url : null, progress: 1, att, error: '' })),
+  );
+  // What is uploaded is kept in the place's draft, so closing or reloading does not lose it.
+  useEffect(() => {
+    if (!draftKey) return;
+    const ids = items.filter((i) => i.att).map((i) => i.att!.id);
+    const stored = (readDraft(draftKey)?.files ?? []).map((a) => a.id);
+    if (ids.join() !== stored.join()) patchDraft(draftKey, { files: items.filter((i) => i.att).map((i) => i.att!) });
+  }, [items, draftKey]);
   const patch = (key: string, p: Partial<Pending>) => setItems((cur) => cur.map((i) => (i.key === key ? { ...i, ...p } : i)));
 
   // Object URLs of thumbnails are released when they leave the tray.
@@ -122,6 +135,8 @@ export function useAttachDraft(projectId: string | undefined, owner: string | nu
     thumbs.current.forEach((u) => URL.revokeObjectURL(u));
     thumbs.current.clear();
     setItems([]);
+    // What was typed went with it: the place's draft is done.
+    if (draftKey) clearDraft(draftKey);
   };
 
   const uploading = items.some((i) => !i.att && !i.error);
@@ -143,7 +158,7 @@ export function AttachTray({ items, onRemove }: { items: Pending[]; onRemove: (k
           )}
           {i.error && <span className="att-pending-error">{i.error}</span>}
           <button type="button" className="att-pending-remove" onClick={() => onRemove(i.key)} aria-label={`Remove ${i.name}`}>
-            <Icon name="close" size={14} />
+            <Icon name="close" size={16} />
           </button>
         </li>
       ))}
@@ -253,7 +268,7 @@ export function AttachmentList({ items, onRemove, className = '', compactFeedbac
           // In References: every round of image feedback under one row, closed until asked for.
           <details className="ann-group">
             <summary>
-              <Icon name="chevron" size={14} /> Feedback ({feedback.length})
+              <Icon name="chevron" size={16} /> Feedback ({feedback.length})
             </summary>
             <div className="ann-cards compact">
               {feedback.map((a) => (
@@ -304,7 +319,7 @@ export function AttachmentList({ items, onRemove, className = '', compactFeedbac
         ) : (
           <div key={a.id} className="att-file">
             <a href={a.kind === 'pdf' || a.kind === 'text' ? a.url : `${a.url}?download=1`} target={a.kind === 'pdf' || a.kind === 'text' ? '_blank' : undefined} rel="noopener" download={a.kind === 'pdf' || a.kind === 'text' ? undefined : a.name}>
-              <span className={`att-file-icon ${a.kind}`}>{a.kind === 'pdf' ? 'PDF' : <Icon name={a.kind === 'text' ? 'file' : 'download'} size={18} />}</span>
+              <span className={`att-file-icon ${a.kind}`}>{a.kind === 'pdf' ? 'PDF' : <Icon name={a.kind === 'text' ? 'file' : 'download'} size={20} />}</span>
               <span className="att-file-name one-line">{a.name}</span>
               <span className="muted small">{sizeLabel(a.size)}</span>
             </a>
@@ -335,7 +350,7 @@ export function ClipCount({ n }: { n?: number }) {
   if (!n) return null;
   return (
     <span className="clip-count" title={`${n} ${n === 1 ? 'attachment' : 'attachments'}`} aria-label={`${n} ${n === 1 ? 'attachment' : 'attachments'}`}>
-      <Icon name="clip" size={14} />
+      <Icon name="clip" size={16} />
       {n}
     </span>
   );
@@ -408,12 +423,12 @@ export function References({ projectId, owner, version, title = 'References', hi
     >
       <div className="refs-head">
         <span className="label">
-          <Icon name="clip" size={14} /> {title}
+          <Icon name="clip" size={16} /> {title}
           {items && items.length > 0 ? ` · ${items.length}` : ''}
         </span>
         <span className="spacer" />
         <button type="button" className="btn small quiet" disabled={progress !== null} onClick={() => input.current?.click()}>
-          <Icon name="plus" size={15} /> {progress !== null ? `Uploading ${Math.round(progress * 100)}%` : 'Add'}
+          <Icon name="plus" size={16} /> {progress !== null ? `Uploading ${Math.round(progress * 100)}%` : 'Add'}
         </button>
         <input
           ref={input}
@@ -432,7 +447,6 @@ export function References({ projectId, owner, version, title = 'References', hi
           <span style={{ width: `${Math.round(progress * 100)}%` }} />
         </span>
       )}
-      {items && items.length === 0 && progress === null && <p className="muted small refs-empty">{hint ?? 'Screenshots, mockups, recordings or documents for the agents to look at.'}</p>}
       {items && <AttachmentList items={items} onRemove={remove} compactFeedback />}
       {error && <p className="error-text">{error}</p>}
     </div>

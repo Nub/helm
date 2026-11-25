@@ -113,10 +113,9 @@ test('warning files one to-do; critical notifies, tells directors and refuses ne
   assert.deepEqual(told.map((t) => t.projectId).sort(), [a.project.id, db.get("SELECT id FROM projects WHERE name = 'Beta'")!.id].sort());
   assert.match(told[0].text, /stop builds/);
   assert.match(disk.refusal('new agents') ?? '', /disk is nearly full \(5\.0 GB free of 1000 GB/);
-  const refused = await runtime.runtimeApi.spawn(a.director, defaultStructure().roles.find((r) => r.id !== defaultStructure().root)!.id, 'Builder', 'Build it.');
-  assert.equal(typeof refused, 'string');
-  assert.match(refused as string, /^Not started: the disk is nearly full/);
-  assert.equal(db.get("SELECT COUNT(*) AS n FROM agents WHERE name = 'Builder'")!.n, 0);
+  // No builder starts while the disk is nearly full (dispatch.ts).
+  const { plan } = await import('./dispatch.ts');
+  assert.deepEqual(plan(a.project.id), []);
   const health = disk.healthDisk();
   assert.deepEqual(health, { level: 'critical', full: false }, 'no sizes without sign-in');
   await at(4, 'critical');

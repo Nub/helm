@@ -5,8 +5,11 @@ import { addTaskMessage, getTask, isDiscussion, taskRef } from './tasks.ts';
 import type { Author } from './tasks.ts';
 import { createDiscussion } from './discussions.ts';
 import { ensureSectionPath, getDoc, linkDoc, normTags, parseTags, resolveSection, saveDoc } from './spec.ts';
-import { pathText, sectionTree } from './sections.ts';
+import { listSections, pathText, sectionTree } from './sections.ts';
+import { relatedItems } from './rankedsearch.ts';
 import type { DocInput, Editor } from './spec.ts';
+import { specWorkExtras } from './specwork.ts';
+import { carryCards, settleCardRequests } from './speccards.ts';
 
 /**
  * Discussing a Spec entry with the director. "Discuss" on an entry opens the one open discussion about it (doc_links
@@ -137,6 +140,9 @@ function entryText(doc: Row): string {
  */
 export function specMessageExtras(d: Row): { attrs: string; context: string } {
   if (!isDiscussion(d)) return { attrs: '', context: '' };
+  // A Spec Review, Revise or Create discussion (specwork.ts): its mode, and with the first message its brief.
+  const work = specWorkExtras(d);
+  if (work) return work;
   const doc = entryOfDiscussion(d.id);
   if (!doc) return { attrs: '', context: '' };
   const first = Number(get("SELECT COUNT(*) AS n FROM task_messages WHERE task_id = ? AND author = 'user' AND kind = 'message'", d.id)?.n ?? 0) <= 1;
@@ -226,6 +232,8 @@ export function proposeEdit(agent: Row, docRef: string, discRef: string, input: 
     );
     if (isDiscussion(d)) linkDoc(doc.id, d.id, 'discusses');
     addTaskMessage(d, { author: 'director', name: agent.name }, JSON.stringify({ id }), 'proposal');
+    // A request about the older cards carries this one too (speccards.ts).
+    carryCards(older.map((o) => o.id), id);
     return older.length;
   });
   touchProject(doc.project_id);
@@ -349,12 +357,13 @@ export function applyProposal(p: Row, wordingOnly: boolean): { error: string; co
   });
   if ('error' in out) return { error: out.error };
   touchProject(doc.project_id);
+  const settled = settleCardRequests([p.id]);
   const where = d ? ` in ${taskRef(d)}` : '';
   return {
     pending: out.pending,
-    note: wordingOnly
+    note: (wordingOnly
       ? `The user applied your proposed edit ${p.id} to the Spec entry "${doc.title}" (id ${doc.id})${where} as wording only: the entry now reads as proposed, and no planning task follows.`
-      : `The user applied your proposed edit ${p.id} to the Spec entry "${doc.title}" (id ${doc.id})${where}. It counts as the user's edit: after the quiet period Helm ${d?.kind === 'task' ? 'adds the change to that planning task' : 'turns the discussion into the planning task for it, in place'} and tells you. Do not start work before then.`,
+      : `The user applied your proposed edit ${p.id} to the Spec entry "${doc.title}" (id ${doc.id})${where}. It counts as the user's edit: after the quiet period Helm ${d?.kind === 'task' ? 'adds the change to that planning task' : 'turns the discussion into the planning task for it, in place'} and tells you. Do not start work before then.`) + settled,
   };
 }
 
@@ -373,9 +382,59 @@ export function declineProposal(p: Row, note: string): { error: string; code?: n
     if (d) addTaskMessage(d, HELM, `You declined the proposed edit to "${title}"${note ? `: ${note}` : '.'}`, 'state');
   });
   touchProject(p.project_id);
+  const settled = settleCardRequests([p.id]);
   return {
     note:
       `The user declined your proposed edit ${p.id} to the Spec entry "${title}" (id ${p.doc_id})${d ? ` in ${taskRef(d)}` : ''}${note ? `, saying: ${note}` : ' without a note'}. ` +
-      `The entry is unchanged. If it helps, propose a revised edit there with propose_doc_edit; otherwise leave it.`,
+      `The entry is unchanged. If it helps, propose a revised edit there with propose_doc_edit; otherwise leave it.` + settled,
   };
+}
+
+// ---------- a task with no Spec entry ----------
+
+/** Done, dropped and merged tasks no longer look for an entry. */
+const SETTLED = ['done', 'dropped', 'merged'];
+
+/** Why a task cannot start a Spec discussion, or null. */
+export function cannotDiscussSpecFor(t: Row): string | null {
+  if (isDiscussion(t)) return 'It is a discussion, not a task.';
+  if (SETTLED.includes(t.state)) return 'It is finished.';
+  if (get("SELECT 1 AS x FROM doc_links WHERE task_id = ? AND relation = 'implements'", t.id) || t.doc_id) return 'It already has a Spec entry.';
+  return null;
+}
+
+/** The open discussion looking for this task's Spec entry, if any. */
+export const openTaskSpecDiscussion = (taskId: string): Row | undefined =>
+  get("SELECT * FROM tasks WHERE about_task = ? AND kind = 'discussion' AND state = 'open' ORDER BY created_at DESC LIMIT 1", taskId);
+
+/**
+ * "No Spec entry · Discuss" on a task: the open discussion about which entry it belongs to, or a new one, "Spec for:
+ * <title>", linked to the task. A new one comes with the director's brief (directorNote): the task, the Spec's
+ * sections and the closest entries, asking it to propose linking an entry or a new one, and to converse until concluded.
+ */
+export function startTaskSpecDiscussion(t: Row): { discussion: Row; created: boolean; directorNote?: string } | { error: string } {
+  const why = cannotDiscussSpecFor(t);
+  if (why) return { error: why };
+  const open = openTaskSpecDiscussion(t.id);
+  if (open) return { discussion: open, created: false };
+  const discussion = tx(() => {
+    const d = createDiscussion(t.project_id, { title: `Spec for: ${t.title}`.slice(0, 140), origin: 'user' }, { author: 'user', name: 'You' });
+    run('UPDATE tasks SET about_task = ? WHERE id = ?', t.id, d.id);
+    addTaskMessage(d, HELM, `You opened this discussion to find the Spec entry for ${taskRef(t)}.`, 'state');
+    return getTask(d.id)!;
+  });
+  touchProject(t.project_id);
+  const tree = sectionTree(t.project_id);
+  const sections = listSections(t.project_id).map((x) => pathText(tree, x.id));
+  const near = (relatedItems(t.project_id, `${t.title}\n${t.description ?? ''}`, { kinds: ['doc'], limit: 5 }) ?? [])
+    .map((h) => getDoc(h.item))
+    .filter((d): d is Row => !!d)
+    .map((d) => `- [[${d.id}]] ${d.title}: ${d.summary || '(no summary)'}`);
+  const directorNote =
+    `The user opened [[${discussion.id}]] to find the Spec entry for ${taskRef(t)}, which has none.\n` +
+    `Task: ${t.title}\n${String(t.description ?? '').trim().slice(0, 1500) || '(no description)'}\n` +
+    `Spec sections: ${sections.length ? sections.join('; ') : '(none)'}\n` +
+    `Closest entries:\n${near.length ? near.join('\n') : '(none found)'}\n` +
+    `In that discussion (task_post), propose whether the task belongs under an existing entry (which one) or needs a new one (its title, summary and text). Converse until it is concluded (task_post conclude: true). On Conclude, link the task (update_task doc) and create or edit the entry as agreed (set_doc agreed_in: ${discussion.id}).`;
+  return { discussion, created: true, directorNote };
 }

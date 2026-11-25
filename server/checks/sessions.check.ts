@@ -172,7 +172,7 @@ await check('owner activity is recognised from the route; views and global pages
 });
 
 await check('while away, create_task is limited to found-while-away work with a reason, a few per away period', async () => {
-  const tools = helmTools('ag_dir', { spawn: async () => 'x', send: async () => {}, close: async () => {}, markComplete: () => {} }, { manager: true, root: true, consult: false });
+  const tools = helmTools('ag_dir', { send: async () => {}, close: async () => {}, markComplete: () => {} }, { manager: true, root: true, consult: false });
   const create = tools.find((t: any) => t.name === 'create_task') as any;
   const call = (args: any) => create.handler({ description: '', ...args }, {});
   let r = await call({ title: 'New idea', state: 'scheduled' });
@@ -268,7 +268,7 @@ await check('while away, tasks for reports from Act-mode sources are allowed and
   notes.length = 0;
   run("INSERT INTO report_sources (id, project_id, type, name, mode, created_at, updated_at) VALUES ('rs_act', ?, 'folder', 'Act', 'act', ?, ?), ('rs_tri', ?, 'folder', 'Triage', 'triage', ?, ?)", pid, now(), now(), pid, now(), now());
   run("INSERT INTO reports (id, project_id, source_id, external_id, title, changed_at, created_at, updated_at) VALUES ('rp_a', ?, 'rs_act', 'a', 'Crash on start', ?, ?, ?), ('rp_t', ?, 'rs_tri', 't', 'Idea', ?, ?, ?)", pid, now(), now(), now(), pid, now(), now(), now());
-  const tools = helmTools('ag_dir', { spawn: async () => 'x', send: async () => {}, close: async () => {}, markComplete: () => {} }, { manager: true, root: true, consult: false });
+  const tools = helmTools('ag_dir', { send: async () => {}, close: async () => {}, markComplete: () => {} }, { manager: true, root: true, consult: false });
   const create = tools.find((x: any) => x.name === 'create_task') as any;
   const call = (args: any) => create.handler({ description: '', ...args }, {});
   const before = S.awayTasksCreated(pid);
@@ -303,7 +303,7 @@ const finish = (id: string) => {
   W.onAgentFinished(id);
 };
 const reportToDirector = () => run("INSERT INTO events (project_id, agent_id, ts, kind, data) VALUES (?, 'ag_dir', ?, 'inbound', '{}')", pid, now());
-const fakeRt = { spawn: async () => 'x', send: async () => {}, close: async (id: string) => finish(id), markComplete: () => {} };
+const fakeRt = { send: async () => {}, close: async (id: string) => finish(id), markComplete: () => {} };
 
 await check('driver completes: awaiting review, a history entry, and the clock stops', () => {
   S.recordOwnerActivity(pid); // in a session, so creation is unrestricted

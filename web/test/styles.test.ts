@@ -58,3 +58,19 @@ test(`styles.css nests at most ${MAX_DEPTH} deep`, () => {
   assert.equal(r.firstTooDeep, 0, `brace depth reaches ${MAX_DEPTH + 1} at styles.css line ${r.firstTooDeep}: a closing brace was probably lost above it`);
 });
 
+
+// The Quieter system (task_5c39a0ebe5): buttons and chips are styled only in the shared block; elsewhere a rule
+// whose subject is one may only place it (sharedstyles.ts has the definition).
+test('no button or chip rules outside the shared set', async () => {
+  const { strays } = await import('./sharedstyles.ts');
+  const found = strays(css).map((r) => `line ${r.line}: ${r.selector} sets ${r.visual.map((d) => d.prop).join(', ')}`);
+  assert.deepEqual(found, [], `Style these in the shared block of styles.css, or only place them here:\n${found.join('\n')}`);
+  // And the block itself is there.
+  assert.ok(css.includes('shared:start') && css.includes('shared:end'));
+});
+
+test('a bespoke class is caught: a rule outside the block styling a -btn or a .tag', async () => {
+  const { strays } = await import('./sharedstyles.ts');
+  const sample = '.x .tag { margin: 0; }\n.y-btn { background: red; }\n.z .chip { color: blue; }\n/* shared:start */ .tag { color: red; } /* shared:end */';
+  assert.deepEqual(strays(sample).map((r) => r.selector), ['.y-btn', '.z .chip']);
+});

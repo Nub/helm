@@ -386,7 +386,8 @@ export function checkImportance(
   next: { importance: number; reason: string; counted: boolean },
   by: Editor,
 ): { error?: string; warning?: string } {
-  const say = (msg: string) => (by.author === 'agent' ? { error: msg } : { warning: msg });
+  // The user's own choice is never second-guessed: reasons and budgets bind agents only.
+  const say = (msg: string) => (by.author === 'agent' ? { error: msg } : {});
   const what = target === 'doc' ? 'entry' : 'task';
   if (next.importance < 1 || next.importance > 5) return { error: 'Importance is 1 (Minor) to 5 (Critical).' };
   if (by.author === 'agent' && row?.importance_pinned && row.importance !== next.importance) {
@@ -542,15 +543,15 @@ export function recentImportanceChanges(projectId: string): Row[] {
 }
 
 /** Entries and tasks by level with reasons, for a director recalibrating. */
-export function renderImportance(projectId: string): string {
+export function renderImportance(projectId: string, opts: { target?: Target; min_level?: number } = {}): string {
   const out: string[] = [];
-  for (const target of ['doc', 'task'] as Target[]) {
+  for (const target of (opts.target ? [opts.target] : ['doc', 'task']) as Target[]) {
     const b = importanceBudget(projectId, target);
     const rows = openRows(projectId, target);
     out.push(
       `# ${target === 'doc' ? 'Spec entries' : 'Tasks'} — ${b.open} ${TARGET_NAME[target]}. Critical ${b.critical.count} of ${b.critical.cap}${b.critical.over ? ' (OVER: demote before promoting)' : ''}, High ${b.high.count} of ${b.high.cap}${b.high.over ? ' (OVER: demote before promoting)' : ''}.`,
     );
-    for (let l = 5; l >= 1; l--) {
+    for (let l = 5; l >= Math.max(1, opts.min_level ?? 1); l--) {
       const list = rows.filter((d) => d.importance === l);
       if (!list.length) continue;
       out.push(
@@ -957,9 +958,12 @@ const SPEC_STATE_TEXT: Record<string, string> = {
  * entry with its summary, tags and how many decisions and notes its history
  * holds. Bodies only for the ids asked for, or for everything with full.
  */
-export function renderSpec(projectId: string, opts: { ids?: string[]; full?: boolean; section?: string } = {}): string {
-  const docs = all("SELECT * FROM docs WHERE project_id = ? AND kind IN ('entry','goal','design') ORDER BY importance DESC, importance_rank IS NULL, importance_rank, updated_at DESC", projectId);
-  if (!docs.length) return 'The Spec is empty: no entries yet.';
+export function renderSpec(projectId: string, opts: { ids?: string[]; full?: boolean; section?: string; tag?: string } = {}): string {
+  const every = all("SELECT * FROM docs WHERE project_id = ? AND kind IN ('entry','goal','design') ORDER BY importance DESC, importance_rank IS NULL, importance_rank, updated_at DESC", projectId);
+  if (!every.length) return 'The Spec is empty: no entries yet.';
+  const tag = opts.tag?.trim().replace(/^#/, '').toLowerCase();
+  const docs = tag ? every.filter((d) => parseTags(d.tags).some((t) => t.toLowerCase() === tag)) : every;
+  if (!docs.length) return `No entry is tagged "${tag}". Tags in use: ${tagVocabulary(projectId)}.`;
   const recorded = new Map<string, number>();
   for (const r of all("SELECT doc_id, COUNT(*) AS n FROM doc_history_items WHERE project_id = ? GROUP BY doc_id UNION ALL SELECT doc_id, COUNT(*) FROM journal WHERE project_id = ? AND kind = 'decision' AND doc_id IS NOT NULL GROUP BY doc_id", projectId, projectId)) {
     recorded.set(r.doc_id, (recorded.get(r.doc_id) ?? 0) + Number(r.n));

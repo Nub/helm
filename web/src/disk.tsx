@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, useLive } from './api';
-import { Icon, Tag, ago, href, useAction, useTick } from './ui';
+import { Icon, Sheet, Tag, href, useAction, useTick, PageHeader } from './ui';
+import { dateTime } from './time';
 
 // Disk guard (server/disk.ts): the banner every page shows when the disk is full or getting there.
 
@@ -36,7 +37,7 @@ export function worstFs(s: DiskStatus): Filesystem | undefined {
 }
 
 export function DiskBanner({ s }: { s: DiskStatus | null }) {
-  if (!s || (s.level === 'ok' && !s.full) || location.hash === href('helm', 'disk')) return null;
+  if (!s || (s.level === 'ok' && !s.full) || location.hash.startsWith(href('system'))) return null;
   const f = worstFs(s);
   const where = f ? `${bytes(f.free)} free on the disk with ${f.holds.map((h) => h.label).slice(0, 3).join(', ')}${f.holds.length > 3 ? '…' : ''}.` : '';
   const title = s.full ? 'The disk is full' : s.level === 'critical' ? 'The disk is nearly full' : 'Disk space is running low';
@@ -52,19 +53,19 @@ export function DiskBanner({ s }: { s: DiskStatus | null }) {
         <strong>{title}</strong>
         {body && <span className="muted small">{body}</span>}
       </span>
-      <a className="btn small quiet" href={href('helm', 'disk')}>
+      <a className="btn small quiet" href={href('system', 'disk')}>
         Details
       </a>
     </div>
   );
 }
 
-// ---------- the Disk page (#/helm/disk) ----------
+// ---------- the Disk section of System (#/system/disk) ----------
 
 export type UsageEntry = {
   path: string;
   label: string;
-  kind: 'project' | 'worktree' | 'artifact' | 'install' | 'tmp';
+  kind: 'project' | 'worktree' | 'artifact' | 'install' | 'tmp' | 'dashboards' | 'release';
   bytes: number | null;
   computedAt: number | null;
   measuring: boolean;
@@ -78,6 +79,9 @@ export type UsageEntry = {
   agent?: string | null;
   stray?: boolean;
   mtime?: number;
+  /** A release's files (kind release): removable from the Disk page, the release's record kept. */
+  releaseId?: string;
+  testBuildId?: string;
 };
 type ProjectUsage = { id: string; name: string; path: string; total: number; entries: UsageEntry[] };
 type Usage = { projects: ProjectUsage[]; install: UsageEntry[]; tmp: UsageEntry[]; tmpTotal: number; generations: { system: number; live: number }; measuring: number };
@@ -100,9 +104,6 @@ function FsCard({ f }: { f: Filesystem }) {
         <span className="disk-mark warn" style={{ left: mark(f.warning) }} title={`Warning below ${bytes(f.warning)} free`} />
         <span className="disk-mark crit" style={{ left: mark(f.critical) }} title={`Critical below ${bytes(f.critical)} free`} />
       </div>
-      <p className="muted small disk-holds">
-        Holds {f.holds.map((h) => h.label).join(', ')}. Warning below {bytes(f.warning)} free, critical below {bytes(f.critical)}.
-      </p>
     </div>
   );
 }
@@ -112,7 +113,8 @@ function measured(e: UsageEntry): string {
   return bytes(e.bytes);
 }
 
-function EntryRow({ e }: { e: UsageEntry }) {
+function EntryRow({ e, onChanged }: { e: UsageEntry; onChanged?: () => void }) {
+  const { busy, run } = useAction();
   const tags: [string, string][] = [];
   if (e.kind === 'worktree') {
     if (e.stray) tags.push(['tone-warning', 'not a git worktree']);
@@ -128,26 +130,19 @@ function EntryRow({ e }: { e: UsageEntry }) {
       <div className="disk-row-head">
         <span className="one-line">{e.label}</span>
         <b className="mono small">{measured(e)}</b>
+        {e.testBuildId && onChanged && (
+          <button className="btn small quiet" disabled={busy} onClick={() => confirm(`Delete the ${e.label}? Its record stays, with Rebuild.`) && run(async () => (await api(`/api/test-builds/${e.testBuildId}/files`, { method: 'DELETE' }), onChanged()))}>
+            Delete
+          </button>
+        )}
+        {e.releaseId && onChanged && (
+          <button className="btn small quiet" disabled={busy} onClick={() => confirm(`Remove the files of ${e.label.replace(/ files$/, "")}? Its change log and record stay.`) && run(async () => (await api(`/api/releases/${e.releaseId}/files`, { method: 'DELETE' }), onChanged()))}>
+            Remove
+          </button>
+        )}
       </div>
-      <div className="disk-row-sub">
-        <span className="mono small muted one-line" title={e.path}>
-          {e.path}
-        </span>
-      </div>
-      {(tags.length > 0 || e.agent || e.note || e.computedAt) && (
-        <div className="disk-row-tags">
-          {tags.map(([tone, t]) => (
-            <Tag key={t} tone={tone}>
-              {t}
-            </Tag>
-          ))}
-          {e.agent && <span className="muted small">by {e.agent}</span>}
-          {e.note && <span className="muted small one-line">{e.note}</span>}
-          <span className="spacer" />
-          {e.computedAt && e.kind !== 'tmp' && <span className="muted small">{e.measuring ? 'measuring again' : ago(e.computedAt)}</span>}
-          {e.kind === 'tmp' && e.mtime && <span className="muted small">changed {ago(e.mtime)}</span>}
-        </div>
-      )}
+      {/* One line: what state it is in and who made it. */}
+      {(tags.length > 0 || e.agent) && <p className={`small one-line ${tags.some(([t]) => t === 'tone-serious' || t === 'tone-warning') ? 'err-text' : 'muted'}`}>{[...tags.map(([, t]) => t), e.agent && `by ${e.agent}`].filter(Boolean).join(' · ')}</p>}
     </li>
   );
 }
@@ -199,8 +194,96 @@ function Settings({ s, onSaved }: { s: DiskSettings; onSaved: () => void }) {
   );
 }
 
+type CleanItem = { path: string; what: string; bytes: number | null; kind: 'folder' | 'testbuild'; build?: string };
+type CleanPlan = { remove: CleanItem[]; skipped: { path: string; reason: string }[]; total: number };
+
+/**
+ * A project's Clean up (server/diskclean.ts): the button opens what would go, by clean_artifacts' rules (disposable
+ * build and scratch folders, merged clean worktrees, test-build files past their keep time) with sizes and the total,
+ * and what stays with why; Remove takes exactly those. The result replaces the list.
+ */
+function CleanUp({ pid, name, onDone }: { pid: string; name: string; onDone: () => void }) {
+  const [plan, setPlan] = useState<CleanPlan | null>(null);
+  const [done, setDone] = useState<CleanPlan | null>(null);
+  const [open, setOpen] = useState(false);
+  const { busy, error, run } = useAction();
+  const start = () => {
+    setOpen(true);
+    setPlan(null);
+    setDone(null);
+    void run(async () => setPlan(await api<CleanPlan>(`/api/projects/${pid}/disk/clean`, { body: {} })));
+  };
+  const confirm = () =>
+    run(async () => {
+      const r = await api<CleanPlan>(`/api/projects/${pid}/disk/clean`, {
+        body: { confirm: { paths: plan!.remove.filter((i) => i.kind === 'folder').map((i) => i.path), builds: plan!.remove.filter((i) => i.build).map((i) => i.build) } },
+      });
+      setDone(r);
+      onDone();
+    });
+  const shown = done ?? plan;
+  return (
+    <>
+      <button type="button" className="btn small quiet" onClick={start}>
+        Clean up
+      </button>
+      {open && (
+        <Sheet title={done ? `Cleaned up ${name}` : `Clean up ${name}`} onClose={() => setOpen(false)}>
+          {!shown && <p className="muted small">{busy ? 'Checking what can go…' : ''}</p>}
+          {shown && (
+            <div className="disk-clean">
+              <p className="disk-clean-total">
+                {shown.remove.length
+                  ? `${done ? 'Removed' : 'Would remove'} ${shown.remove.length} ${shown.remove.length === 1 ? 'item' : 'items'}, ${bytes(shown.total)}`
+                  : done ? 'Nothing was removed' : 'Nothing to remove'}
+              </p>
+              {shown.remove.length > 0 && (
+                <ul className="disk-clean-list">
+                  {shown.remove.map((i) => (
+                    <li key={i.path}>
+                      <span className="disk-clean-path mono small">{i.path}</span>
+                      <span className="muted small">
+                        {i.what}
+                        {i.bytes != null ? ` · ${bytes(i.bytes)}` : ' · not measured yet'}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {shown.skipped.length > 0 && (
+                <>
+                  <h3 className="disk-clean-h">{done ? 'Skipped' : 'Stays'}</h3>
+                  <ul className="disk-clean-list">
+                    {shown.skipped.map((i) => (
+                      <li key={i.path}>
+                        <span className="disk-clean-path mono small">{i.path}</span>
+                        <span className="muted small">{i.reason}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
+              {error && <p className="error-text small">{error}</p>}
+              <div className="row disk-clean-acts">
+                {!done && plan && plan.remove.length > 0 && (
+                  <button type="button" className="btn primary" disabled={busy} onClick={confirm}>
+                    Remove {bytes(plan.total)}
+                  </button>
+                )}
+                <button type="button" className="btn quiet" onClick={() => setOpen(false)}>
+                  {done || !plan?.remove.length ? 'Close' : 'Cancel'}
+                </button>
+              </div>
+            </div>
+          )}
+        </Sheet>
+      )}
+    </>
+  );
+}
+
 export function DiskPage() {
-  const d = useLive<{ status: DiskStatus; usage: Usage }>('/api/disk', (m) => m.type === 'disk');
+  const d = useLive<{ status: DiskStatus; usage: Usage; history?: HistoryState }>('/api/disk', (m) => m.type === 'disk');
   const { busy, run } = useAction();
   useTick();
   if (!d.data) return d.error ? <p className="error-text">{d.error}</p> : <div className="loading">Loading…</div>;
@@ -209,12 +292,11 @@ export function DiskPage() {
   const tmpTop = u.tmp.filter((e) => e.bytes !== null).slice(0, 8);
   return (
     <section className="narrow disk-page">
-      <div className="section-head">
-        <h1 className="page-title">Disk</h1>
+      <PageHeader title="Disk">
         <button className="btn small" disabled={busy} onClick={() => run(async () => (await api('/api/disk/refresh', { method: 'POST' }), d.reload()))}>
           Measure again
         </button>
-      </div>
+      </PageHeader>
       {s.full && (
         <div className="update-banner bad" role="alert">
           <Icon name="alert" />
@@ -238,7 +320,6 @@ export function DiskPage() {
       {s.filesystems.map((f) => (
         <FsCard key={f.dev} f={f} />
       ))}
-      {u.measuring > 0 && <p className="muted small">Measuring {u.measuring} {u.measuring === 1 ? 'folder' : 'folders'} in the background…</p>}
 
       <h2>Projects</h2>
       {projects.map((p) => (
@@ -249,10 +330,11 @@ export function DiskPage() {
             </a>
             <span className="spacer" />
             <b className="mono">{bytes(p.total)}</b>
+            <CleanUp pid={p.id} name={p.name} onDone={d.reload} />
           </div>
           <ul className="disk-rows">
             {[...p.entries].sort(bySize).map((e) => (
-              <EntryRow key={e.path} e={e} />
+              <EntryRow key={e.path} e={e} onChanged={d.reload} />
             ))}
           </ul>
         </div>
@@ -266,9 +348,10 @@ export function DiskPage() {
           ))}
         </ul>
       </div>
+      {d.data.history && <HistoryLine h={d.data.history} />}
       <h2>Temporary files</h2>
       <p className="muted small">
-        {bytes(u.tmpTotal)} in {u.tmp.length} {u.tmp.length === 1 ? 'entry' : 'entries'} owned by Helm's user. The largest:
+        {bytes(u.tmpTotal)} in all; the largest:
       </p>
       <div className="card">
         <ul className="disk-rows">
@@ -284,13 +367,37 @@ export function DiskPage() {
   );
 }
 
+/** Agents' history (server/historyreduce.ts): its size in the database and its index, and the last daily reduction. */
+type HistoryState = { events: number; bytes: number; indexBytes: number | null; last: { at: number; results: number; calls: number; bytesBefore: number; bytesAfter: number } | null };
+function HistoryLine({ h }: { h: HistoryState }) {
+  const last = h.last;
+  return (
+    <>
+      <h2>Agent history</h2>
+      <div className="card">
+        <ul className="disk-rows">
+          <li className="row">
+            <span className="grow">
+              Transcripts
+              <span className="muted small one-line">
+                {last ? `Last reduced ${dateTime(last.at)}${last.bytesBefore > last.bytesAfter ? `, ${bytes(last.bytesBefore - last.bytesAfter)} freed` : ', nothing old enough'}` : 'Not reduced yet'}
+              </span>
+            </span>
+            <b className="mono">{bytes(h.bytes + (h.indexBytes ?? 0))}</b>
+          </li>
+        </ul>
+      </div>
+    </>
+  );
+}
+
 /** The Disk line on the Helm page. */
 export function DiskSummary() {
   const s = useDiskStatus().data;
   if (!s) return null;
   const f = worstFs(s);
   return (
-    <a className="card disk-summary" href={href('helm', 'disk')}>
+    <a className="card disk-summary" href={href('system', 'disk')}>
       <Icon name="disk" />
       <span>
         <strong>Disk</strong>

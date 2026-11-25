@@ -11,6 +11,7 @@ const known: Record<string, RefInfo> = {
   [T]: { id: T, kind: 'task', title: 'Overview rework', state: 'active', project_id: 'prj_1', project_name: 'Helm', href: '#/p/prj_1/tasks/task_0123456789', thumb: null },
   // An alias: the old discussion id resolves to the task it became.
   [D]: { id: D, kind: 'task', title: 'Became a task', state: 'done', project_id: 'prj_1', project_name: 'Helm', href: '#/p/prj_1/tasks/task_bbbbbbbbbb', thumb: null },
+  disc_eeeeeeeeee: { id: 'disc_eeeeeeeeee', kind: 'discussion', title: 'Open topic', state: 'open', project_id: 'prj_1', project_name: 'Helm', href: '#/p/prj_1/discussions/disc_eeeeeeeeee', thumb: null },
   pv_cccccccccc: { id: 'pv_cccccccccc', kind: 'preview', title: 'Menu <fixed>', state: '', project_id: 'prj_2', project_name: 'Other & Co', href: '#/p/prj_2/previews/pv_cccccccccc', thumb: '/artifacts/x.png' },
 };
 const env: ChipEnv = { resolve: (id) => (id in known ? known[id] : id === 'doc_dddddddddd' ? undefined : null), projectId: 'prj_1', icon: (n) => `<i data-icon="${n}"></i>` };
@@ -50,10 +51,12 @@ const render: [string, string, (html: string) => void][] = [
   ['other project: name shown, titles escaped', '[[pv_cccccccccc]]', (h) => {
     assert.match(h, /Menu &lt;fixed&gt;/);
     assert.match(h, /<span class="ref-p">Other &amp; Co<\/span>/);
-    assert.match(h, /<img class="ref-img" src="\/artifacts\/x.png"/);
+    assert.match(h, /<i data-icon="previews"><\/i>/); // a preview leads with its kind's image icon, as every kind has one mark
   }],
   ['label with markup is escaped once', `[[${T}|a & b]]`, (h) => assert.match(h, /<span class="ref-t">a &amp; b<\/span>/)],
-  ['page link uses the current project', '[[page:previews]] [[page:helm]]', (h) => { assert.match(h, /href="#\/p\/prj_1\/previews"/); assert.match(h, /href="#\/helm"/); }],
+  ['page link uses the current project', '[[page:spec]] [[page:helm]]', (h) => { assert.match(h, /href="#\/p\/prj_1\/spec"/); assert.match(h, /href="#\/helm"/); }],
+  ['folded pages land on their new place', '[[page:previews]] [[page:history]] [[page:knowledge]] [[page:hosts]]', (h) => { assert.match(h, /href="#\/p\/prj_1\/gallery"/); assert.match(h, /href="#\/p\/prj_1\/overview\/journal"/); assert.match(h, /href="#\/p\/prj_1\/setup\/knowledge"/); assert.match(h, /href="#\/system\/hosts"/); }],
+  ['releases land on Ship', '[[page:releases]] [[page:ship]]', (h) => { assert.equal((h.match(/href="#\/p\/prj_1\/ship"/g) ?? []).length, 2); assert.doesNotMatch(h, /\/releases"/); }],
   ['emphasis around a reference', `**[[${T}]]** and _${T}_`, (h) => assert.equal(chips(h), 2)],
   ['punctuation after a chip stays with it', `see [[${T}]]. Next`, (h) => assert.match(h, /<span class="ref-wrap"><a [^]*<\/a>\.<\/span> Next/)],
   ['eight in one paragraph', Array(8).fill(`[[${T}]]`).join(', '), (h) => assert.equal(chips(h), 8)],
@@ -65,4 +68,10 @@ test('no env: plain markdown', () => assert.equal(chips(renderMarkdown(`[[${T}]]
 test('plainRefs: titles, labels, pages', () => {
   assert.equal(plainRefs(`Director: see [[${T}]] and [[${T}|this]] on [[page:spec]]; ${D}.`, env.resolve), 'Director: see Overview rework and this on Spec; Became a task.');
   assert.equal(plainRefs('gone [[task_ffffffffff]]', env.resolve), 'gone task_ffffffffff');
+});
+
+test('each kind has its own mark: a task its state dot, a discussion its bubble', () => {
+  const h = md(`[[${T}]] and [[disc_eeeeeeeeee]]`);
+  assert.match(h, /class="ref ref-task[^"]*"[^>]*><span class="ref-dot"/);
+  assert.match(h, /class="ref ref-discussion[^"]*"[^>]*><i data-icon="discuss"><\/i>/);
 });

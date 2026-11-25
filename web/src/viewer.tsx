@@ -77,13 +77,13 @@ function FrameView({ src, title, sandbox, onClose }: Frame & { onClose: () => vo
   }, []);
   return (
     <div className="zv zv-frame" role="dialog" aria-modal="true" aria-label={title}>
-      <div className="zv-frame-bar">
+      <div className="zv-frame-bar on-media">
         <button className="icon-btn" onClick={onClose} aria-label="Close">
           <Icon name="close" />
         </button>
         <strong className="one-line">{title}</strong>
         <a className="btn small quiet" href={src} target="_blank" rel="noreferrer">
-          <Icon name="external" size={15} /> Open in browser
+          <Icon name="external" size={16} /> Open in browser
         </a>
       </div>
       <iframe src={src} title={title} sandbox={sandbox} />
@@ -132,11 +132,16 @@ function Viewer({ items, index, setIndex, onClose }: { items: ViewerItem[]; inde
     return () => ro.disconnect();
   }, []);
 
-  // A new image: its size comes from the file (or the item), and the view starts afresh.
+  // A new image: its size comes from the file (or the item), and the view starts afresh, unless it has the same
+  // natural size as the last one (two shots of one screen): then the zoom and pan carry over, to compare a spot.
+  const carry = useRef<{ W: number; H: number; view: View } | null>(null);
   useEffect(() => {
-    setSize(item.width && item.height ? { W: item.width, H: item.height } : null);
-    setView(null);
+    const next = item.width && item.height ? { W: item.width, H: item.height } : null;
     setPull({ x: 0, y: 0 });
+    if (next && size && next.W === size.W && next.H === size.H) return;
+    carry.current = size && viewRef.current ? { ...size, view: viewRef.current } : null;
+    setSize(next);
+    setView(null);
   }, [index, items]);
 
   const W = size?.W ?? 1;
@@ -154,7 +159,10 @@ function Viewer({ items, index, setIndex, onClose }: { items: ViewerItem[]; inde
 
   useEffect(() => {
     if (!stage || !size) return;
-    setView((v) => (v ? clamp(v) : home()));
+    // A size read from the file that matches the last image's takes its view back.
+    const c = carry.current;
+    carry.current = null;
+    setView((v) => (v ? clamp(v) : c && c.W === size.W && c.H === size.H ? clamp(c.view) : home()));
   }, [stage?.w, stage?.h, size?.W, size?.H]);
 
   const zoomTo = (k: number, sx?: number, sy?: number) => {
@@ -284,7 +292,7 @@ function Viewer({ items, index, setIndex, onClose }: { items: ViewerItem[]; inde
   const dim = Math.min(1, pull.y / 300);
   return (
     <div className="zv" role="dialog" aria-modal="true" aria-label={item.label || 'Image'} style={{ ['--zv-dim' as any]: 1 - dim * 0.7 }}>
-      <div className="zv-top">
+      <div className="zv-top on-media solid">
         <span className="zv-count">{items.length > 1 ? `${index + 1} of ${items.length}` : ''}</span>
         <button className="icon-btn" onClick={onClose} aria-label="Close">
           <Icon name="close" />
@@ -313,7 +321,7 @@ function Viewer({ items, index, setIndex, onClose }: { items: ViewerItem[]; inde
             ))}
         </div>
       </div>
-      <div className="zv-bar lightbox-bar">
+      <div className="zv-bar lightbox-bar on-media">
         {items.length > 1 && (
           <button className="icon-btn" disabled={prev === null} onClick={() => prev !== null && setIndex(prev)} aria-label="Previous">
             <Icon name="back" />
@@ -328,7 +336,7 @@ function Viewer({ items, index, setIndex, onClose }: { items: ViewerItem[]; inde
             <Icon name="back" />
           </button>
         )}
-        <div className="zv-zoom" role="group" aria-label="Zoom">
+        <div className="zv-zoom on-media" role="group" aria-label="Zoom">
           <button className="icon-btn" onClick={() => zoomTo((view?.k ?? homeK) / 1.5)} disabled={!view || view.k <= minK * 1.001} aria-label="Zoom out">
             <span aria-hidden="true">−</span>
           </button>

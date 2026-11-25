@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { api, useLive } from './api';
 import type { InboxItem, ProjectState } from './api';
-import { Empty, Icon, Tag, clock, href, useAction } from './ui';
+import { Empty, Icon, Tag, clock, href, useAction, PageHeader } from './ui';
+import { timeOfDay } from './time';
 
 /** An always-allow rule the director made for one agent (decide_permission allow_always). */
 export type Rule = { id: string; agent_id: string; agent_name: string | null; tool_name: string; rule_content: string | null; reason: string; created_at: number; revoked_at: number | null };
@@ -17,7 +18,7 @@ function RuleRow({ r, pid }: { r: Rule; pid: string }) {
         {r.revoked_at ? (
           <span className="muted small">Revoked {clock(r.revoked_at)}</span>
         ) : (
-          <button className="btn danger req-btn" disabled={busy} onClick={() => run(() => api(`/api/projects/${pid}/rules/${r.id}/revoke`, { method: 'POST' }))}>
+          <button className="btn danger" disabled={busy} onClick={() => run(() => api(`/api/projects/${pid}/rules/${r.id}/revoke`, { method: 'POST' }))}>
             Revoke
           </button>
         )}
@@ -74,9 +75,9 @@ export function AutoAllowedGroup({ items }: { items: InboxItem[] }) {
   return (
     <details className="tl-auto">
       <summary>
-        <Icon name="check" size={14} /> <span>
+        <Icon name="check" size={16} /> <span>
           {items.length === 1 ? 'Allowed automatically' : `${items.length} commands allowed automatically`}
-          <span className="muted"> · {who} · {clock(first.created_at)}{items.length > 1 && last.created_at - first.created_at > 60_000 ? `–${new Date(last.created_at).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}` : ''}</span>
+          <span className="muted"> · {who} · {clock(first.created_at)}{items.length > 1 && last.created_at - first.created_at > 60_000 ? `–${timeOfDay(last.created_at)}` : ''}</span>
         </span>
       </summary>
       <p className="muted small">The project is Unrestricted and these were not on the dangerous list, so Helm allowed them without asking.</p>
@@ -105,7 +106,7 @@ export function DecisionsPage({ s }: { s: ProjectState }) {
       <a className="back" href={href('p', pid, 'setup')}>
         <Icon name="back" size={16} /> Setup
       </a>
-      <h1 className="page-title">Decisions made for you</h1>
+      <PageHeader title="Decisions made for you" />
       <p className="muted">
         Permission requests Helm answered without asking you, newest first.{' '}
         {s.project.autonomy === 'full'
@@ -130,7 +131,7 @@ export function DecisionsPage({ s }: { s: ProjectState }) {
       </label>
       {error && <p className="error-text">{error}</p>}
       {!data && !error && <div className="loading">Loading…</div>}
-      {data && list.length === 0 && <Empty title="No decisions yet">When Helm answers a permission request on your behalf, it is listed here with who decided and why.</Empty>}
+      {data && list.length === 0 && <Empty title="No decisions yet" />}
       <ul className="decision-list">
         {list.map((d) => (
           <li key={d.id} className="card decision">

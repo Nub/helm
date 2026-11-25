@@ -1,50 +1,100 @@
 import { useEffect, useRef, useState } from 'react';
+import { ShareButton } from './share';
+import { RequestTestBuild } from './testbuilds';
 import type { InboxItem } from './api';
 import { AttachButton, AttachTray, dropTarget, pasteInto, useAttachDraft } from './attachments';
-import { ACTION_CHOICES, KIND_LABEL, WantsMark, answerRequest, kindTone, wantsWhat } from './needs';
+import { useStoredText } from './drafts';
+import { ACTION_CHOICES, actOf, ErrorDetails, KIND_LABEL, LimitAll, ScheduledResume, WantsMark, answerRequest, appliesToAll, errorChoices, kindTone, wantsWhat } from './needs';
 import { INLINE_KINDS, PreviewBody, PreviewTile } from './preview';
-import { Icon, Importance, Markdown, Tag, ago, clock, go, href, useAction } from './ui';
+import { openChat } from './chat';
+import { Icon, Importance, Markdown, Tag, ago, clock, go, href, openPreview, useAction } from './ui';
+import { api } from './api';
+import { dayTime } from './time';
+import { ProposalCard } from './specdiscuss';
 
 /**
- * A request to the user (an agent's question, a permission request, a team change to approve) as a full card
- * with its answer controls: shown in the thread of the task or discussion it belongs to, and on the agent's page.
+ * A request to the user, as its one full card: the only shape a request is shown in (Needs you, the project's Needs
+ * response, the Home card, the thread of its task or discussion, the agent's page). The whole ask, never clamped: the
+ * task or discussion it belongs to as the card's title line (a link; nothing for a request on no task), its kind, the
+ * request's own title and text, a to-do's steps, an
+ * error's details, a permission's command and why it asks, attached previews, the recommendation, then the answer
+ * controls. Kinds differ only in their label and their controls.
+ *
+ * context: the line linking to its task or discussion (left out in that task's own thread). hidePreviews: shown
+ * above it already (a pinned proposal's items). onAnswered: told after an answer was sent (the Home card moves on).
  */
-
-/** hidePreviews: shown above it already (a pinned proposal's items). */
-export function InboxCard({ item, agentName, showProject = false, hidePreviews = false }: { item: InboxItem; agentName?: string; showProject?: boolean; hidePreviews?: boolean }) {
+export function InboxCard({ item, agentName, hidePreviews = false, context = true, onAnswered, openHref }: { item: InboxItem; agentName?: string; hidePreviews?: boolean; context?: boolean; onAnswered?: (what: string) => void; openHref?: string | null }) {
   const [choice, setChoice] = useState('');
-  const [text, setText] = useState('');
+  // What is typed (a note, an answer) and the files attached are kept per request until it is answered (drafts.ts).
+  const draftKey = `request:${item.id}`;
+  const [text, setText] = useStoredText(draftKey);
+  const [all, setAll] = useState(true);
   const { busy, error, run } = useAction();
-  const who = agentName ?? item.agent_name ?? 'An agent';
+  // No agent: Helm itself asked (a watch's command to approve, an update, a release).
+  const who = agentName ?? item.agent_name ?? (item.agent_id ? 'An agent' : 'Helm');
   // Waiting on the director or the independent check: still answerable by the user, first answer wins.
   const deciding = item.status === 'director' || item.status === 'check';
   const open = item.status === 'open' || deciding;
   // A question's answer can carry files: picker, paste into the box, or drop on the form (as in the composer).
   const action = item.kind === 'action';
   const question = open && (item.kind === 'question' || action);
-  const draft = useAttachDraft(question ? item.project_id : undefined, `request:${item.id}`);
+  const draft = useAttachDraft(question ? item.project_id : undefined, `request:${item.id}`, draftKey);
   const [over, setOver] = useState(false);
   const files = draft.ready.map((a) => a.id);
-  const answer = (body: { choice?: string; text?: string; dismiss?: boolean }) =>
+  const answer = (body: { choice?: string; text?: string; dismiss?: boolean; all?: boolean; perform?: boolean }) =>
     run(async () => {
       await answerRequest(item.id, files.length && !body.dismiss ? { ...body, attachments: files } : body);
       draft.clear();
+      onAnswered?.(body.dismiss ? 'Dismissed' : `Answered “${body.choice ?? (body.perform ? actOf(item)?.button : null) ?? 'Done'}”`);
     });
+  // Where it belongs: its task or discussion, else the agent that asked (a request on no task), else the project.
+  const thread = item.task_id ? href('p', item.project_id, item.task_kind === 'discussion' ? 'discussions' : 'tasks', item.task_id) : null;
+  // Open (top right, beside Share) and Ask (the bottom row, before Dismiss): the same on every card; a card shown in its
+  // own thread (context false) is already there, so it has no Open.
+  const openTo = openHref !== undefined ? openHref : context ? thread ?? (item.agent_id ? href('p', item.project_id, 'agents', item.agent_id) : null) : null;
+  const ask = (
+    <button className="btn quiet" disabled={busy} onClick={() => openChat({ kind: 'request', id: item.id })}>
+      <Icon name="discuss" size={16} /> Ask
+    </button>
+  );
+  const dismiss = (
+    <button className="btn quiet" disabled={busy} onClick={() => answer({ dismiss: true })}>
+      Dismiss
+    </button>
+  );
   // Asked for a file: Attach leads, and the text box waits until the user chooses to answer in words.
   const wants = !!wantsWhat(item);
   const [inWords, setInWords] = useState(false);
   const box = useRef<HTMLTextAreaElement>(null);
   const showBox = !wants || inWords || draft.items.length > 0 || !!text || !!choice;
+  const cards = item.payload.spec_cards ?? [];
+  const cardsOpen = open ? item.payload.spec_open ?? 0 : 0;
 
   return (
-    <article className={`card inbox-card ${open ? '' : 'handled'} ${open && item.blocking ? 'blocking' : ''}`}>
+    <article className={`card inbox-card ${open ? '' : 'handled'} ${open && item.blocking ? 'blocking' : ''}`} data-kctx={`request:${item.id}`}>
+      <ShareButton route={thread ?? href('home', 'needs')} title={item.task_title ?? 'Request'} className="card-share" />
+      {open && openTo && (
+        <a className="icon-btn share card-open" href={openTo} aria-label="Open" title="Open">
+          <Icon name="external" size={20} />
+        </a>
+      )}
+      {/* The card is titled with its task or discussion; the project is the section it sits in (needs.tsx). */}
+      {context && item.task_title && (
+        <h3 className="req-task">
+          {thread ? <a href={thread}>{item.task_title}</a> : item.task_title}
+        </h3>
+      )}
       <header className="inbox-meta">
         <Tag tone={kindTone(item.kind)}>{KIND_LABEL[item.kind]}</Tag>
-        {open && !!item.blocking && <Tag tone="tone-warning">Blocking {who}</Tag>}
+        {open && !!item.blocking && <Tag tone="tone-warning">Blocking</Tag>}
         {(item.kind === 'question' || action) && <Importance value={item.importance} />}
         <WantsMark r={item} />
+        {/* Deferred before and asked again (server/reminders.ts): when it was first asked. */}
+        {item.payload.asked_again && <span className="muted small">Asked again · first {dayTime(item.payload.asked_again.first_at)}</span>}
         <span className="spacer" />
-        <span className="muted small">{ago(item.created_at)}</span>
+        <span className="muted small">
+          {item.agent_id ? <a href={href('p', item.project_id, 'agents', item.agent_id)}>{who}</a> : who} · {ago(item.created_at)}
+        </span>
       </header>
       {deciding && (
         <p className="deciding">
@@ -62,21 +112,10 @@ export function InboxCard({ item, agentName, showProject = false, hidePreviews =
         </p>
       )}
       <h3>{item.title}</h3>
-      <p className="muted small">
-        {showProject && item.project_name && (
-          <>
-            <a href={href('p', item.project_id, 'tasks', 'needs')}>{item.project_name}</a> ·{' '}
-          </>
-        )}
-        from {item.agent_id ? <a href={href('p', item.project_id, 'agents', item.agent_id)}>{who}</a> : who}
-        {item.task_id && item.task_title && (
-          <>
-            {' · task '}
-            <a href={href('p', item.project_id, 'tasks', item.task_id)}>{item.task_title}</a>
-          </>
-        )}
-      </p>
-      {item.body && !sameAsTitle(item) && <Markdown text={item.body} />}
+      {/* A permission's body is a shortened copy of its command, which is shown in full below. */}
+      {item.body && !sameAsTitle(item) && !(item.kind === 'permission' && item.payload.input) && <Markdown text={item.body} />}
+      {action && <ActionSteps item={item} who={who} />}
+      <ErrorDetails r={item} open={open} />
       {item.kind === 'permission' && item.payload.danger && (
         <p className="danger-reason">
           <span className="label">Why this asks you</span> {item.payload.danger}
@@ -89,6 +128,8 @@ export function InboxCard({ item, agentName, showProject = false, hidePreviews =
           <pre>{item.payload.input}</pre>
         </details>
       )}
+      {/* A test build it carries (testbuilds.tsx): its files with Download and Get link. */}
+      {item.payload.test_build && <RequestTestBuild id={item.payload.test_build} />}
       {item.previews?.length > 0 && !hidePreviews &&
         (open ? (
           <AttachedPreviews item={item} />
@@ -98,6 +139,14 @@ export function InboxCard({ item, agentName, showProject = false, hidePreviews =
             <AttachedPreviews item={item} />
           </details>
         ))}
+      {/* Spec edit cards it is about (server/speccards.ts): decided here, and the last one decided settles it. */}
+      {open && cards.length > 0 && (
+        <div className="req-spec-cards">
+          {cards.map((id) => (
+            <ProposalCard key={id} body={JSON.stringify({ id })} ts={item.created_at} projectId={item.project_id} />
+          ))}
+        </div>
+      )}
 
       {item.kind === 'permission' && item.payload.triage?.passed && (
         <div className="recommendation">
@@ -119,23 +168,32 @@ export function InboxCard({ item, agentName, showProject = false, hidePreviews =
         </p>
       )}
 
-      {action && <ActionSteps item={item} who={who} />}
+      {/* Its inline action (reqactions.ts): Helm does it when tapped, and the request closes. */}
+      {question && actOf(item)?.button && (
+        <div className="row answer-actions">
+          <button className="btn primary" disabled={busy} onClick={() => answer({ perform: true })}>
+            {actOf(item)!.button}
+          </button>
+        </div>
+      )}
 
       {question && action && (
         <div className={`answer-form ${over ? 'drop-over' : ''}`} {...dropTarget(draft, setOver)}>
-          <textarea rows={1} value={text} onChange={(e) => setText(e.target.value)} onPaste={pasteInto(draft)} placeholder="Add a note (optional)" />
+          <textarea rows={1} value={text} onChange={(e) => setText(e.target.value)} onPaste={pasteInto(draft)} placeholder={cardsOpen ? "Add a note to Can't / not yet" : 'Add a note, or press Done'} />
           <AttachTray items={draft.items} onRemove={draft.drop} />
           <div className="row answer-actions">
-            <button className="btn primary" disabled={busy || draft.uploading} onClick={() => answer({ choice: 'Done', text: text.trim() || undefined })}>
-              <Icon name="check" size={15} /> {draft.uploading ? 'Uploading' : 'Done'}
-            </button>
+            {/* A note on its own settles it as Done, with the note: one button, Send. With Spec cards open, deciding them is Done. */}
+            {!cardsOpen && (
+              <button className={`btn ${actOf(item) ? '' : 'primary'}`} disabled={busy || draft.uploading} onClick={() => answer({ choice: 'Done', text: text.trim() || undefined })}>
+                <Icon name={text.trim() ? 'send' : 'check'} size={16} /> {draft.uploading ? 'Uploading' : text.trim() ? 'Send' : 'Done'}
+              </button>
+            )}
             <button className="btn" disabled={busy || draft.uploading} onClick={() => answer({ choice: ACTION_CHOICES[1], text: text.trim() || undefined })}>
               {ACTION_CHOICES[1]}
             </button>
             <AttachButton draft={draft} className="icon-btn answer-clip" label={draft.items.length ? 'Attach more' : 'Attach photos or files'} />
-            <button className="btn quiet" disabled={busy} onClick={() => answer({ dismiss: true })}>
-              Dismiss
-            </button>
+            {ask}
+            {dismiss}
           </div>
         </div>
       )}
@@ -189,12 +247,39 @@ export function InboxCard({ item, agentName, showProject = false, hidePreviews =
                 Answer in words instead
               </button>
             )}
-            <button className="btn quiet" disabled={busy} onClick={() => answer({ dismiss: true })}>
-              Dismiss
-            </button>
+            {ask}
+            {dismiss}
           </div>
         </div>
       )}
+
+      {open && item.kind === 'agent_error' && (
+        <div className="answer-form">
+          <textarea rows={1} value={text} onChange={(e) => setText(e.target.value)} placeholder="Add a note (optional)" />
+          <div className="row answer-actions">
+            {/* A note alone resumes the agent with it (the first choice), like pressing Resume. */}
+            {text.trim() && (
+              <button className="btn primary" disabled={busy} onClick={() => answer({ text: text.trim() })}>
+                <Icon name="send" size={16} /> Send
+              </button>
+            )}
+            {errorChoices(item).map((c, i) => (
+              <button
+                key={c}
+                className={`btn ${i === 0 && !text.trim() ? 'primary' : c === 'Close the agent' ? 'quiet' : ''}`}
+                disabled={busy}
+                onClick={() => (c !== 'Close the agent' || confirm(`Close ${who}? Its history stays.`)) && answer({ choice: c, text: text.trim() || undefined, ...(appliesToAll(c) && all && (item.payload.limit_peers ?? 0) > 1 ? { all: true } : {}) })}
+              >
+                {c}
+              </button>
+            ))}
+            {ask}
+            {dismiss}
+          </div>
+          <LimitAll r={item} all={all} setAll={setAll} />
+        </div>
+      )}
+      {!open && item.kind === 'agent_error' && <ScheduledResume agentId={item.agent_id} text={item.payload.resumes_text} />}
 
       {open && item.kind === 'structure' && (
         <div className="answer-form">
@@ -249,7 +334,7 @@ function ActionSteps({ item, who }: { item: InboxItem; who: string }) {
       wrap.append(pre);
       const b = document.createElement('button');
       b.type = 'button';
-      b.className = 'btn copy-btn';
+      b.className = 'btn small copy-code';
       b.textContent = 'Copy';
       const said = (t: string) => {
         b.textContent = t;
@@ -302,10 +387,38 @@ function AttachedPreviews({ item }: { item: InboxItem }) {
       {tiles.length > 0 && (
         <div className="preview-strip">
           {tiles.map((p) => (
-            <PreviewTile key={p.id} p={p} onOpen={() => go('p', item.project_id, 'previews', p.id)} />
+            <PreviewTile key={p.id} p={p} onOpen={() => openPreview(item.project_id, p.id)} />
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+/** When a deferred request's reminder comes, in words. */
+export const reminderText = (r: { due_text: string | null; due_at: number | null }) => (r.due_text ? `Reminds you ${r.due_text}` : r.due_at ? `Reminds you ${dayTime(r.due_at)}` : 'Reminds you later');
+
+/**
+ * A request answered "not now" (server/reminders.ts): one line saying when Helm asks again, with a control to change it
+ * (next session, in 1 hour, tomorrow) or not be reminded.
+ */
+export function ReminderLine({ r, title }: { r: { id: string; due_text: string | null; due_at: number | null }; title?: React.ReactNode }) {
+  const { busy, error, run } = useAction();
+  const set = (when: string) => run(() => api(`/api/reminders/${r.id}`, { body: { when } }));
+  return (
+    <div className="reminder-line small">
+      {title}
+      <span className="muted">
+        <Icon name="clock" size={16} /> {reminderText(r)}
+      </span>
+      <select aria-label="Change when to be reminded" value="" disabled={busy} onChange={(e) => e.target.value && void set(e.target.value)}>
+        <option value="">Change</option>
+        <option value="session">Next session</option>
+        <option value="hour">In 1 hour</option>
+        <option value="tomorrow">Tomorrow</option>
+        <option value="never">Don't remind</option>
+      </select>
+      {error && <span className="error-text">{error}</span>}
     </div>
   );
 }
@@ -314,6 +427,7 @@ function AttachedPreviews({ item }: { item: InboxItem }) {
 export function outcomeText(item: InboxItem): string {
   const [choice, ...rest] = item.answer.split(' — ');
   const note = rest.length ? `: ${rest.join(' — ')}` : '';
+  if (item.status === 'dismissed' && /^(Withdrawn|Agent closed)/.test(item.answer)) return item.answer;
   if (item.status === 'dismissed') return item.answer && item.answer !== 'Dismissed' ? `Dismissed: ${item.answer}` : 'Dismissed by you';
   if (item.kind === 'permission') {
     if (item.decided_by === 'auto') return 'Allowed automatically: the project is Unrestricted and this was not on the dangerous list';
@@ -325,6 +439,7 @@ export function outcomeText(item: InboxItem): string {
     return label + note;
   }
   if (item.kind === 'structure') return `${choice} by you${note}`;
+  if (item.kind === 'agent_error') return `${choice === 'Resume' ? 'Resumed by you' : choice === 'Ask the director' ? 'Passed to the director by you' : choice === 'Close the agent' ? 'Closed by you' : choice}${note}`;
   if (item.kind === 'action') return `${choice === 'Done' ? 'Done, by you' : `${choice}, you said`}${note}`;
   return `You answered: ${item.answer}`;
 }
@@ -340,7 +455,7 @@ export function RequestOutcome({ item, asker }: { item: InboxItem; asker?: strin
   return (
     <div className={`tl-card tl-question tl-req-${item.kind}`}>
       <span className="msg-meta">
-        <Tag tone={kindTone(item.kind)}>{KIND_LABEL[item.kind]}</Tag> <b>{who}</b> {item.kind === 'permission' ? 'asked permission' : item.kind === 'structure' ? 'proposed' : item.kind === 'action' ? 'asked you to do' : 'asked'} · {clock(item.created_at)}
+        <Tag tone={kindTone(item.kind)}>{KIND_LABEL[item.kind]}</Tag> <b>{who}</b> {item.kind === 'agent_error' ? 'stopped with an error' : item.kind === 'permission' ? 'asked permission' : item.kind === 'structure' ? 'proposed' : item.kind === 'action' ? 'asked you to do' : 'asked'} · {clock(item.created_at)}
       </span>
       <strong className={item.kind === 'permission' ? 'req-perm-line' : ''}>{item.kind === 'permission' ? item.line : item.title}</strong>
       {(item.kind === 'question' || item.kind === 'action') && item.body && !sameAsTitle(item) && <Markdown text={item.body} />}
@@ -357,13 +472,23 @@ export function RequestOutcome({ item, asker }: { item: InboxItem; asker?: strin
           <pre>{item.payload.input}</pre>
         </details>
       )}
+      {item.kind === 'agent_error' && item.body && <p className="small">{item.body}</p>}
+      <ErrorDetails r={item} />
       {item.kind === 'structure' && item.body && (
         <details className="tool-input">
           <summary>The proposed change</summary>
           <Markdown text={item.body} />
         </details>
       )}
-      {item.kind !== 'question' && item.kind !== 'action' && (
+      {item.kind === 'agent_error' && <ScheduledResume agentId={item.agent_id} text={item.payload.resumes_text} />}
+      {item.reminder && <ReminderLine r={item.reminder} />}
+      {item.status === 'withdrawn' && (
+        <p className="req-outcome muted">
+          Withdrawn: {item.answer}
+          {item.answered_at && <span className="muted"> · {clock(item.answered_at)}</span>}
+        </p>
+      )}
+      {item.kind !== 'question' && item.kind !== 'action' && item.status !== 'withdrawn' && (
         <p className={`req-outcome ${good ? 'good' : 'bad'}`}>
           {outcomeText(item)}
           {item.answered_at && <span className="muted"> · {clock(item.answered_at)}</span>}

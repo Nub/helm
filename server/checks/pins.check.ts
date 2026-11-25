@@ -171,7 +171,8 @@ await check('options that do not map one to one onto previews are not linked unl
   const r = await call('ask_user', { title: 'Q', question: 'Q', options: [{ label: 'Yes' }, { label: 'No' }, { label: 'Later' }], previews: [a, b], task: t.id });
   assert.doesNotMatch(text(r), /linked/);
   assert.equal(P.proposalView(t.id), null);
-  const r2 = await call('ask_user', { title: 'Q2', question: 'Q', options: [{ label: 'Yes' }, { label: 'No' }, { label: 'Later' }], previews: [a, b], task: t.id, proposal: true });
+  // A different question: asking the same one again is refused (the open one is replaced instead).
+  const r2 = await call('ask_user', { title: 'Q2', question: 'Q, with the previews pinned as a proposal', options: [{ label: 'Yes' }, { label: 'No' }, { label: 'Later' }], previews: [a, b], task: t.id, proposal: true });
   assert.match(text(r2), /linked to the pinned proposal/);
   assert.equal(P.proposalView(t.id)!.items.length, 2);
 });

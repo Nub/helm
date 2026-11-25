@@ -1,82 +1,101 @@
 import type { FastifyInstance, FastifyReply } from 'fastify';
+import { markSeen, peerView } from './crossproject.ts';
+import { parallelHint } from './dispatch.ts';
+import { buildsForTask } from './testbuilds.ts';
+import { CONSOLIDATE_ASK, applyConsolidation, consolidationDiscussion, consolidationView, declineConsolidation, getConsolidation } from './merge.ts';
+import { taskScope } from './tilescope.ts';
+import { runningCommands } from './commands.ts';
 import { all, get, now, run, tx } from './db.ts';
 const clock = now;
 import type { Row } from './db.ts';
 import { reportsForTask } from './reports.ts';
 import { bindAttachments, pendingAttachments } from './attachments.ts';
-import { rootAgent, sendToAgent } from './runtime.ts';
+import { dispatchWork, rootAgent, sendToAgent, tellDirector } from './agents.ts';
 import { onTaskDecision, taskSpec } from './spec.ts';
 import { getProject, touchProject } from './store.ts';
-import { anotherTaskFrom, canMakeAnotherTask, cannotBecomeDiscussion, createDiscussion, discussionToTask, listDiscussions, reopenDiscussion, settleDiscussion, taskToDiscussion } from './discussions.ts';
+import { anotherTaskFrom, canMakeAnotherTask, cannotBecomeDiscussion, concludeDiscussion, createDiscussion, makeTaskFromDiscussion, discussionToTask, listDiscussions, reopenDiscussion, settleDiscussion, taskToDiscussion } from './discussions.ts';
 import { OPEN_TASK_STATES, QUEUE_ORDER, STATE_LABEL, USER, addTaskMessage, createTask, getTask, isDiscussion, moveTask, setTaskState, taskDetail, taskRef, unfiledNeed } from './tasks.ts';
 import type { Move } from './tasks.ts';
-import { specMessageExtras } from './specdiscuss.ts';
+import { batchDiscussions } from './discrevisit.ts';
+import { specMessageExtras, startTaskSpecDiscussion } from './specdiscuss.ts';
+import { onSpecWorkMessage } from './specwork.ts';
+import { taskReferences } from './taskrefs.ts';
+import { taskStatus } from './taskstatus.ts';
+import { partsView } from './taskparts.ts';
 import { boundaries } from './sessions.ts';
 import { orderPins, pinItems, relabel, unpin } from './pins.ts';
 import { contextBlock } from './chatcontext.ts';
 import type { Viewing } from './chatcontext.ts';
+import { holdsNewWork } from './projectmode.ts';
+import { ACTIONS, modeWords, queuePlace, taskAction } from './taskactions.ts';
+import { setBell } from './bell.ts';
+import { setWaits } from './waits.ts';
+import { KINDS, headline, taskTime, topSentence } from './tasktime.ts';
+import { userTier } from './workrules.ts';
+import { projectTimeline } from './timeline.ts';
 
 
 function bad(reply: FastifyReply, message: string, code = 400) {
   return reply.code(code).send({ error: message });
 }
 
-/** A note from Helm to the project's top-level agent; it shows in the conversation as a system row. */
-export async function tellDirector(projectId: string, text: string) {
-  const project = getProject(projectId);
-  if (!project) return;
-  await sendToAgent(rootAgent(project).id, `<helm-note>${text}</helm-note>`, { kind: 'system', name: 'Helm' });
-}
-
-/** Where a scheduled task stands in the queue, for notes to the director. */
-function queuePlace(task: Row): string {
-  const scheduled = all(`SELECT id FROM tasks WHERE project_id = ? AND state = 'scheduled' ${QUEUE_ORDER}`, task.project_id);
-  const i = scheduled.findIndex((t) => t.id === task.id);
-  return i < 0 ? '' : ` It is number ${i + 1} of ${scheduled.length} in the scheduled queue.`;
-}
-
-/** The user's one-tap task actions: which states they apply to, the new state, and what the director is told. */
-const ACTIONS: Record<string, { from: string[]; to: string; label: string; note: (t: Row) => string }> = {
-  // Approve a plan, or Schedule a waiting task: both put it in the queue.
-  approve: {
-    from: ['planning', 'waiting'],
-    to: 'scheduled',
-    label: 'Approve',
-    note: (t) => `The user ${t.was === 'waiting' ? 'scheduled' : 'approved'} ${taskRef(t)}. It is now Scheduled.${queuePlace(t)} Take it up in queue order; say in its thread (task_post) when you start.`,
-  },
-  start: {
-    from: ['planning', 'waiting', 'scheduled', 'paused'],
-    to: 'active',
-    label: 'Start now',
-    note: (t) => `The user pressed Start now on ${taskRef(t)}. It is now Active. Start work on it now, ahead of the queue, or say in its thread what is missing before you can.`,
-  },
-  interrupt: {
-    from: ['active'],
-    to: 'paused',
-    label: 'Interrupt',
-    note: (t) => `The user interrupted ${taskRef(t)}. It is now Paused. Wind down work on it: stop or redirect the agents working on it, and do not continue it until they resume it.`,
-  },
-  resume: {
-    from: ['paused'],
-    to: 'active',
-    label: 'Resume',
-    note: (t) => `The user resumed ${taskRef(t)}. It is Active again. Pick the work back up where it stopped, or say in its thread what is missing.`,
-  },
-  drop: {
-    from: OPEN_TASK_STATES,
-    to: 'dropped',
-    label: 'Drop',
-    note: (t) => `The user dropped ${taskRef(t)}. Stop any work on it, and close agents that were only working on it.`,
-  },
-};
-
 export function registerTaskApi(app: FastifyInstance) {
+  // The Work page's Timeline, throughput and flow (timeline.ts): tasks of the last `days` (1 to 90) and every open one.
+  app.get('/api/projects/:id/timeline', async (req, reply) => {
+    const project = getProject((req.params as any).id);
+    if (!project) return bad(reply, 'No such project', 404);
+    const days = Math.min(90, Math.max(1, Number((req.query as any)?.days) || 28));
+    return projectTimeline(project.id, days);
+  });
+
+  // Where a task's time went (tasktime.ts): kept for a finished task, computed for an open one.
+  app.get('/api/tasks/:id/time', async (req, reply) => {
+    const id = (req.params as { id: string }).id;
+    if (!get('SELECT 1 AS x FROM tasks WHERE id = ?', id)) return bad(reply, 'No such task', 404);
+    const time = taskTime(id);
+    return { time, headline: time ? headline(time) : '', sentence: time ? topSentence(time) : '', kinds: KINDS };
+  });
+
+  // Consolidate tasks (Work page, merge.ts): a discussion with the director about the tasks that are not running; the
+  // first time, the user's ask goes to it. Its proposals are cards the user applies or declines here.
+  app.post('/api/projects/:id/consolidate', async (req, reply) => {
+    const project = getProject((req.params as any).id);
+    if (!project) return bad(reply, 'No such project', 404);
+    const { d, created } = consolidationDiscussion(project.id);
+    if (created) await sendThreadMessage(d, CONSOLIDATE_ASK, []);
+    return { discussion_id: d.id, created };
+  });
+  app.get('/api/consolidations/:id', async (req, reply) => {
+    const c = getConsolidation((req.params as any).id);
+    return c ? consolidationView(c) : bad(reply, 'No such proposal', 404);
+  });
+  app.post('/api/consolidations/:id/:action', async (req, reply) => {
+    const { id, action } = req.params as any;
+    const c = getConsolidation(id);
+    if (!c) return bad(reply, 'No such proposal', 404);
+    if (action === 'apply') {
+      const res = applyConsolidation(c);
+      if ('error' in res) return bad(reply, res.error, res.code ?? 400);
+      await tellDirector(c.project_id, `The user applied your proposal in [[${c.discussion_id}]]: ${res.text}`).catch(() => {});
+      return res;
+    }
+    if (action === 'decline') {
+      const e = declineConsolidation(c);
+      if (e) return bad(reply, e.error, e.code ?? 400);
+      await tellDirector(c.project_id, `The user declined your proposal in [[${c.discussion_id}]] (${c.kind}: ${c.gain}).`).catch(() => {});
+      return { ok: true };
+    }
+    return bad(reply, 'apply or decline', 404);
+  });
+
   app.get('/api/tasks/:id', async (req, reply) => {
     const detail = taskDetail((req.params as any).id);
     if (!detail) return bad(reply, 'No such task', 404);
+    // The user opened a thread with another project: its replies are read (crossproject.ts).
+    markSeen(detail.task.id);
     // Session and away boundaries across the task's life, for dividers in its history.
     const periods = boundaries(detail.task.project_id, detail.task.created_at, detail.timeline.length ? Math.max(clock(), detail.timeline[detail.timeline.length - 1].ts) : clock());
-    return { ...detail, reports: reportsForTask(detail.task.id), spec: taskSpec(detail.task.id), periods, now: clock() };
+    return { ...detail, reports: reportsForTask(detail.task.id), spec: taskSpec(detail.task.id), references: detail.task.kind === 'task' ? taskReferences(detail.task) : null, parallel: parallelHint(detail.task), status: detail.task.kind === 'task' ? taskStatus(detail.task) : null, parts: detail.task.kind === 'task' ? partsView(detail.task.id) : [], periods, now: clock(), commands: runningCommands(detail.task.id), dashboards: taskScope(detail.task.id), dashboard: get('SELECT id, title, state FROM dashboards WHERE task_id = ?', detail.task.id) ?? null, test_builds: buildsForTask(detail.task.id), peer: peerView(detail.task.id) };
   });
 
   /**
@@ -90,13 +109,17 @@ export function registerTaskApi(app: FastifyInstance) {
     const b = (req.body ?? {}) as Record<string, any>;
     const title = String(b.title ?? '').trim();
     if (!title) return bad(reply, 'Give it a title.');
-    const state = b.scheduled ? 'scheduled' : 'waiting';
+    // Winding down, at rest or stopped (projectmode.ts): a new task waits; the user schedules it once they resume.
+    const held = !!b.scheduled && holdsNewWork(project.id);
+    const state = b.scheduled && !held ? 'scheduled' : 'waiting';
     const docId = b.doc_id && get('SELECT id FROM docs WHERE id = ? AND project_id = ?', b.doc_id, project.id) ? b.doc_id : null;
     const task = createTask(project.id, { title, description: String(b.description ?? ''), state, doc_id: docId, origin: 'user' }, USER);
+    if (held) addTaskMessage(task, { author: 'system', name: 'Helm' }, `Added as Waiting, not Scheduled: the project is ${modeWords(project.id)}. Schedule it once the project runs again.`, 'state');
     if (state === 'scheduled') {
-      await tellDirector(project.id, `The user added ${taskRef(task)} as Scheduled.` + (task.description ? `\n\n${task.description}\n\n` : ' ') + `Take it up in queue order.${queuePlace(task)}`);
+      await tellDirector(project.id, `The user added ${taskRef(task)} as Scheduled.` + (task.description ? `\n\n${task.description}\n\n` : ' ') + `Helm starts a fresh builder for it in queue order.${queuePlace(task)}`);
+      dispatchWork(project.id);
     }
-    return { id: task.id };
+    return { id: task.id, ...(held ? { note: `Added as Waiting: the project is ${modeWords(project.id)}.` } : {}) };
   });
 
   /** Edit title, description or linked goal. Only an edit to an active task wakes the director. */
@@ -127,6 +150,24 @@ export function registerTaskApi(app: FastifyInstance) {
     return { ok: true };
   });
 
+  /** The task menu's "Review before it lands" (builder.ts isRisky): the user marks a task for review, or unmarks it. */
+  app.post('/api/tasks/:id/review', async (req, reply) => {
+    const task = getTask((req.params as any).id);
+    if (!task || task.kind !== 'task') return bad(reply, 'No such task', 404);
+    const on = !!(req.body as any)?.on;
+    run('UPDATE tasks SET risky = ?, updated_at = ? WHERE id = ?', on ? 1 : 0, now(), task.id);
+    addTaskMessage(task, { author: 'system', name: 'Helm' }, on ? 'You marked it for review: it is reviewed before it lands.' : 'You took off its review: it lands without one.', 'state');
+    return { ok: true };
+  });
+
+  /** The task page's tier picker (workrules.ts userTier): the user's tier, pinned; the agent on it takes it next turn. */
+  app.post('/api/tasks/:id/tier', async (req, reply) => {
+    const task = getTask((req.params as any).id);
+    if (!task || task.kind !== 'task') return bad(reply, 'No such task', 404);
+    const err = userTier(task, String((req.body as any)?.tier ?? ''));
+    return err ? bad(reply, err) : { ok: true };
+  });
+
   /** Reorder. Quiet: the director reads the queue when it next picks up work. */
   /**
    * The row's "Ask the director what it needs": a task says it needs the user but nothing is filed (tasks.ts
@@ -148,6 +189,24 @@ export function registerTaskApi(app: FastifyInstance) {
     return { ok: true };
   });
 
+  // What a task waits for, set by the user from its menu (waits.ts).
+  app.post('/api/tasks/:id/waits', async (req, reply) => {
+    const task = getTask((req.params as any).id);
+    if (!task) return bad(reply, 'No such task', 404);
+    const ids = (req.body as any)?.ids;
+    if (!Array.isArray(ids)) return bad(reply, 'Send ids: the tasks it waits for.');
+    const err = setWaits(task.id, ids.map(String));
+    return err ? bad(reply, err.replace(/\[\[[^\]|]+\]\]/g, (m) => `"${getTask(m.slice(2, -2))?.title ?? m}"`)) : { ok: true };
+  });
+
+  // The bell: tell the user once when this task finishes (bell.ts).
+  app.post('/api/tasks/:id/bell', async (req, reply) => {
+    const task = getTask((req.params as any).id);
+    if (!task) return bad(reply, 'No such task', 404);
+    setBell(task.id, !!(req.body as any)?.on);
+    return { ok: true };
+  });
+
   app.post('/api/tasks/:id/move', async (req, reply) => {
     const task = getTask((req.params as any).id);
     if (!task) return bad(reply, 'No such task', 404);
@@ -159,17 +218,13 @@ export function registerTaskApi(app: FastifyInstance) {
     return err ? bad(reply, err) : { ok: true };
   });
 
-  for (const [action, a] of Object.entries(ACTIONS)) {
+  for (const action of Object.keys(ACTIONS)) {
     app.post(`/api/tasks/:id/${action}`, async (req, reply) => {
       const task = getTask((req.params as any).id);
       if (!task) return bad(reply, 'No such task', 404);
-      if (isDiscussion(task)) return bad(reply, `${a.label} applies to tasks; this is a discussion. Turn it into a task first.`);
-      if (!a.from.includes(task.state)) return bad(reply, `This task is ${STATE_LABEL[task.state]}; ${a.label} applies to ${a.from.map((s) => STATE_LABEL[s]).join(', ')} tasks.`);
-      setTaskState(task, a.to, USER);
-      // A Spec change being planned: Approve or Start settles the edited entries, Drop marks them not planned.
-      onTaskDecision(task, action);
-      await tellDirector(task.project_id, a.note({ ...getTask(task.id)!, was: task.state }));
-      return { ok: true };
+      const res = await taskAction(task, action, !!(req.body as any)?.anyway);
+      if (res.needsConfirm) return reply.code(409).send({ error: res.error, needsConfirm: true });
+      return res.error ? bad(reply, res.error) : { ok: true };
     });
   }
 
@@ -180,6 +235,16 @@ export function registerTaskApi(app: FastifyInstance) {
     if (!project) return bad(reply, 'No such project', 404);
     const q = req.query as { q?: string; state?: string };
     return { discussions: listDiscussions(project.id, { q: q.q, state: q.state }) };
+  });
+
+  /** Many discussions at once, or one from its page: mark stale, archive, close (with its proposed conclusion, else "Closed in bulk") or reopen. */
+  app.post('/api/projects/:id/discussions/batch', async (req, reply) => {
+    const project = getProject((req.params as any).id);
+    if (!project) return bad(reply, 'No such project', 404);
+    const b = (req.body ?? {}) as { ids?: unknown; action?: string };
+    if (!Array.isArray(b.ids) || !b.ids.length) return bad(reply, 'Give the discussions: ids.');
+    const res = batchDiscussions(project.id, b.ids.map(String), b.action as 'stale', USER);
+    return 'error' in res ? bad(reply, res.error) : res;
   });
 
   /** The user starts a discussion: a title and a first message, delivered to the director tagged with it. */
@@ -204,17 +269,51 @@ export function registerTaskApi(app: FastifyInstance) {
   app.post('/api/tasks/:id/settle', async (req, reply) => {
     const d = getTask((req.params as any).id);
     if (!d) return bad(reply, 'No such discussion', 404);
-    if (!isDiscussion(d)) return bad(reply, 'Only a discussion can be settled; a task is finished with Done or Drop.');
+    if (!isDiscussion(d)) return bad(reply, 'Only a discussion can be closed; a task is finished with Done or Drop.');
     if (d.state === 'settled') return bad(reply, 'It is already settled.');
     const conclusion = String((req.body as any)?.conclusion ?? '').trim();
     settleDiscussion(d, conclusion, USER);
     await tellDirector(
       d.project_id,
       conclusion
-        ? `The user settled ${taskRef(d)} with this conclusion: ${conclusion}`
-        : `The user settled ${taskRef(d)}. Write its conclusion from the thread with update_discussion (conclusion), in one to three sentences. Do not reply in the conversation.`,
+        ? `The user closed ${taskRef(d)} with this conclusion: ${conclusion}`
+        : `The user closed ${taskRef(d)}. Write its conclusion from the thread with update_discussion (conclusion), in one to three sentences. Do not reply in the conversation.`,
     );
     return { ok: true };
+  });
+
+  /** Conclude: the director's proposed conclusion (task_post conclude) closes the discussion and it plans the work. */
+  app.post('/api/tasks/:id/conclude', async (req, reply) => {
+    const d = getTask((req.params as any).id);
+    if (!d) return bad(reply, 'No such discussion', 404);
+    const raw = (req.body as any)?.message;
+    const res = concludeDiscussion(d, raw == null ? undefined : Number(raw), USER);
+    if ('error' in res) return bad(reply, res.error);
+    touchProject(d.project_id);
+    await tellDirector(d.project_id, res.text);
+    return { ok: true };
+  });
+
+  /** Make a task from a discussion's header: close it with its conclusion (or summary) and the director plans the work now. */
+  app.post('/api/tasks/:id/make-task', async (req, reply) => {
+    const d = getTask((req.params as any).id);
+    if (!d) return bad(reply, 'No such discussion', 404);
+    const m = (req.body as any)?.message;
+    const res = makeTaskFromDiscussion(d, (req.body as any)?.line, USER, m == null ? undefined : Number(m));
+    if ('error' in res) return bad(reply, res.error);
+    touchProject(d.project_id);
+    await tellDirector(d.project_id, res.text);
+    return { ok: true };
+  });
+
+  /** "No Spec entry · Discuss" on a task: open (or reuse) the discussion about which entry it belongs to (specdiscuss.ts). */
+  app.post('/api/tasks/:id/spec-discussion', async (req, reply) => {
+    const t = getTask((req.params as any).id);
+    if (!t) return bad(reply, 'No such task', 404);
+    const res = startTaskSpecDiscussion(t);
+    if ('error' in res) return bad(reply, res.error);
+    if (res.directorNote) await tellDirector(t.project_id, res.directorNote);
+    return { id: res.discussion.id, created: res.created };
   });
 
   app.post('/api/tasks/:id/reopen', async (req, reply) => {
@@ -325,12 +424,18 @@ export function registerTaskApi(app: FastifyInstance) {
     const text = String((req.body as any)?.text ?? '').trim();
     const files = pendingAttachments(task.project_id, (req.body as any)?.attachments);
     if ('error' in files) return bad(reply, files.error);
-    if (!text && !files.rows.length) return bad(reply, 'Empty message');
-    // From the task page's Interject box: on an active task the message is an interjection, and may pause the task
-    // (the Interrupt action) in the same step. On any other task it is an ordinary reply.
+    // Interject (one control, in place of Interrupt and Interject): on an active task it stops the work (the task is
+    // paused) and the director re-evaluates with the message; with no message it just stops. On any other task a
+    // message is an ordinary reply, and Send beside Interject is a question that leaves the work running.
     const b = (req.body ?? {}) as Record<string, any>;
     const interject = !!b.interject && !isDiscussion(task) && task.state === 'active';
-    const pause = interject && !!b.pause;
+    if (interject && !text && !files.rows.length) {
+      const res = await taskAction(task, 'interrupt');
+      if (res.error) return bad(reply, res.error);
+      return { ok: true, interject: true, paused: true };
+    }
+    if (!text && !files.rows.length) return bad(reply, 'Empty message');
+    const pause = interject;
     if (pause) {
       setTaskState(task, 'paused', USER, 'paused with an interjection, to read before the work goes on');
       onTaskDecision(task, 'interrupt');
@@ -355,9 +460,13 @@ export async function sendThreadMessage(task: Row, text: string, files: Row[], i
   const tag = isDiscussion(task) ? 'discussion-message' : 'task-message';
   const attr = isDiscussion(task) ? 'discussion' : 'task';
   // A discussion about a Spec entry names it, and its first message says what the discussion is for (specdiscuss.ts).
+  // In a Spec Review, Revise or Create, a bare "stop" or "continue" stops or continues it (specwork.ts).
+  onSpecWorkMessage(task, text);
   const spec = specMessageExtras(task);
   const flags = interject ? ` interjection="true"${interject.pause ? ' paused="true"' : ''}` : '';
   const note = interject?.pause ? `\n<helm-note>${ACTIONS.interrupt.note(getTask(task.id)!)}</helm-note>` : '';
-  await sendToAgent(rootAgent(project).id, `<${tag} ${attr}="${task.id}" title="${title}"${flags}${spec.attrs}>\n${text}${spec.context}\n</${tag}>${note}`, { kind: 'user', name: 'You' }, files, false, viewing);
+  // Not an interjection on work that is under way: a question or remark beside it (the History's Send).
+  const aside = !interject && !isDiscussion(task) && task.state === 'active' ? '\n<helm-note>Sent with Send, not Interject: answer it in the thread without changing the work, unless the exchange leads to a change.</helm-note>' : '';
+  await sendToAgent(rootAgent(project).id, `<${tag} ${attr}="${task.id}" title="${title}"${flags}${spec.attrs}>\n${text}${spec.context}\n</${tag}>${note}${aside}`, { kind: 'user', name: 'You' }, files, false, viewing);
   touchProject(task.project_id);
 }

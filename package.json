@@ -12,7 +12,10 @@
     "check:sessions": "node server/checks/sessions.check.ts",
     "check:ui-skill": "node server/checks/ui-skill.check.ts",
     "check:pins": "node server/checks/pins.check.ts",
-    "check:holders": "node server/checks/holders.check.ts"
+    "check:holders": "node server/checks/holders.check.ts",
+    "check:split": "node server/checks/split.check.ts",
+    "check:search-speed": "node server/checks/searchbench.check.ts",
+    "check:hostwork": "node server/checks/hostwork.check.ts"
   },
   "keywords": [],
   "author": "",

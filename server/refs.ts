@@ -80,7 +80,8 @@ export function resolveRef(id: string): RefInfo | null {
     return d ? base('doc', d, d.title, d.status, route('p', d.project_id, 'spec', d.id)) : null;
   }
   if (prefix === 'pv') {
-    const p = get('SELECT * FROM previews WHERE id = ?', id);
+    // An old id grouped into a preview as an earlier version (store.ts) shows that preview.
+    const p = get('SELECT * FROM previews WHERE id = ?', id) ?? get('SELECT p.* FROM preview_versions v JOIN previews p ON p.id = v.preview_id WHERE v.old_id = ?', id);
     return p ? base('preview', p, p.title, '', route('p', p.project_id, 'previews', p.id), previewThumb(p)) : null;
   }
   if (prefix === 'rp') {

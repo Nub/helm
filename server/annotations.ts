@@ -4,10 +4,11 @@ import { ARTIFACT_DIR } from './config.ts';
 import { all, get, newId, now, run } from './db.ts';
 import type { Row } from './db.ts';
 import { attachmentPath, attachmentView, getAttachment, importFile, pendingAttachments } from './attachments.ts';
-import { rootAgent, sendToAgent } from './runtime.ts';
+import { rootAgent, sendToAgent } from './agents.ts';
 import { getProject } from './store.ts';
 import { sendThreadMessage } from './taskapi.ts';
 import { getTask, isDiscussion } from './tasks.ts';
+import { dateTimeText } from './clock.ts';
 
 /**
  * Feedback drawn on an image: the user marks up a preview's image (one side of a comparison, a guide step's
@@ -113,7 +114,7 @@ export function sourcePhrase(kind: string, side: string, title: string, sideLabe
  */
 export function feedbackText(input: { what: string; width: number; height: number; comment: string; marks: Mark[]; notes: Note[]; continues?: number | null }): string {
   const out: string[] = [`Feedback drawn on ${input.what} (${input.width}×${input.height} px).`];
-  if (input.continues) out.push(`This continues the feedback the user drew on the same image on ${new Date(input.continues).toUTCString()}; the marks and notes below are the complete set now.`);
+  if (input.continues) out.push(`This continues the feedback the user drew on the same image on ${dateTimeText(input.continues)}; the marks and notes below are the complete set now.`);
   if (input.comment.trim()) out.push(input.comment.trim());
   const byId = new Map(input.marks.map((m) => [m.id, m]));
   if (input.notes.length) {

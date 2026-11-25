@@ -5,6 +5,7 @@ import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } 
 import { parse as parseToml } from 'smol-toml';
 import { parse as parseYaml } from 'yaml';
 import { GH_PATH } from './config.ts';
+import { dateText } from './clock.ts';
 
 /**
  * Report source adapters. Each turns one kind of outside source (GitHub issues,
@@ -165,7 +166,7 @@ const github: Adapter = {
         if (Array.isArray(comments) && comments.length) {
           body += `\n\n---\n\n### Comments\n`;
           for (const cm of comments) {
-            body += `\n**${str(cm.user?.login) || 'someone'}** (${str(cm.created_at).slice(0, 10)}):\n\n${str(cm.body).trim()}\n`;
+            body += `\n**${str(cm.user?.login) || 'someone'}** (${Date.parse(str(cm.created_at)) ? dateText(Date.parse(str(cm.created_at))) : str(cm.created_at).slice(0, 10)}):\n\n${str(cm.body).trim()}\n`;
             images.push(...imageUrls(str(cm.body_html), str(cm.body)).filter((u) => !images.some((x) => x.url === u.url)));
           }
         }

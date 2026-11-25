@@ -1,14 +1,22 @@
 import { all, get, newId, now, run, tx } from './db.ts';
 import type { Row } from './db.ts';
+import { noteFollowups, recordTaskTelemetry } from './telemetry.ts';
 import { reportsTaskDone } from './reports.ts';
 import { applyImportance } from './spec.ts';
 import { answerAttachments, attachmentView, listAttachments, messageAttachments, taskAttachmentCount } from './attachments.ts';
-import { agentView, inboxView, touchProject, withFeedback } from './store.ts';
+import { agentView, alongsideLine, checklistProgress, currentTool, driverView, getChecklist, inboxView, progressOn, taskLine, touchProject, withFeedback } from './store.ts';
 import { holderView, needsView } from './requests.ts';
 import { watchView } from './taskwatch.ts';
 import { findUserAsks } from './userasks.ts';
 import { notifyPlanReady, notifyTaskDone, safe } from './notify.ts';
-import { proposalSummary, proposalView, renderProposal } from './pins.ts';
+import { ringBell } from './bell.ts';
+import { blockedReason, nowReady, waitsView } from './waits.ts';
+import { proposalSummary, proposalView, renderProposal, reviewView } from './pins.ts';
+import { clockText } from './clock.ts';
+import { durationText, shipText, taskTimes } from './worktime.ts';
+import { checkAtRest, stateRefusal, taskHeld } from './projectmode.ts';
+import { taskTokens } from './usage.ts';
+import { checkLine } from './progress.ts';
 
 /**
  * Tasks: the units of work the user manages. Each has a state, a place in the
@@ -33,7 +41,7 @@ export const STATE_LABEL: Record<string, string> = {
   done: 'Done',
   dropped: 'Dropped',
   open: 'Open',
-  settled: 'Settled',
+  settled: 'Closed',
 };
 
 /**
@@ -46,7 +54,7 @@ export const isDiscussion = (t: Row) => t.kind === 'discussion';
 export const kindWord = (t: Row) => (isDiscussion(t) ? 'discussion' : 'task');
 
 /** Who did something to a task. `id` is the agent's id when an agent did it. */
-export type Author = { author: 'user' | 'director' | 'system'; name: string; id?: string };
+export type Author = { author: 'user' | 'director' | 'system' | 'project'; name: string; id?: string };
 export const USER: Author = { author: 'user', name: 'You' };
 
 /** A task or discussion by id, or by an old id that now resolves to it (task_aliases). */
@@ -62,6 +70,12 @@ export function getTask(id: string): Row | undefined {
  */
 export function agentStateChangeError(task: Row, state: string, agentId: string): string | null {
   if (state === task.state || state === 'dropped') return null;
+  // Waiting for tasks that are not done (waits.ts).
+  const blocked = state === 'active' ? blockedReason(task.id) : null;
+  if (blocked) return `${taskRef(task)} cannot become Active: ${blocked}`;
+  // Winding down, at rest or stopped: agents never make a task Active, nor line one up (projectmode.ts).
+  const held = stateRefusal(task.project_id, state, task, agentId);
+  if (held) return held;
   if (task.state === 'planning') {
     return `${taskRef(task)} is in Planning. Only the user can move it on, by pressing Approve or Start on the dashboard. Discuss it in its thread with task_post and keep the description current with the plan; you may drop it if it is no longer wanted.`;
   }
@@ -91,10 +105,12 @@ export function findTask(projectId: string, ref: string): Row | undefined {
 export const taskRef = (t: Row) => `the ${kindWord(t)} "${t.title}" [[${t.id}]]`;
 
 /** `eventId`: the conversation event this message was filed from, if any. */
-export function addTaskMessage(task: Row, by: Author, body: string, kind: 'message' | 'state' | 'summary' | 'change' | 'spec' | 'proposal' = 'message', eventId: number | null = null): number {
+export function addTaskMessage(task: Row, by: Author, body: string, kind: 'message' | 'state' | 'summary' | 'change' | 'spec' | 'proposal' | 'recipe' | 'consolidate' | 'findings' | 'entries' = 'message', eventId: number | null = null): number {
   const id = tx(() => {
     const res = run('INSERT INTO task_messages (task_id, author, author_name, kind, body, created_at, event_id) VALUES (?,?,?,?,?,?,?)', task.id, by.author, by.name, kind, body, now(), eventId);
     run('UPDATE tasks SET updated_at = ? WHERE id = ?', now(), task.id);
+    // A message in a stale discussion opens it again (discrevisit.ts).
+    if (kind === 'message') run("UPDATE tasks SET state = 'open', stale_at = NULL, revisit_count = 0, revisit_at = NULL, revisit_later = 0 WHERE id = ? AND kind = 'discussion' AND state = 'stale'", task.id);
     return Number(res.lastInsertRowid);
   });
   touchProject(task.project_id);
@@ -123,6 +139,10 @@ export function createTask(
     addTaskMessage(task, { author: 'system', name: 'Helm' }, kind === 'task' ? `${by.name} created this task as ${STATE_LABEL[input.state]}.` : `${by.name} started this discussion.`, 'state');
     return getTask(id)!;
   });
+  // Created Active with a driver: that is the driver's current task (followDriver).
+  followDriver(created.id);
+  // A task naming a recently finished one is its follow-up (telemetry.ts).
+  if (created.kind === 'task') noteFollowups(created);
   return created;
 }
 
@@ -137,11 +157,39 @@ export function setTaskState(task: Row, state: string, by: Author, why = '') {
     else run('UPDATE tasks SET paused_by = NULL, paused_from = NULL WHERE id = ?', task.id);
     addTaskMessage(task, { author: 'system', name: 'Helm' }, `${by.name} moved it from ${STATE_LABEL[task.state]} to ${STATE_LABEL[state]}${why ? `: ${why}` : '.'}`, 'state');
     if (state === 'done') {
-      const fixed = reportsTaskDone(task.id);
+      // What was fixed goes to each of its reports with the status (reports.ts).
+      const fixed = reportsTaskDone(task.id, task.status_summary ?? '');
       if (fixed) addTaskMessage(task, { author: 'system', name: 'Helm' }, `Marked ${fixed} linked report${fixed === 1 ? '' : 's'} fixed.`, 'state');
     }
   });
-  if (state === 'done') safe(() => notifyTaskDone(getTask(task.id) ?? task, stretchStart));
+  // The user's bell on it rings once (bell.ts); otherwise Done goes by the general setting.
+  let rang = false;
+  safe(() => void (rang = ringBell(task, state, by.author === 'system')));
+  if (state === 'done' && !rang) safe(() => notifyTaskDone(getTask(task.id) ?? task, stretchStart));
+  // The last open task another waited for is done: that one is ready, in its thread and to the director (waits.ts).
+  if (state === 'done') {
+    for (const r of nowReady(task.id)) {
+      addTaskMessage(r, { author: 'system', name: 'Helm' }, `Ready: everything it waited for is done (last: ${taskRef(task)}).`, 'state');
+      void import('./agents.ts').then((a) => a.tellDirector(r.project_id, `${taskRef(r)} is ready: everything it waited for is done (last: ${taskRef(task)}). Take it up in queue order.`)).catch(() => {});
+    }
+  }
+  if (state === 'active') followDriver(task.id);
+  // The user's own Start, Approve or Resume is never refused by the director's rules (workrules.ts); a task with no tier
+  // yet takes the default.
+  if (state === 'active' && by.author === 'user') run("UPDATE tasks SET tier = 'skilled', tier_reason = 'started by the user' WHERE id = ? AND tier IS NULL", task.id);
+  // The last Active task settling may end a wind down (projectmode.ts).
+  if (task.state === 'active') void checkAtRest(task.project_id).catch((err) => console.error('At-rest check failed:', err));
+}
+
+/**
+ * An agent's current task is the Active task it drives: a standing agent the director hands task after task (as
+ * driver) files its previews, requests, reviews, tile answers and complete_task under the one it is on now, not the
+ * one it was spawned for. Called when a task becomes Active and when its driver changes. Top-level agents keep none.
+ */
+export function followDriver(taskId: string) {
+  const t = getTask(taskId);
+  if (!t || t.kind !== 'task' || t.state !== 'active' || !t.driver_agent_id) return;
+  run("UPDATE agents SET task_id = ?, updated_at = ? WHERE id = ? AND parent_id IS NOT NULL AND status != 'closed' AND (task_id IS NULL OR task_id != ?)", t.id, now(), t.driver_agent_id, t.id);
 }
 
 /** Replace the status summary; every summary is also kept in the thread as it was written. */
@@ -160,6 +208,8 @@ export function setTaskSummary(task: Row, summary: string, by: Author) {
 export function noteTaskState(taskId: string, from: string | null, state: string, at = now()) {
   run('INSERT INTO task_states (task_id, from_state, state, at) VALUES (?,?,?,?)', taskId, from, state, at);
   applyTiming(taskId, from, state, at);
+  // A finished task's telemetry row (telemetry.ts); reopened and finished again, it is recorded again.
+  if (state === 'done' || state === 'dropped') recordTaskTelemetry(taskId);
 }
 
 function applyTiming(taskId: string, from: string | null, state: string, at: number) {
@@ -210,13 +260,21 @@ export function activeMs(t: Row, at = now()): number {
   return (t.active_ms ?? 0) + (t.active_since ? Math.max(0, at - t.active_since) : 0);
 }
 
-/** "started 14:02 · running 37 min" / "took 1 h 12 min", for agents. */
+/** A task's work time for the page (work_ms, and work_since while it works now) and its time to ship once done. */
+export function workView(t: Row): { work_ms: number | null; work_since: number | null; ship_ms: number | null; ship_text: string } {
+  if (t.kind !== 'task' || !t.started_at) return { work_ms: null, work_since: null, ship_ms: null, ship_text: '' };
+  const x = taskTimes(t);
+  return { work_ms: x.workMs, work_since: x.workSince, ship_ms: x.shipMs, ship_text: shipText(x) };
+}
+
+/** "started 2:02 pm · running 37 min" / "took 1 h 12 min of work", for agents. Work time, never waiting on the user. */
 export function timingText(t: Row): string {
-  const dur = (ms: number) => { const m = Math.round(ms / 60000); return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`; };
-  const at = (ts: number) => new Date(ts).toLocaleString('en-GB', { weekday: 'short', hour: '2-digit', minute: '2-digit' });
-  if (t.state === 'done' && t.started_at) return `started ${at(t.started_at)}, took ${dur(activeMs(t))} of active time`;
-  if (t.state === 'active' && t.started_at) return `started ${at(t.started_at)}, running ${dur(activeMs(t))}`;
-  if (t.started_at) return `started ${at(t.started_at)}, ${dur(activeMs(t))} active so far`;
+  const at = (ts: number) => clockText(ts);
+  const x = taskTimes(t);
+  const work = durationText(x.workMs);
+  if (t.state === 'done' && t.started_at) return `started ${at(t.started_at)}, took ${work} of work; ${shipText(x)}`;
+  if (t.state === 'active' && t.started_at) return `started ${at(t.started_at)}, ${work} of work so far`;
+  if (t.started_at) return `started ${at(t.started_at)}, ${work} of work so far`;
   return '';
 }
 
@@ -283,16 +341,19 @@ export function previewRow(p: Row): Row {
   return withFeedback({ id: p.id, project_id: p.project_id, kind: p.kind, title: p.title, caption: p.caption, file: p.file, content: p.content, agent_id: p.agent_id, task_id: p.task_id, created_at: p.created_at });
 }
 
-/** The most recent preview(s) of a task: the last one and any posted with it (within two minutes). */
-export function latestPreviews(taskId: string): Row[] {
-  const recent = all('SELECT * FROM previews WHERE task_id = ? ORDER BY created_at DESC LIMIT 6', taskId);
-  if (!recent.length) return [];
-  return recent.filter((p) => recent[0].created_at - p.created_at < 2 * 60 * 1000).reverse().map(previewRow);
-}
-
 /** A task row with what the Overview shows about it. */
-export function taskView(t: Row): Row {
-  const driver = t.driver_agent_id ? get('SELECT * FROM agents WHERE id = ?', t.driver_agent_id) : undefined;
+export function taskView(t: Row, drivers?: Map<string, Row | null>): Row {
+  // A list shares its drivers (a builder drives many tasks): each is read once per list.
+  // Keyed by driver and task: on a task it runs alongside, a driver shows that task's worklist, not its own task's.
+  const driverOf = (id: string): Row | null => {
+    const key = `${id}:${t.id}`;
+    if (drivers?.has(key)) return drivers.get(key)!;
+    const row = get('SELECT * FROM agents WHERE id = ?', id);
+    const v = row ? driverView(row, t.id) : null;
+    drivers?.set(key, v);
+    return v;
+  };
+  const driver = t.driver_agent_id ? driverOf(t.driver_agent_id) : null;
   const doc = t.doc_id ? get('SELECT id, kind, title, status FROM docs WHERE id = ?', t.doc_id) : undefined;
   // Every goal or design the task implements: the main one (mirrored into doc_links) and any others.
   const docs = all("SELECT id, kind, title, status FROM docs WHERE id IN (SELECT doc_id FROM doc_links WHERE task_id = ? AND relation = 'implements')", t.id);
@@ -301,7 +362,7 @@ export function taskView(t: Row): Row {
   const needs = needsView(t.id);
   return {
     ...t,
-    driver: driver ? (({ id, name, status, status_line, progress, checklist }) => ({ id, name, status, status_line, progress, checklist }))(agentView(driver)) : null,
+    driver,
     doc: doc ?? null,
     docs,
     last: last ?? null,
@@ -310,9 +371,25 @@ export function taskView(t: Row): Row {
     ...unfiledNeed(t, needs.needs_response),
     attach_count: taskAttachmentCount(t.id),
     ...watchView(t),
+    ...waitsView(t.id),
     ...linkedViews(t),
+    // Its parts (taskparts.ts): "N parts" by the title when more than one.
+    parts: Number(get('SELECT COUNT(*) AS n FROM task_parts WHERE task_id = ?', t.id)?.n ?? 0),
+    // A discussion opened to find a task's Spec entry ("No Spec entry · Discuss", specdiscuss.ts): that task.
+    about: t.about_task ? (get('SELECT id, title, state, kind FROM tasks WHERE id = ?', t.about_task) ?? null) : null,
     proposal: proposalSummary(t.id),
     holder: holderView(t),
+    // Not running while the project winds down or is stopped, with nobody on it (projectmode.ts).
+    held: taskHeld(t),
+    // Tokens its agents' turns used while on it (usage.ts).
+    tokens: taskTokens(t.id),
+    // Why the progress check flagged it, or null (progress.ts).
+    check: checkLine(t),
+    // Work time (never time it waited on the user) and, once done, time to ship (worktime.ts).
+    ...workView(t),
+    // The reports it is for, and the task it was merged into (merge.ts).
+    report_count: Number(get('SELECT COUNT(*) AS n FROM reports WHERE task_id = ?', t.id)?.n ?? 0),
+    merged_into_title: t.merged_into ? (get('SELECT title FROM tasks WHERE id = ?', t.merged_into)?.title ?? null) : null,
   };
 }
 
@@ -330,7 +407,8 @@ export function unfiledNeed(t: Row, openRequests: number): { waiting_on_user_wit
 }
 
 export function listTasks(projectId: string): Row[] {
-  return all(`SELECT * FROM tasks WHERE project_id = ? AND kind = 'task' ${QUEUE_ORDER}`, projectId).map(taskView);
+  const drivers = new Map<string, Row | null>();
+  return all(`SELECT * FROM tasks WHERE project_id = ? AND kind = 'task' ${QUEUE_ORDER}`, projectId).map((t) => taskView(t, drivers));
 }
 
 /**
@@ -364,14 +442,17 @@ export function taskTimeline(taskId: string): Row[] {
   const items: Row[] = [];
   const files = messageAttachments(taskId);
   const answerFiles = answerAttachments(taskId);
+  // A proposed conclusion shows its Conclude button only while the discussion is open.
+  const open = get("SELECT 1 AS x FROM tasks WHERE id = ? AND kind = 'discussion' AND state = 'open'", taskId);
   for (const m of all('SELECT * FROM task_messages WHERE task_id = ? ORDER BY id', taskId)) {
-    items.push({ key: `m${m.id}`, ts: m.created_at, type: m.kind, author: m.author, name: m.author_name, body: m.body, filed: m.event_id != null, interject: !!m.interject, attachments: files.get(m.id) ?? (m.event_id != null ? listAttachments('event', String(m.event_id)).map(attachmentView) : []) });
+    items.push({ key: `m${m.id}`, ts: m.created_at, type: m.kind, author: m.author, name: m.author_name, body: m.body, filed: m.event_id != null, interject: !!m.interject, conclude: open && m.conclude ? { task: taskId, message: m.id } : undefined, attachments: files.get(m.id) ?? (m.event_id != null ? listAttachments('event', String(m.event_id)).map(attachmentView) : []) });
   }
   // Requests to the user (questions, permissions, team changes), each with its answer or outcome. A question's answer
   // is also the user's turn in the conversation, so it shows as their message.
-  for (const i of all('SELECT inbox.*, agents.name AS agent_name FROM inbox LEFT JOIN agents ON agents.id = inbox.agent_id WHERE inbox.task_id = ?', taskId)) {
+  // Held ones (filed this turn, requests.ts) are not shown yet; a withdrawn one shows with its reason, with no answer.
+  for (const i of all("SELECT inbox.*, agents.name AS agent_name FROM inbox LEFT JOIN agents ON agents.id = inbox.agent_id WHERE inbox.task_id = ? AND inbox.status != 'held'", taskId)) {
     items.push({ key: `q${i.id}`, ts: i.created_at, type: 'question', inbox_id: i.id, request: inboxView(i) });
-    if (i.answered_at && (i.kind === 'question' || i.kind === 'action')) items.push({ key: `a${i.id}`, ts: i.answered_at, type: 'answer', title: i.title, status: i.status, body: i.answer, attachments: answerFiles.get(i.id) ?? [] });
+    if (i.answered_at && i.status !== 'withdrawn' && (i.kind === 'question' || i.kind === 'action')) items.push({ key: `a${i.id}`, ts: i.answered_at, type: 'answer', title: i.title, status: i.status, body: i.answer, attachments: answerFiles.get(i.id) ?? [] });
   }
   // Questions and review requests between agents working on it (consults.ts), each as one row with its answer.
   for (const c of all('SELECT c.*, a.name AS asker_name, m.name AS manager_name FROM consults c LEFT JOIN agents a ON a.id = c.asker_id LEFT JOIN agents m ON m.id = c.manager_id WHERE c.task_id = ?', taskId)) {
@@ -390,18 +471,33 @@ export function taskTimeline(taskId: string): Row[] {
 }
 
 export function taskDetail(taskId: string) {
-  const t = getTask(taskId);
+  let t = getTask(taskId);
   if (!t) return null;
-  const agents = all('SELECT * FROM agents WHERE task_id = ? OR id = ? ORDER BY created_at', t.id, t.driver_agent_id ?? '').map(agentView);
+  // A task merged into another (merge.ts): its link opens the kept task, where its history shows folded.
+  for (let i = 0; i < 8 && t.merged_into; i++) t = getTask(t.merged_into) ?? t;
+  // Only what belongs to this task (task_aeff7900b5): an agent whose current task is another (a builder running this
+  // one alongside) shows this task's worklist and status line, and nothing of its own task's line, progress or tool.
+  const agents = all('SELECT * FROM agents WHERE task_id = ? OR id = ? ORDER BY created_at', t.id, t.driver_agent_id ?? '').map((a): Row => {
+    const v = agentView(a);
+    if (a.task_id === t.id) return { ...v, on_task: true, current_tool: v.status === 'working' ? currentTool(a.id, t.id) : null };
+    // Its line for this task (report_status task, or a subagent's final report on it: agent_task_status).
+    const checklist = getChecklist(a.id, t.id);
+    const line = alongsideLine(a.id, t.id);
+    return { ...v, on_task: false, status_line: line.status_line, progress: progressOn(t.id, checklist, line.progress), checklist, current_tool: null };
+  });
   // A task made separately from a discussion shows that discussion inline, read-only, from the origin row.
   const origins = isDiscussion(t)
     ? []
     : linkedViews(t).discussions.map((o) => {
         const row = getTask(o.id)!;
         return { id: row.id, title: row.title, kind: row.kind, state: row.state, timeline: discussionEra(row) };
-      });
+      })
+      .concat(
+        // Tasks merged into this one: each one's whole history, as a folded part of this one's.
+        all('SELECT * FROM tasks WHERE merged_into = ? ORDER BY created_at', t.id).map((m) => ({ id: m.id, title: m.title, kind: m.kind, state: m.state, timeline: taskTimeline(m.id), merged: true })),
+      );
   const timeline = taskTimeline(t.id);
-  return { task: taskView(t), agents, latest: latestPreviews(t.id), proposal: proposalView(t.id), timeline, origins, changes: recentChanges(timeline, t.became_task_at ?? 0) };
+  return { task: taskView(t), agents, proposal: proposalView(t.id), review: reviewView(t.id), timeline, origins, changes: recentChanges(timeline, t.became_task_at ?? 0) };
 }
 
 /** One line in a task's "What changed": `key` is the history entry it jumps to. */
@@ -430,6 +526,14 @@ export function notableChange(i: Row): Change | null {
       return c('spec', 'Changed the Spec');
     case 'proposal':
       return c('spec', 'Proposed an edit to the Spec');
+    case 'recipe':
+      return c('spec', 'Proposed a release recipe');
+    case 'consolidate':
+      return c('spec', 'Proposed consolidating tasks');
+    case 'findings':
+      return c('spec', 'Posted Spec review findings');
+    case 'entries':
+      return c('spec', 'Proposed new Spec entries');
     case 'message':
       return i.author === 'user' && i.interject ? c('interject', `You interjected: ${i.body}`) : null;
     case 'journal':
@@ -458,29 +562,57 @@ export function recentChanges(timeline: Row[], since = 0, limit = 6): Change[] {
     .slice(0, limit);
 }
 
-/** Plain-text list of tasks for agents. */
-export function renderTasks(projectId: string): string {
-  const tasks = listTasks(projectId);
-  if (!tasks.length) return 'No tasks yet.';
-  return tasks
-    .map((t, i) => {
-      const level = ['', 'Minor', 'Low', 'Medium', 'High', 'Critical'][t.importance] ?? '';
-      const bits = [`${i + 1}. [${t.state}] ${t.title} ([[${t.id}]]${level && t.kind !== 'discussion' ? `, importance ${level}${t.importance_pinned ? ' pinned by the user' : ''}` : ''})`];
-      if (t.importance_reason && t.importance >= 4) bits.push(`   why ${level}: ${t.importance_reason}`);
-      const timing = timingText(t);
-      if (timing) bits.push(`   timing: ${timing}`);
-      if (t.origin === 'away') bits.push(`   found while the user was away: ${t.origin_note}`);
-      if (t.driver) bits.push(`   driver: ${t.driver.name} (${t.driver.status})`);
-      if (t.doc) bits.push(`   implements: ${t.doc.title} [[${t.doc.id}]]`);
-      if (t.status_summary) bits.push(`   status: ${t.status_summary.replace(/\s+/g, ' ').slice(0, 300)}`);
-      if (t.awaiting_review) bits.push(`   ${t.review_agent} finished it; awaiting your review: settle it (done with a status summary, or send it back)`);
-      else if (t.stalled) bits.push('   stalled: nobody is working on it');
-      if (t.needs_response) bits.push(`   needs response: ${t.needs_response} open request(s) to the user`);
-      const proposal = renderProposal(t.id);
-      if (proposal) bits.push(proposal.replace(/^/gm, '   '));
-      return bits.join('\n');
-    })
-    .join('\n');
+/** Tasks per page of list_tasks. */
+export const TASKS_PAGE = 25;
+const CLOSED_STATES = ['done', 'dropped'];
+
+/**
+ * Plain-text list of tasks for agents. By default only open ones (not done, dropped or merged), each with the lines
+ * that need action; `all` adds closed ones, one line each. Paged (TASKS_PAGE a page), so it stays short however
+ * long the project's history is.
+ */
+export function renderTasks(projectId: string, opts: { all?: boolean; page?: number; state?: string[]; driver?: string } = {}): string {
+  const every = listTasks(projectId);
+  const states = opts.state?.length ? opts.state : null;
+  // Naming done or dropped in `state` lists them without `all`.
+  const wantClosed = opts.all || !!states?.some((s) => CLOSED_STATES.includes(s));
+  let tasks = wantClosed ? every : every.filter((t) => !t.merged_into && !CLOSED_STATES.includes(t.state));
+  const closed = every.length - tasks.length;
+  const filtered = !!(states || opts.driver);
+  if (states) tasks = tasks.filter((t) => states.includes(t.state));
+  if (opts.driver) tasks = tasks.filter((t) => t.driver?.id === opts.driver);
+  if (!tasks.length && filtered) return 'No tasks match the filters (state, driver). find searches by words.';
+  if (!tasks.length) return every.length ? `No open tasks. all: true lists the ${closed} done or dropped.` : 'No tasks yet.';
+  const pages = Math.ceil(tasks.length / TASKS_PAGE);
+  const page = Math.min(Math.max(1, Math.floor(opts.page ?? 1)), pages);
+  const from = (page - 1) * TASKS_PAGE;
+  const lines = tasks.slice(from, from + TASKS_PAGE).map((t, i) => {
+    const level = ['', 'Minor', 'Low', 'Medium', 'High', 'Critical'][t.importance] ?? '';
+    const head = `${from + i + 1}. [${t.merged_into ? `merged into [[${t.merged_into}]]` : t.state}] ${t.title} ([[${t.id}]]${level && t.kind !== 'discussion' ? `, importance ${level}${t.importance_pinned ? ' pinned by the user' : ''}` : ''})`;
+    // Closed tasks: the one line.
+    if (t.merged_into || CLOSED_STATES.includes(t.state)) return head;
+    const bits = [head];
+    if (t.importance_reason && t.importance >= 4) bits.push(`   why ${level}: ${t.importance_reason}`);
+    const timing = timingText(t);
+    if (timing) bits.push(`   timing: ${timing}`);
+    if (t.origin === 'away') bits.push(`   found while the user was away: ${t.origin_note}`);
+    if (t.driver) bits.push(`   driver: ${t.driver.name} (${t.driver.status})`);
+    if (t.doc) bits.push(`   implements: ${t.doc.title} [[${t.doc.id}]]`);
+    if (t.report_count) bits.push(`   from ${t.report_count} report(s)`);
+    if (t.risky === 1) bits.push('   marked for review: request_review before it lands');
+    if (t.status_summary) bits.push(`   status: ${t.status_summary.replace(/\s+/g, ' ').slice(0, 200)}`);
+    if (t.awaiting_review) bits.push(`   ${t.review_agent} finished it; awaiting your review: settle it (done with a status summary, or send it back)`);
+    else if (t.stalled) bits.push('   stalled: nobody is working on it');
+    if (t.needs_response) bits.push(`   needs response: ${t.needs_response} open request(s) to the user`);
+    const proposal = renderProposal(t.id);
+    if (proposal) bits.push(proposal.replace(/^/gm, '   '));
+    return bits.join('\n');
+  });
+  const notes = [
+    pages > 1 ? `Page ${page} of ${pages}${page < pages ? `; page: ${page + 1} for the next` : ''}.` : '',
+    !wantClosed && closed ? `${closed} done or dropped not listed (all: true lists them).` : '',
+  ].filter(Boolean);
+  return lines.join('\n') + (notes.length ? `\n\n${notes.join(' ')}` : '');
 }
 
 /** How many of a project's tasks say they need the user with nothing filed (see unfiledNeed). */

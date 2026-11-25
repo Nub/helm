@@ -2,7 +2,7 @@
 // Screenshot routes of a scratch Helm, logged in, at several device sizes, and audit each for phone layout problems.
 //
 //   node shoot.mjs [--name N] [--routes '#/,#/p/{project}/tasks'] [--devices phone,desktop] [--out DIR]
-//                  [--full] [--theme dark|light] [--wait MS] [--no-audit] [--url URL --token T]
+//                  [--full] [--theme dark|light] [--tz IANA] [--wait MS] [--no-audit] [--url URL --token T]
 //
 // {project} in a route is replaced by the first project's id. Prints one JSON line per shot:
 // {"route", "device", "file", "errors", "audit"} and exits 1 if any page threw a script error.
@@ -39,7 +39,7 @@ const browser = await launch();
 let failed = false;
 try {
   for (const device of devices) {
-    const page = await browser.page({ device, base: url, cookie, theme: String(o.theme ?? 'dark') });
+    const page = await browser.page({ device, base: url, cookie, theme: String(o.theme ?? 'dark'), timezone: o.tz ? String(o.tz) : undefined });
     for (const route of routes) {
       page.errors.length = 0;
       await page.go(route, { wait: Number(o.wait ?? 700) });

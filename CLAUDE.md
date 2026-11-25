@@ -15,12 +15,42 @@ what it does and how to run it. This file is what an agent working on Helm itsel
   that cannot touch the live one, logged-in screenshots at 390 px and desktop, phone emulation and a Claude stand-in.
   Do not write your own scratch-server or browser scripts; extend the skill (`npm run check:ui-skill` checks it).
 - A running Helm is deployed separately from this checkout (see README, "NixOS" and "Live update"). If you are an agent being run by it: do not edit, restart or redeploy it unless the user asks; restarting it stops every running agent, you included. Deploying is: commit, point the `release` branch at the commit (not master), and the owner presses Update now on the dashboard's Helm page. No agent starts the update. The Update panel and `/api/health` must survive on every commit `release` points at, or the next update has no button and its health check fails. Check packaging changes with `nix build`.
+- With `services.helm.split` (the default) a running Helm is two units: `helm.service` (the runner, which holds the
+  agents) and `helm-web.service` (the dashboard); restarting the runner stops every agent, restarting the web service
+  none. An update whose build has the running runner's hash (lib/helm/runner.json, server/closure.ts) restarts only the
+  web service; one that changes the runner's code (anything server/runner-main.ts imports, tools and prompts included)
+  restarts it once agents are idle. `npm run check:split` and `bash nix/live-update.check.sh <pre-split rev>` check the
+  split and the update paths.
 - Machine-specific notes (paths, host names, how this install is deployed) live in `CLAUDE.local.md`, which is not tracked: read it if it exists, and keep such details out of tracked files.
 - The Nix package (`nix/package.nix`) only sees files git tracks; new files must be added before `nix build`.
   It reads `package-lock.json` directly, so dependency changes need no hash update. Nothing at runtime may write
   next to the code (it is read-only in the Nix store): all state goes under `HELM_DATA`.
 
+## Layout
+
+- `server/runtime.ts`  agent sessions: start, resume, message routing, permission requests
+- `server/tools.ts`    the tools agents use to report to the dashboard (worklist, previews, inbox, journal, spawn)
+- `server/structure.ts` team templates and the system prompt each role gets
+- `server/api.ts`      HTTP API and the live update stream
+- `server/runner.ts`   the runner and the web service as two processes: commands, live updates and heartbeat through the database
+- `web/src`            the React app
+- `nix/package.nix`    the Nix package; `nix/module.nix` the NixOS module (`services.helm`)
+- `docs/screenshots`   the README's pictures (dark theme, from a scratch copy with neutral project names)
+
 ## How it fits together
+
+- `server/runner.ts`: Helm runs as one process (`helm`, `helm all`) or as two (`helm runner`, `helm web`; server/main.ts
+  starts server/runner-main.ts and/or server/web-main.ts). The web service never loads runtime.ts: the API reaches agents
+  through server/agents.ts, which the web service binds to commands in the database (`runner_commands`) and the runner
+  to the runtime. The runner's live updates reach the web service through `bus_log`; its heartbeat is `runner_state`.
+  Nothing outside the runner's modules may import runtime.ts, and runner-main.ts must not import the API (that would
+  put the web side into the runner's hash, and every update would restart agents).
+- Skew between the two: an update that does not change the runner's code leaves it running an older build than the
+  dashboard, possibly for many updates. A change to what a shared table or column means, or to how the dashboard writes
+  rows the runner reads (or the reverse), must therefore touch the runner's closure: bump `SKEW_EPOCH` in
+  server/skew.ts, so the update restarts the runner. Example: the nested Spec sections (6f9eff6) changed how section
+  rows are parented; the API writes them, the runner's tools read them. Keep write transactions short: the other
+  process waits on them with its event loop stopped (server/db.ts tx).
 
 - `server/runtime.ts`: one Claude Agent SDK `query()` per agent, fed by an input queue. The process is closed after
   `idleSeconds` and resumed from `agents.session_id` on the next message. A worker's end-of-turn result is delivered

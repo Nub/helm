@@ -1,16 +1,18 @@
 import { execFile, spawn } from 'node:child_process';
+import { buildFiles, buildLabel } from './testbuilds.ts';
 import { existsSync, lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync } from 'node:fs';
 import { opendir } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
 import { basename, dirname, isAbsolute, join, normalize, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { bus } from './bus.ts';
-import { DATA_DIR } from './config.ts';
+import { ARTIFACT_DIR, DATA_DIR } from './config.ts';
 import { all, db, get, newId, now, run } from './db.ts';
 import type { Row } from './db.ts';
 import { LIVE } from './liveupdate.ts';
 import { addJournal, getProject } from './store.ts';
 import { gb, holdsFor } from './disk.ts';
+import { dashboardBytes, fileDir } from './dashboards.ts';
 
 /**
  * Disk tracking: what each project, its worktrees and the folders its agents registered take on disk, and what Helm
@@ -55,6 +57,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
   fresh INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS artifacts_project ON artifacts(project_id, removed_at);
+CREATE INDEX IF NOT EXISTS artifacts_agent ON artifacts(agent_id);
 -- du results: bytes on disk under a path, when measured, or why it failed.
 CREATE TABLE IF NOT EXISTS disk_sizes (
   path TEXT PRIMARY KEY,
@@ -63,6 +66,9 @@ CREATE TABLE IF NOT EXISTS disk_sizes (
   error TEXT NOT NULL DEFAULT ''
 );
 `);
+// A worktree's fork point from the main checkout's branch when registered: the base for what a task changed in it
+// (tilescope.ts), which merge-base alone loses once the branch is merged.
+if (!(db.prepare('PRAGMA table_info(artifacts)').all() as { name: string }[]).some((c) => c.name === 'base_commit')) db.exec('ALTER TABLE artifacts ADD COLUMN base_commit TEXT');
 
 export const ARTIFACT_KINDS = ['worktree', 'build', 'scratch', 'other'] as const;
 export type ArtifactKind = (typeof ARTIFACT_KINDS)[number];
@@ -653,6 +659,11 @@ export async function registerArtifact(
       id, project.id, agentId, p, input.kind, input.disposable ? 1 : 0, input.note ?? '', now(), branch, st.birthtimeMs || null, fresh, wtNow?.branch ?? null,
     );
   }
+  if (wtNow && !wtNow.main && wtNow.head) {
+    const main = (await worktreesOf(project.path)).known.find((w) => w.main);
+    const base = main?.head ? (await git(project.path, 'merge-base', wtNow.head, main.head).catch(() => '')).trim() : '';
+    if (base) run('UPDATE artifacts SET base_commit = COALESCE(base_commit, ?) WHERE id = ?', base, id);
+  }
   measure(p);
   publishDisk();
   const roots = [real(project.path), real(`${project.path}-wt`), real(tmpdir())];
@@ -772,7 +783,7 @@ async function cleanNow(projectId: string, opts: CleanOpts): Promise<CleanResult
 export type UsageEntry = {
   path: string;
   label: string;
-  kind: 'project' | 'worktree' | 'artifact' | 'install' | 'tmp';
+  kind: 'project' | 'worktree' | 'artifact' | 'install' | 'tmp' | 'dashboards' | 'release' | 'testbuild';
   bytes: number | null;
   computedAt: number | null;
   measuring: boolean;
@@ -787,6 +798,10 @@ export type UsageEntry = {
   agent?: string | null;
   stray?: boolean;
   mtime?: number;
+  /** A release's files (kind release): removable from the Disk page, the release's record kept. */
+  releaseId?: string;
+  /** A test build's files (kind testbuild): removable from the Disk page, its record kept. */
+  testBuildId?: string;
 };
 
 const entry = (path: string, label: string, kind: UsageEntry['kind'], refresh: boolean, extra: Partial<UsageEntry> = {}): UsageEntry => {
@@ -817,6 +832,17 @@ export async function projectUsage(project: Row, refresh = false): Promise<{ id:
     }
     if (!existsSync(a.path)) continue;
     entries.push(entry(a.path, basename(a.path), 'artifact', refresh, { artifactKind: a.kind, disposable: !!a.disposable, note: a.note, agent: names.get(a.agent_id) ?? null }));
+  }
+  // Dashboard images and pages, kept in Helm's data folder and counted from what each refresh recorded (no du).
+  const dash = dashboardBytes(project.id);
+  if (dash) entries.push({ path: fileDir(project.id), label: 'Dashboard images and pages', kind: 'dashboards', bytes: dash, computedAt: now(), measuring: false, note: 'history kept per tile, trimmed as tiles refresh' });
+  // Release files (releases.ts), per release, newest first: an old release's can be removed, its record kept.
+  for (const r of all('SELECT r.id, r.version, SUM(a.bytes) AS n FROM releases r JOIN release_artifacts a ON a.release_id = r.id WHERE r.project_id = ? AND a.file IS NOT NULL GROUP BY r.id ORDER BY r.created_at DESC', project.id)) {
+    entries.push({ path: join(ARTIFACT_DIR, 'releases', project.id, r.id), label: `Release ${r.version} files`, kind: 'release', bytes: r.n, computedAt: now(), measuring: false, releaseId: r.id });
+  }
+  // Test builds' files (testbuilds.ts), per build: removable here, the record kept.
+  for (const { build, bytes } of buildFiles(project.id)) {
+    entries.push({ path: join(ARTIFACT_DIR, 'recipe-tests', project.id, build.id), label: `${buildLabel(build)} files`, kind: 'testbuild', bytes, computedAt: now(), measuring: false, testBuildId: build.id });
   }
   // Registered folders inside the project folder are counted in it already.
   const total = entries.filter((e) => !(e.kind === 'artifact' && inside(e.path, project.path))).reduce((n, e) => n + (e.bytes ?? 0), 0);

@@ -30,8 +30,8 @@ const itemId = (p: Row) => (p.preview_id ?? p.attachment_id) as string;
 
 function activePins(taskId: string, round?: number): Row[] {
   return round === undefined
-    ? all('SELECT * FROM pins WHERE task_id = ? AND unpinned_at IS NULL ORDER BY round, position, id', taskId)
-    : all('SELECT * FROM pins WHERE task_id = ? AND round = ? AND unpinned_at IS NULL ORDER BY position, id', taskId, round);
+    ? all('SELECT * FROM pins WHERE task_id = ? AND auto = 0 AND unpinned_at IS NULL ORDER BY round, position, id', taskId)
+    : all('SELECT * FROM pins WHERE task_id = ? AND round = ? AND auto = 0 AND unpinned_at IS NULL ORDER BY position, id', taskId, round);
 }
 
 const roundRow = (taskId: string, round: number) => get('SELECT * FROM proposal_rounds WHERE task_id = ? AND round = ?', taskId, round);
@@ -46,7 +46,7 @@ function ensureRound(taskId: string, round: number): Row {
  * waiting (a proposal can be a question alone); 0 when there is no proposal.
  */
 export function currentRound(taskId: string): number {
-  const pinned = get('SELECT MAX(round) AS r FROM pins WHERE task_id = ? AND unpinned_at IS NULL', taskId)?.r as number | null;
+  const pinned = get('SELECT MAX(round) AS r FROM pins WHERE task_id = ? AND auto = 0 AND unpinned_at IS NULL', taskId)?.r as number | null;
   const asked = get(
     "SELECT MAX(r.round) AS r FROM proposal_rounds r LEFT JOIN inbox i ON i.id = r.request_id WHERE r.task_id = ? AND (r.question != '' OR i.status = 'open')",
     taskId,
@@ -123,7 +123,7 @@ export function unpin(task: Row, refs: string[], by: Author, round?: number): { 
   const missing = pins.filter((p) => !p.pin).map((p) => p.ref);
   if (missing.length) return { error: `Nothing pinned with id ${missing.join(', ')} on ${task.title}.` };
   tx(() => {
-    for (const { pin } of pins) run('UPDATE pins SET unpinned_at = ? WHERE id = ?', now(), pin!.id);
+    for (const { pin } of pins) run('UPDATE pins SET unpinned_at = ?, unpinned_by = ? WHERE id = ?', now(), by.author === 'user' ? 'user' : by.name, pin!.id);
     run('UPDATE tasks SET updated_at = ? WHERE id = ?', now(), task.id);
   });
   const removed = pins.map((p) => p.pin!.label as string);
@@ -300,10 +300,17 @@ function thumbOf(v: Row): string | null {
   return null;
 }
 
-/** What a list row shows: up to three thumbnails, how many items, whether the linked decision is waiting, the choice. */
+/**
+ * What a list row shows: up to three thumbnails, how many items, whether the linked decision is waiting, the choice.
+ * With no proposal, the automatic "For review" pin's thumbnails (review: true, no count).
+ */
 export function proposalSummary(taskId: string): Row | null {
   const cur = currentRound(taskId);
-  if (!cur) return null;
+  if (!cur) {
+    const items = reviewPins(taskId).slice(0, 3).map(pinView).filter((x): x is Row => !!x);
+    if (!items.length) return null;
+    return { round: 0, count: 0, waiting: false, chosen: null, review: true, thumbs: items.map((i: Row) => ({ label: i.label, url: thumbOf(i), kind: i.preview?.kind })) };
+  }
   const v = roundView(taskId, cur, activePins(taskId, cur));
   return {
     round: cur,
@@ -325,3 +332,132 @@ export function renderProposal(taskId: string): string {
   if (v.earlier.length) lines.push(`  earlier rounds: ${v.earlier.map((e: Row) => `${e.round} (${e.items.length} items${e.choice ? `, chose ${e.items.find((i: Row) => i.pin_id === e.choice.pin_id)?.label ?? e.choice.text}` : ''})`).join(', ')}`);
   return lines.join('\n');
 }
+
+// ---------- the automatic "For review" pin ----------
+
+/**
+ * One rule, enforced here whenever a preview lands on a task or discussion (store.ts addPreview, from any path): its
+ * "For review" set is exactly its newest burst, and everything older is unpinned.
+ *
+ * - A burst is the task's newest previews posted within BURST_GAP_MS of each other, whoever posted them (several
+ *   agents, several turns, a builder or helper on the task), at most AUTO_MAX, oldest first.
+ * - Helm's own pins (auto = 1, round 0) outside that burst are unpinned. One the user unpinned during the burst
+ *   stays unpinned (unpinned_by 'user').
+ * - Proposal rounds pinned by hand before the burst began are unpinned too, unless their question is still open (a
+ *   linked request waiting, or a question asked and not decided): that proposal is the one exception, and it is shown
+ *   as the proposal, apart from For review.
+ */
+export const AUTO_MAX = 6;
+export const BURST_GAP_MS = 10 * 60_000;
+
+/** The task's newest burst of previews, oldest first; [] when it has none. */
+export function newestBurst(taskId: string): Row[] {
+  const recent = all('SELECT * FROM previews WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 50', taskId);
+  const burst: Row[] = [];
+  for (const p of recent) {
+    if (burst.length && (burst[burst.length - 1].created_at - p.created_at > BURST_GAP_MS || burst.length >= AUTO_MAX)) break;
+    burst.push(p);
+  }
+  return burst.reverse();
+}
+
+/** A proposal round whose question still waits on the user. */
+function roundOpen(taskId: string, round: number): boolean {
+  const r = roundRow(taskId, round);
+  if (!r) return false;
+  if (r.request_id && get("SELECT 1 AS x FROM inbox WHERE id = ? AND status IN ('open', 'held', 'director', 'check')", r.request_id)) return true;
+  return !!String(r.question ?? '').trim() && !r.decided_at;
+}
+
+/** Apply the rule to one task. Returns whether its pins changed. */
+export function reviewNow(taskId: string, at = now()): boolean {
+  const task = getTask(taskId);
+  if (!task) return false;
+  const burst = newestBurst(task.id);
+  if (!burst.length) return false;
+  const ids = new Set(burst.map((p) => p.id as string));
+  const start = burst[0].created_at as number;
+  const key = `b:${burst[0].id}`;
+  let changed = false;
+  tx(() => {
+    for (const p of all('SELECT id, preview_id FROM pins WHERE task_id = ? AND auto = 1 AND unpinned_at IS NULL', task.id)) {
+      if (ids.has(p.preview_id)) continue;
+      run("UPDATE pins SET unpinned_at = ?, unpinned_by = 'helm' WHERE id = ?", at, p.id);
+      changed = true;
+    }
+    for (const pv of burst) {
+      if (get('SELECT 1 AS x FROM pins WHERE task_id = ? AND auto = 1 AND preview_id = ? AND unpinned_at IS NULL', task.id, pv.id)) continue;
+      // The user took it off during this burst: it stays off.
+      if (get("SELECT 1 AS x FROM pins WHERE task_id = ? AND auto = 1 AND preview_id = ? AND unpinned_by = 'user' AND unpinned_at >= ?", task.id, pv.id, start)) continue;
+      const agent = pv.agent_id ? get('SELECT name FROM agents WHERE id = ?', pv.agent_id)?.name : null;
+      run(
+        'INSERT INTO pins (project_id, task_id, preview_id, label, round, position, pinned_by, pinned_at, auto, burst) VALUES (?,?,?,?,0,0,?,?,1,?)',
+        task.project_id, task.id, pv.id, clean(pv.title, 120), agent ?? 'Helm', at, key,
+      );
+      changed = true;
+    }
+    // Proposal rounds pinned before this burst and no longer waiting on the user are stale.
+    for (const r of all('SELECT round, MAX(pinned_at) AS last FROM pins WHERE task_id = ? AND auto = 0 AND unpinned_at IS NULL GROUP BY round', task.id)) {
+      if (r.last >= start || roundOpen(task.id, r.round)) continue;
+      run("UPDATE pins SET unpinned_at = ?, unpinned_by = 'helm' WHERE task_id = ? AND auto = 0 AND round = ? AND unpinned_at IS NULL", at, task.id, r.round);
+      changed = true;
+    }
+  });
+  if (changed) touchProject(task.project_id);
+  return changed;
+}
+
+/** A preview was posted: apply the rule to its task. Returns whether it is pinned for review now. */
+export function autoPin(previewId: string): boolean {
+  const pv = get('SELECT id, task_id FROM previews WHERE id = ?', previewId);
+  if (!pv?.task_id) return false;
+  reviewNow(pv.task_id);
+  return !!get('SELECT 1 AS x FROM pins WHERE task_id = ? AND auto = 1 AND preview_id = ? AND unpinned_at IS NULL', pv.task_id, pv.id);
+}
+
+/** The automatic pin's live items, oldest first, without those also pinned by hand (they show in the proposal). */
+function reviewPins(taskId: string): Row[] {
+  return all(
+    `SELECT a.* FROM pins a LEFT JOIN previews p ON p.id = a.preview_id WHERE a.task_id = ? AND a.auto = 1 AND a.unpinned_at IS NULL
+       AND NOT EXISTS (SELECT 1 FROM pins h WHERE h.task_id = a.task_id AND h.auto = 0 AND h.unpinned_at IS NULL AND h.preview_id = a.preview_id)
+     ORDER BY p.created_at, a.id`,
+    taskId,
+  );
+}
+
+/** The "For review" set of a task or discussion page: its items and when the burst began, or null. */
+export function reviewView(taskId: string): Row | null {
+  const pins = reviewPins(taskId);
+  const items = pins.map(pinView).filter((x): x is Row => !!x);
+  if (!items.length) return null;
+  const from = Math.min(...items.map((i: Row) => i.preview?.created_at ?? i.pinned_at));
+  return { items, from };
+}
+
+/** Tasks whose For review set is not their newest burst (the audit; empty after the repair). */
+export function reviewMismatches(projectId?: string): Row[] {
+  const tasks = all(`SELECT id, title FROM tasks t WHERE ${projectId ? 'project_id = ? AND' : ''} EXISTS (SELECT 1 FROM previews p WHERE p.task_id = t.id)`, ...(projectId ? [projectId] : []));
+  const out: Row[] = [];
+  for (const t of tasks) {
+    const want = newestBurst(t.id).map((p) => p.id as string);
+    const have = all('SELECT preview_id FROM pins WHERE task_id = ? AND auto = 1 AND unpinned_at IS NULL', t.id).map((p) => p.preview_id as string);
+    const userOff = all("SELECT preview_id FROM pins WHERE task_id = ? AND auto = 1 AND unpinned_by = 'user'", t.id).map((p) => p.preview_id as string);
+    const missing = want.filter((x) => !have.includes(x) && !userOff.includes(x));
+    const stale = have.filter((x) => !want.includes(x));
+    if (missing.length || stale.length) out.push({ id: t.id, title: t.title, missing, stale });
+  }
+  return out;
+}
+
+/** Once per project: every task's pins set by the rule (done ones keep only their last burst). */
+export function repairReviewPins(): number {
+  let n = 0;
+  for (const p of all('SELECT id FROM projects WHERE review_pins_repaired = 0')) {
+    for (const t of all('SELECT DISTINCT task_id FROM previews WHERE project_id = ? AND task_id IS NOT NULL', p.id)) if (reviewNow(t.task_id)) n++;
+    run('UPDATE projects SET review_pins_repaired = 1 WHERE id = ?', p.id);
+  }
+  return n;
+}
+
+const repaired = repairReviewPins();
+if (repaired) console.log(`Set the For review pins of ${repaired} task(s) and discussion(s) to their newest previews.`);

@@ -17,7 +17,9 @@ import {
 } from './reports.ts';
 import { DEFAULT_GLOB, SOURCE_TYPES, repoVisibility } from './reportsources.ts';
 import { getProject, touchProject } from './store.ts';
-import { tellDirector } from './taskapi.ts';
+import { tellDirector } from './agents.ts';
+import { processRole } from './role.ts';
+import { runnerCommand } from './runner.ts';
 import { USER, addTaskMessage, createTask, taskRef } from './tasks.ts';
 
 function bad(reply: FastifyReply, message: string, code = 400) {
@@ -71,6 +73,11 @@ export function registerReportApi(app: FastifyInstance) {
   app.post('/api/report-sources/:id/poll', async (req, reply) => {
     const source = getSource((req.params as any).id);
     if (!source) return bad(reply, 'No such source', 404);
+    // Split, the runner polls (its report timers deliver the note to the director); the web service hands it over.
+    if (processRole() === 'web') {
+      runnerCommand('poll-source', { sourceId: source.id });
+      return { started: true };
+    }
     return { started: pollSource(source.id) };
   });
 

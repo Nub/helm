@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { enterSends, isComposing, isTouchOnly, toggleChatView } from './keys';
 
 import { api, useAgentEvents, useLive } from './api';
 import type { Agent, AgentEvent, Discussion, Doc, InboxItem, Preview, ProjectState, Report, Task, TaskDetail } from './api';
@@ -13,6 +14,7 @@ import { Thread } from './thread';
 import type { ThreadLine } from './thread';
 import { RequestAnswers } from './home';
 import { Icon, Sheet, Tag, href, useAction } from './ui';
+import { draftGist, patchDraft, readDraft, useDraft, useStoredText } from './drafts';
 
 /**
  * The chat with the director, opened from wherever the user is (the docked bar on every project page, a triage
@@ -27,8 +29,20 @@ export type ChatCtx = { kind: 'general' } | { kind: 'task' | 'discussion' | 'doc
 export const GENERAL: ChatCtx = { kind: 'general' };
 
 let openGlobal: ((c?: ChatCtx) => void) | null = null;
+/** Text to start the message box with, taken by the next composer (the search's "Ask the director"). */
+let pendingDraft = '';
+/** Where what is typed in a chat opened from `page` is kept (drafts.ts): per project and the place it opened on. */
+const chatDraftKey = (pid: string, page: ChatCtx) => `chat:${pid}:${page.kind}:${'id' in page ? page.id : ''}`;
+/** A message of the general conversation to open the chat at (a search hit: #/p/<project>/chat/<event id>). */
+let pendingFocus: { pid: string; key: string } | null = null;
+export const focusChatAt = (pid: string, eventId: string) => {
+  pendingFocus = { pid, key: eventId };
+};
 /** Open the chat; without a context it opens on the page's own (the docked bar's). */
-export const openChat = (c?: ChatCtx) => openGlobal?.(c);
+export const openChat = (c?: ChatCtx, opts: { draft?: string } = {}) => {
+  pendingDraft = opts.draft ?? '';
+  openGlobal?.(c);
+};
 
 const TAG: Record<ChatCtx['kind'], string> = { general: 'General', task: 'Task', discussion: 'Discussion', doc: 'Spec', request: 'Request', preview: 'Preview', report: 'Report' };
 const THIS: Record<ChatCtx['kind'], string> = { general: 'General', task: 'This task', discussion: 'This discussion', doc: 'Spec entry', request: 'This request', preview: 'This preview', report: 'This report' };
@@ -105,6 +119,7 @@ export const directorName = (s: ProjectState) => directorOf(s)?.name ?? s.projec
 /** On every project page: the docked "Chat with Director" bar, and the sheet it opens. */
 export function ChatHost({ s, page }: { s: ProjectState; page: ChatCtx }) {
   const [open, setOpen] = useState<ChatCtx | null>(null);
+  const waiting = useDraft(chatDraftKey(s.project.id, page));
   const pageKey = `${page.kind}:${'id' in page ? page.id : ''}`;
   useEffect(() => {
     openGlobal = (c) => setOpen(c ?? page);
@@ -114,24 +129,28 @@ export function ChatHost({ s, page }: { s: ProjectState; page: ChatCtx }) {
   }, [pageKey]);
   // Moving to another page (a link in the thread, Back) closes the chat.
   useEffect(() => () => setOpen(null), [pageKey, location.hash]);
-  const running = s.tasks.filter((t) => t.state === 'active').length;
+  // Sent here to a message of the conversation (focusChatAt): open the general chat at it.
+  useEffect(() => {
+    if (pendingFocus?.pid === s.project.id) setOpen(GENERAL);
+  }, [pageKey, location.hash]);
+  // Active tasks whose driver is not stopped with an error (that one is on Agents and under Needs you instead).
+  // Tasks whose agent is mid-turn (working, or waiting on a permission): none, no chip.
+  const running = s.tasks.filter((t) => t.state === 'active' && (t.driver?.status === 'working' || t.driver?.status === 'waiting')).length;
   const name = directorName(s);
   const row = page.kind === 'task' || page.kind === 'discussion' ? findRow(s, page.id) : null;
-  const active = row?.kind !== 'discussion' && row?.state === 'active';
   const what = page.kind === 'general' ? '' : page.kind === 'doc' ? s.docs.find((d) => d.id === page.id)?.title : page.kind === 'preview' ? s.previews.find((p) => p.id === page.id)?.title : row?.title;
   return (
     <>
       <div className="chat-dock">
-        <button className="chat-dock-open" onClick={() => setOpen(page)} aria-label={`${active ? 'Interject or chat' : 'Chat'} with ${name}${what ? ` about ${what}` : ''}`}>
-          <Icon name="discuss" size={19} />
+        <button className="chat-dock-open" onClick={() => setOpen(page)} aria-label={`Chat with ${name}${what ? ` about ${what}` : ''}`}>
+          <Icon name="discuss" size={20} />
           <span className="chat-dock-text">
-            {/* The Interject badge says the rest; on a narrow phone with the badge the name gives way too (styles.css). */}
             <b>
               Chat<span className="chat-dock-with">with {name}</span>
             </b>
-            {what && <span className="chat-dock-about">about {what}</span>}
+            {waiting && draftGist(waiting) ? <span className="chat-dock-about chat-dock-draft">Draft: {draftGist(waiting)}</span> : what && <span className="chat-dock-about">about {what}</span>}
           </span>
-          {active && <span className="chat-dock-tag">Interject</span>}
+          {/* Interject is on the task's title card (tasks.tsx ChatButton): one way to do it. */}
         </button>
         {/* What is running, folded into the bar (no separate strip): opens Work's tasks, active first. */}
         {running > 0 && (
@@ -141,7 +160,7 @@ export function ChatHost({ s, page }: { s: ProjectState; page: ChatCtx }) {
           </a>
         )}
       </div>
-      {open && <ChatSheet key={JSON.stringify(open)} s={s} initial={open} onClose={() => setOpen(null)} />}
+      {open && <ChatSheet key={JSON.stringify(open)} s={s} initial={open} draftKey={chatDraftKey(s.project.id, page)} onClose={() => setOpen(null)} />}
     </>
   );
 }
@@ -162,13 +181,37 @@ const unread = (lines: ThreadLine[], since: number) => lines.filter((l) => l.typ
 
 // ---------- the sheet ----------
 
-function ChatSheet({ s, initial, onClose }: { s: ProjectState; initial: ChatCtx; onClose: () => void }) {
+function ChatSheet({ s, initial, draftKey, onClose }: { s: ProjectState; initial: ChatCtx; draftKey: string; onClose: () => void }) {
   const pid = s.project.id;
-  const [ctx, setCtx] = useState<ChatCtx>(initial);
+  // What the draft was about (the context the user picked, which thread) comes back with its words.
+  const kept = useMemo(() => (readDraft(draftKey)?.extra ?? null) as { ctx?: ChatCtx; view?: 'item' | 'general' } | null, []);
+  const [ctx, setCtx] = useState<ChatCtx>(kept?.ctx ?? initial);
   const reportData = useLive<{ report: Report }>(ctx.kind === 'report' ? `/api/reports/${ctx.id}` : null, (m) => m.type === 'project' && m.projectId === pid);
   const r = resolve(s, ctx, reportData.data?.report ?? null);
   const hasItem = !!r.thread || !!r.doc;
-  const [view, setView] = useState<'item' | 'general'>(hasItem ? 'item' : 'general');
+  const [view, setView] = useState<'item' | 'general'>(kept?.view ?? (hasItem ? 'item' : 'general'));
+  useEffect(() => patchDraft(draftKey, { extra: { ctx, view } }), [ctx, view]);
+  // Ctrl+g, even while typing: this item or General.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey && !e.metaKey && !e.altKey && e.key === 'g') {
+        e.preventDefault();
+        setView((v) => toggleChatView(v, hasItem));
+      }
+    };
+    addEventListener('keydown', onKey);
+    return () => removeEventListener('keydown', onKey);
+  }, [hasItem]);
+  // Opened on a thread the page has not loaded yet (one just started, as the release recipe's): its own view once it is.
+  useEffect(() => {
+    if (hasItem && !kept?.view && initial.kind !== 'general') setView('item');
+  }, [hasItem]);
+  // A message to scroll to and mark (from a search hit), taken once.
+  const [focus] = useState(() => {
+    const f = pendingFocus?.pid === pid ? pendingFocus.key : null;
+    pendingFocus = null;
+    return f;
+  });
   // The context changed under the open sheet (a Spec discussion was just started, or the item has no thread).
   useEffect(() => {
     if (!hasItem && view === 'item') setView('general');
@@ -179,6 +222,7 @@ function ChatSheet({ s, initial, onClose }: { s: ProjectState; initial: ChatCtx;
   const root = directorOf(s);
 
   const general = useGeneralLines(s);
+  useFocusLine(focus, general);
   const detail = useLive<TaskDetail>(r.thread ? `/api/tasks/${r.thread.id}` : null, (m) => m.type === 'project' && m.projectId === pid);
   const itemLines = useMemo(() => (detail.data && detail.data.task.id === r.thread?.id ? toThreadLines(detail.data.timeline, s, name, pinCtx(detail.data.task.id, detail.data.proposal)) : []), [detail.data, s, name, r.thread?.id]);
   const showing = view === 'general' ? general.lines : itemLines;
@@ -197,7 +241,7 @@ function ChatSheet({ s, initial, onClose }: { s: ProjectState; initial: ChatCtx;
   const send = async (text: string, attachments: string[]) => {
     const context = r.viewing ?? (view === 'general' && ctx.kind !== 'general' ? { kind: ctx.kind, id: ctx.id } : undefined);
     if (view === 'item' && row) {
-      await api(`/api/tasks/${row.id}/message`, { body: { text, attachments, context: r.viewing, interject: active, pause: active && pause } });
+      await api(`/api/tasks/${row.id}/message`, { body: { text, attachments, context: r.viewing, interject: active } });
       setPause(false);
     } else if (view === 'item' && r.doc) {
       await api(`/api/docs/${r.doc.id}/discuss`, { body: { text, attachments } });
@@ -216,6 +260,10 @@ function ChatSheet({ s, initial, onClose }: { s: ProjectState; initial: ChatCtx;
 
   const head = (
     <div className="chat-head">
+      {/* With one thread there is nothing to switch: just its name. */}
+      {!hasItem ? (
+        <strong className="chat-head-title one-line">{name}</strong>
+      ) : (
       <div className="chat-switch" role="tablist" aria-label="Which thread">
         {hasItem && (
           <button role="tab" aria-selected={view === 'item'} className={view === 'item' ? 'on' : ''} onClick={() => setView('item')}>
@@ -232,8 +280,9 @@ function ChatSheet({ s, initial, onClose }: { s: ProjectState; initial: ChatCtx;
           )}
         </button>
       </div>
+      )}
       <button className="icon-btn" onClick={onClose} aria-label="Close the chat">
-        <Icon name="close" size={22} />
+        <Icon name="close" size={20} />
       </button>
     </div>
   );
@@ -298,6 +347,7 @@ function ChatSheet({ s, initial, onClose }: { s: ProjectState; initial: ChatCtx;
         dock={(sendIt) => (
           <ChatComposer
             pid={pid}
+            draftKey={draftKey}
             r={r}
             general={view === 'general'}
             name={name}
@@ -377,7 +427,7 @@ function ItemLink({ row, hrefTo, count, shown }: { row: Row; hrefTo: string; cou
   return (
     <a className="chat-item-link small" href={hrefTo}>
       {count > shown ? `${count - shown} earlier entries · ` : ''}Open “{row.title}”
-      <Icon name="chevron" size={14} />
+      <Icon name="chevron" size={16} />
     </a>
   );
 }
@@ -386,6 +436,7 @@ function ItemLink({ row, hrefTo, count, shown }: { row: Row; hrefTo: string; cou
 
 function ChatComposer({
   pid,
+  draftKey,
   r,
   general,
   name,
@@ -398,6 +449,7 @@ function ChatComposer({
   onSend,
 }: {
   pid: string;
+  draftKey: string;
   r: Resolved;
   general: boolean;
   name: string;
@@ -409,13 +461,23 @@ function ChatComposer({
   onClear: () => void;
   onSend: (text: string, attachments: string[]) => Promise<unknown>;
 }) {
-  const [text, setText] = useState('');
+  // What is typed is kept until sent (drafts.ts); text handed in from elsewhere (opts.draft) takes its place.
+  const [text, setText] = useStoredText(draftKey);
+  useLayoutEffect(() => {
+    const t = pendingDraft;
+    pendingDraft = '';
+    if (t) setText(t);
+    // A kept draft comes back at its full height.
+    const el = ref.current;
+    if (el && (t || text)) el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
+  }, []);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [over, setOver] = useState(false);
   const ref = useRef<HTMLTextAreaElement>(null);
-  const draft = useAttachDraft(pid);
-  const canSend = (!!text.trim() || draft.ready.length > 0) && !busy && !draft.uploading;
+  const draft = useAttachDraft(pid, null, draftKey);
+  // On a running task the send is Interject, which may go empty: it just stops the work (server/taskapi.ts).
+  const canSend = (!!text.trim() || draft.ready.length > 0 || active) && !busy && !draft.uploading;
   // Opened from the docked bar: the box takes focus so the keyboard comes up (on iOS only from the same tap).
   useLayoutEffect(() => {
     if (matchMedia('(min-width: 900px)').matches) ref.current?.focus();
@@ -442,25 +504,20 @@ function ChatComposer({
   return (
     <div className={`chat-composer ${over ? 'drop-over' : ''}`} {...dropTarget(draft, setOver)}>
       <div className="chat-context">
-        <span className="chat-context-label">About</span>
-        <span className="chat-chip">
-          <span className="chat-chip-tag">{r.tag}</span>
-          {r.ctx.kind !== 'general' && <span className="chat-chip-title">{r.title}</span>}
+        <span className="tag tap plain chat-about">
+          <span className="chat-about-kind">{r.tag}</span>
+          {r.ctx.kind !== 'general' && <span className="chat-about-title">{r.title}</span>}
           {r.ctx.kind !== 'general' && (
-            <button className="chat-chip-x" onClick={onClear} aria-label="Remove the context: General">
-              <Icon name="close" size={14} />
+            <button className="icon-btn small chat-about-x" onClick={onClear} aria-label="Remove the context: General">
+              <Icon name="close" size={16} />
             </button>
           )}
         </span>
         <button className="chat-change" onClick={onPick}>
-          Change <Icon name="chevron" size={13} />
+          Change <Icon name="chevron" size={16} />
         </button>
       </div>
-      {active && (
-        <label className="check chat-pause">
-          <input type="checkbox" checked={pause} onChange={(e) => setPause(e.target.checked)} /> Pause the work while you read this
-        </label>
-      )}
+      {active && <p className="muted small chat-pause">Interject stops the work so the director re-evaluates; send it empty to just stop.</p>}
       {draft.items.length > 0 && (
         <div className="chat-tray">
           {draft.items.map((p) => (
@@ -503,11 +560,17 @@ function ChatComposer({
           }}
           onPaste={pasteInto(draft)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) void send();
+            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+              e.preventDefault();
+              void send();
+            } else if (enterSends({ key: e.key, shift: e.shiftKey, composing: isComposing(e), empty: !text.trim() && draft.ready.length === 0, touchOnly: isTouchOnly() })) {
+              e.preventDefault();
+              void send();
+            }
           }}
         />
         <button className="btn primary chat-send" disabled={!canSend} onClick={send} aria-label={active ? 'Interject' : 'Send'}>
-          <Icon name="send" size={18} />
+          <Icon name="send" size={20} />
         </button>
       </div>
       {error && <p className="error-text small">{error}</p>}
@@ -560,7 +623,7 @@ function PickRow({ o, on, onPick }: { o: Option; on: boolean; onPick: (c: ChatCt
   return (
     <li>
       <button className={on ? 'on' : ''} onClick={() => onPick(o.ctx)}>
-        <span className="chat-pick-tag">{o.tag}</span>
+        <span className="chat-pick-kind">{o.tag}</span>
         <span className="one-line">{o.title}</span>
         {on && <Icon name="check" size={16} />}
       </button>
@@ -577,6 +640,8 @@ type Filed = { title: string; href: string; id: string; kind: string };
 function toLines(events: AgentEvent[], name: string, projectId: string, filed: Map<number, Filed[]>): ThreadLine[] {
   const lines: ThreadLine[] = [];
   let reportFrom: string[] = [];
+  // A turn started by a discussion's message: its reply belongs to that thread, not to this conversation.
+  let discussionTurn = false;
   for (const e of events) {
     const d = e.data;
     const base = { key: String(e.id), ts: e.ts };
@@ -597,12 +662,14 @@ function toLines(events: AgentEvent[], name: string, projectId: string, filed: M
       } else if (m?.[1] === 'toolbox-question') {
         const item = /name="([^"]*)"/.exec(m[2])?.[1];
         const question = m[3].split('\n\nAnswer with propose_tool')[0].trim();
-        lines.push({ type: 'system', ...base, text: `You asked about the Toolbox item “${item ?? ''}”: ${question}`, href: href('toolbox') });
+        lines.push({ type: 'system', ...base, text: `You asked about the Toolbox item “${item ?? ''}”: ${question}`, href: href('system', 'tools') });
       } else if (m?.[1] === 'discussion-message') {
         const disc = /discussion="([^"]*)"/.exec(m[2])?.[1];
         const title = /title="([^"]*)"/.exec(m[2])?.[1];
-        const verb = /new="true"/.test(m[2]) ? 'started the discussion' : 'in the discussion';
-        lines.push({ type: 'system', ...base, text: `You ${verb} “${title ?? disc}”: ${m[3].split('\n\n<spec-entry')[0].trim()}`, href: disc ? href('p', projectId, 'discussions', disc) : undefined });
+        // A discussion lives in its own thread: one row when it starts (a link to it), nothing for later messages.
+        if (/new="true"/.test(m[2])) lines.push({ type: 'system', ...base, text: `You started the discussion “${title ?? disc}”`, href: disc ? href('p', projectId, 'discussions', disc) : undefined });
+        discussionTurn = true;
+        continue;
       } else if (m?.[1] === 'helm-note' || d.from?.kind === 'system') {
         const note = (m ? m[3] : text).trim().replace(/^The user /, 'You ').replace(/ \(id [^)]+\)| \[\[(?:task|disc)_[0-9a-f]+\]\]/g, '');
         const task = /(?:\(id |\[\[)((?:task|disc)_[0-9a-f]+)(?:\)|\]\])/.exec(m ? m[3] : text)?.[1];
@@ -610,7 +677,15 @@ function toLines(events: AgentEvent[], name: string, projectId: string, filed: M
       } else {
         lines.push({ type: 'you', ...base, text, filed: filed.get(e.id), attachments: d.attachments, about: d.viewing });
       }
+      discussionTurn = false;
     } else if (e.kind === 'result') {
+      // A reply Helm had rewritten shorter: its rewrite follows.
+      if (d.replaced) continue;
+      if (discussionTurn) {
+        discussionTurn = false;
+        reportFrom = [];
+        continue;
+      }
       const text = String(d.text ?? '').trim();
       if (text || !d.ok) lines.push({ type: 'reply', ...base, name, text: text || 'The turn ended without a reply.', ok: !!d.ok, note: reportFrom.length ? `after ${reportFrom.join(', ')}’s report` : undefined });
       reportFrom = [];
@@ -624,6 +699,32 @@ function toLines(events: AgentEvent[], name: string, projectId: string, filed: M
 }
 
 const PAGE = 16;
+
+/**
+ * Bring a message of the general conversation into view: show (and load) earlier lines until it is there, then scroll
+ * it to the middle and mark it for a moment. Gives up after a few pages (a message filed away is not in the list).
+ */
+function useFocusLine(key: string | null, general: ReturnType<typeof useGeneralLines>) {
+  const tries = useRef(0);
+  const done = useRef(false);
+  useEffect(() => {
+    if (!key || done.current || !general.loaded) return;
+    const at = general.lines.findIndex((l) => l.key === key);
+    if (at < 0 || at < general.lines.length - general.shown) {
+      if (general.hidden > 0 && tries.current++ < 40) void general.earlier();
+      return;
+    }
+    done.current = true;
+    // After the thread's own scroll to the newest exchange.
+    setTimeout(() => {
+      const el = document.querySelector<HTMLElement>(`.chat-thread [data-key="${CSS.escape(key)}"]`);
+      if (!el) return;
+      el.scrollIntoView({ block: 'center' });
+      el.classList.add('msg-focus');
+      setTimeout(() => el.classList.remove('msg-focus'), 2400);
+    }, 120);
+  }, [key, general.loaded, general.lines, general.shown, general.hidden]);
+}
 
 function useGeneralLines(s: ProjectState) {
   const projectId = s.project.id;

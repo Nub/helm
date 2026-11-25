@@ -1,13 +1,14 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api, useLive } from './api';
-import type { Doc, DocHistory, DocSection, DocSnapshot, EntryChange, LinkedTask, ProjectState, Task, TaskSpec } from './api';
+import type { Doc, DocHistory, DocSection, DocSnapshot, EntryChange, LinkedTask, ProjectState, SettingGroup, Task, TaskSpec } from './api';
 import { diffTokens, firstSentence, readable, words } from './diff';
 import { DiscussionStateTag } from './discussions';
-import { TaskStateTag } from './tasks';
+import { Menu, TaskStateTag } from './tasks';
 import { ImportanceControl, ImportanceMeter, ImportancePicker, ImportanceTag, LEVEL, TieredList, overText, recentChange } from './importance';
 import { Empty, Icon, Markdown, Sheet, Tag, ago, clock, href, importanceName, useAction, useTick } from './ui';
 import { ClipCount, References } from './attachments';
 import { DiscussButton, DiscussingMarker } from './specdiscuss';
+import { SpecWorkButton } from './specwork';
 import { MAX_DEPTH, ancestors, buildTree, pathNames, sectionMoveError } from './spectree';
 import type { SecNode, SecTree } from './spectree';
 
@@ -167,19 +168,12 @@ export function TaskSpecBlock({ projectId, spec }: { projectId: string; spec?: T
   if (!spec || (!spec.implements.length && !spec.changes.length)) return null;
   return (
     <section className="card task-spec">
-      <div className="section-head">
-        <h2>Spec</h2>
-        <a href={href('p', projectId, 'spec')}>Open the Spec</a>
-      </div>
+      <h2>Spec</h2>
       {spec.implements.length > 0 && (
         <div className="task-spec-group">
-          <span className="label">Implements</span>
           {spec.implements.map((d) => (
             <a key={d.id} className="task-spec-entry" href={href('p', projectId, 'spec', d.id)}>
-              <span>
-                <b>{d.title}</b>
-                {d.summary && <span className="muted small"> {d.summary}</span>}
-              </span>
+              <b>{d.title}</b>
             </a>
           ))}
         </div>
@@ -190,7 +184,7 @@ export function TaskSpecBlock({ projectId, spec }: { projectId: string; spec?: T
           {spec.changes.map((c) => (
             <div key={c.doc.id} className="task-spec-change">
               <button className="task-spec-entry" onClick={() => setOpen(open === c.doc.id ? null : c.doc.id)} aria-expanded={open === c.doc.id}>
-                <Icon name="chevron" size={14} />
+                <Icon name="chevron" size={16} />
                 <span>
                   <b>{c.doc.title}</b>
                   <span className="muted small">
@@ -276,9 +270,122 @@ function useSpecSort(pid: string): [SortKey, (k: SortKey) => void] {
   ];
 }
 
+/** One page (the default: purpose, then each section with one line per entry) or the full page; remembered on this device. */
+type SpecView = 'page' | 'full';
+function useSpecView(): [SpecView, (v: SpecView) => void] {
+  const key = 'helm.spec.view';
+  const [view, setView] = useState<SpecView>(() => {
+    try {
+      return localStorage.getItem(key) === 'full' ? 'full' : 'page';
+    } catch {
+      return 'page';
+    }
+  });
+  return [
+    view,
+    (v) => {
+      try {
+        localStorage.setItem(key, v);
+      } catch {}
+      setView(v);
+    },
+  ];
+}
+
+/**
+ * The one-page view: the project's purpose, then every section (sub-sections nested in their chapter) with each entry
+ * as its title and one-line summary. Tapping an entry opens its text in place; "Full entry" opens it in the full view.
+ */
+/** A section's heading in the one-page view: a chapter title, not the app's small-caps label. */
+const headStyle = (depth: number): React.CSSProperties => ({
+  margin: 0,
+  font: `600 ${depth === 1 ? 'var(--fs-l)' : 'var(--fs-m)'}/1.25 var(--serif)`,
+  letterSpacing: 0,
+  textTransform: 'none',
+  color: depth === 1 ? 'var(--text)' : 'var(--text-2)',
+});
+
+function OnePage({ s, tree, loose, looseName, open, onToggle, onFull }: { s: ProjectState; tree: SecTree; loose: Doc[]; looseName: string; open: Set<string>; onToggle: (id: string) => void; onFull: (d: Doc) => void }) {
+  const row = (d: Doc) => {
+    const isOpen = open.has(d.id);
+    const summary = d.summary || firstSentence(d.body);
+    return (
+      <li key={d.id} id={`doc-${d.id}`} style={{ opacity: FINISHED.includes(d.status) ? 0.7 : undefined }}>
+        <button className="spec-entry-head" aria-expanded={isOpen} onClick={() => onToggle(d.id)} style={{ display: 'block', padding: 'var(--sp-1) 0' }}>
+          <strong>{d.title}</strong>
+          {summary && <span className="spec-summary"> — {summary}</span>}
+          {d.status !== 'active' && <span className="muted small"> · {docStatusLabel(d.status)}</span>}
+        </button>
+        {isOpen && (
+          <div style={{ padding: 'var(--sp-1) 0 var(--sp-2) var(--sp-3)', borderLeft: '2px solid var(--line-strong)' }}>
+            {d.body ? <Markdown text={d.body} /> : <p className="muted small">No text yet.</p>}
+            <button className="btn quiet small" onClick={() => onFull(d)}>
+              Full entry
+            </button>
+          </div>
+        )}
+      </li>
+    );
+  };
+  const list = (docs: Doc[]) =>
+    docs.length > 0 && (
+      <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gap: 'var(--sp-1)' }}>{docs.map(row)}</ul>
+    );
+  const section = (n: SecNode): React.ReactNode => {
+    const H = n.depth === 1 ? 'h2' : n.depth === 2 ? 'h3' : 'h4';
+    const body = (
+      <>
+        <H style={headStyle(n.depth)}>{n.sec.name}</H>
+        {n.sec.description && <p className="muted small">{n.sec.description}</p>}
+        {list(n.entries)}
+        {n.kids.map(section)}
+      </>
+    );
+    return n.depth === 1 ? (
+      <section key={n.sec.id} id={`sec-${n.sec.id}`} className="card" style={{ display: 'grid', gap: 'var(--sp-2)' }}>
+        {body}
+      </section>
+    ) : (
+      <section key={n.sec.id} id={`sec-${n.sec.id}`} style={{ display: 'grid', gap: 'var(--sp-2)', paddingLeft: 'var(--sp-3)', marginTop: 'var(--sp-2)' }}>
+        {body}
+      </section>
+    );
+  };
+  return (
+    <div style={{ display: 'grid', gap: 'var(--sp-3)' }}>
+      {s.project.description && (
+        <section className="card" style={{ display: 'grid', gap: 'var(--sp-1)' }}>
+          <span className="label">Purpose</span>
+          <p>{s.project.description}</p>
+        </section>
+      )}
+      {tree.roots.map(section)}
+      {loose.length > 0 && (
+        <section id={`sec-${NONE}`} className="card" style={{ display: 'grid', gap: 'var(--sp-2)' }}>
+          <h2 style={headStyle(1)}>{looseName}</h2>
+          {list(loose)}
+        </section>
+      )}
+    </div>
+  );
+}
+
 const NONE = '__none';
 /** Drag and drop needs a mouse or trackpad; on a touch screen, Move to… does the same. */
 const finePointer = () => typeof window !== 'undefined' && window.matchMedia('(pointer: fine)').matches;
+
+/** The project's Spec adherence (Setup › Planning; server/specadherence.ts), under the page title, linking to Setup. */
+function AdherenceLink({ pid }: { pid: string }) {
+  const { data } = useLive<{ groups: SettingGroup[] }>(`/api/projects/${pid}/settings`, (m) => m.type === 'project' && m.projectId === pid);
+  const x = data?.groups.flatMap((g) => g.settings).find((g) => g.key === 'spec_adherence');
+  if (!x) return null;
+  const label = (x.choices?.find((c) => c.value === x.value)?.label ?? String(x.value)).replace(/ \(default\)$/, '');
+  return (
+    <a className="muted small" style={{ gridColumn: '1 / -1', justifySelf: 'start' }} href={href('p', pid, 'setup', 'agent-context')}>
+      Spec adherence: {label}
+    </a>
+  );
+}
 
 export function SpecPage({ s, focus }: { s: ProjectState; focus?: string }) {
   const pid = s.project.id;
@@ -301,6 +408,7 @@ export function SpecPage({ s, focus }: { s: ProjectState; focus?: string }) {
   const [dropOn, setDropOn] = useState<string | null>(null);
   const moveAction = useAction();
   const [sort, setSort] = useSpecSort(pid);
+  const [view, setView] = useSpecView();
   const [warnings, setWarnings] = useState<string[]>([]);
   const canDrag = useMemo(finePointer, []);
 
@@ -459,11 +567,11 @@ export function SpecPage({ s, focus }: { s: ProjectState; focus?: string }) {
               <H>{n.sec.name}</H>
               {n.sec.description && <span className="spec-chapter-desc">{n.sec.description}</span>}
             </span>
-            <span className="spec-chapter-counts">
-              {plural(n.total, 'entry', 'entries')}
-              {n.kids.length > 0 && <span>· {plural(n.kids.length, 'subsection')}</span>}
-              {n.flagged > 0 && <Tag tone="tone-warning spec-flag">{n.flagged} edited by you</Tag>}
-            </span>
+            {n.flagged > 0 && (
+              <span className="spec-chapter-counts">
+                <Tag tone="tone-warning spec-flag">{n.flagged} edited by you</Tag>
+              </span>
+            )}
           </button>
           {grip && (
             <span className="drag-handle spec-grip" {...grip} title="Drag into another section, or to the top level" aria-hidden="true">
@@ -477,7 +585,7 @@ export function SpecPage({ s, focus }: { s: ProjectState; focus?: string }) {
             {n.kids.length > 0 && <div className="spec-subs">{n.kids.map(sectionView)}</div>}
             <div className="row wrap spec-section-foot">
               <button className="btn small quiet spec-add-here" onClick={() => setEditing({ doc: null, section_id: id })}>
-                <Icon name="plus" size={14} /> Add to {n.sec.name}
+                <Icon name="plus" size={16} /> Add to {n.sec.name}
               </button>
               <button className="btn small quiet" onClick={() => setMoving({ kind: 'sec', id })}>
                 Move section…
@@ -498,29 +606,50 @@ export function SpecPage({ s, focus }: { s: ProjectState; focus?: string }) {
     </div>
   );
 
+  /** From the one-page view to this entry, open, in the full view. */
+  const toFull = (d: Doc) => {
+    setView('full');
+    setOpenDocs((cur) => new Set(cur).add(d.id));
+    if (d.section_id && tree.byId.has(d.section_id)) openPath(d.section_id);
+    else updateSecs((set) => set.add(NONE));
+    requestAnimationFrame(() => requestAnimationFrame(() => document.getElementById(`doc-${d.id}`)?.scrollIntoView({ block: 'start' })));
+  };
+
   return (
     <section className="spec-page">
       <div className="spec-title">
         <h1 className="page-title">Spec</h1>
-        <p className="muted small">What the project should be. Edit an entry, or Discuss it with {director}; a change of meaning becomes a planning task that starts only when you approve it.</p>
         <div className="row spec-title-actions">
-          <button className="btn small quiet" onClick={() => setSectionsOpen(true)}>
-            Sections
-          </button>
+          <SpecWorkButton s={s} />
           <button className="btn small" onClick={() => setEditing({ doc: null })}>
-            <Icon name="plus" size={15} /> Add
+            <Icon name="plus" size={16} /> Add
           </button>
+          <Menu label="More Spec actions" items={[{ label: 'Edit sections', onSelect: () => setSectionsOpen(true) }]} />
         </div>
+        {docs.length > 0 && (
+          // A div: the page's old intro paragraph rule (.spec-title p) hides paragraphs here on a phone.
+          <div className="muted small" style={{ gridColumn: '1 / -1' }}>
+            {plural(docs.length, 'entry', 'entries')} in {plural(s.sections.length, 'section')}
+            {' · '}
+            <button className="link" aria-pressed={view === 'full'} onClick={() => setView(view === 'page' ? 'full' : 'page')} title={view === 'page' ? 'Every entry with its tools' : 'The Spec on one page'}>
+              {view === 'page' ? 'Full view' : 'One page'}
+            </button>
+          </div>
+        )}
+        <AdherenceLink pid={pid} />
       </div>
 
+      {view === 'page' ? (
+        <>
+          <PendingBanner s={s} director={director} />
+          {docs.length === 0 ? <Empty title="The Spec is empty" /> : <OnePage s={s} tree={tree} loose={loose} looseName={looseName} open={openDocs} onToggle={toggleDoc} onFull={toFull} />}
+        </>
+      ) : (
+      <>
       {docs.length > 0 &&
         (sort === 'priority' || over ? (
           <ImportanceMeter budget={s.budget} onOpen={sort === 'priority' ? undefined : () => setSort('priority')} />
-        ) : (
-          <button className="imp-meter-compact small muted" onClick={() => setSort('priority')} title="Critical and High are limited per project. Tap to sort by priority.">
-            Critical {s.budget.critical.count}/{s.budget.critical.cap} · High {s.budget.high.count}/{s.budget.high.cap}
-          </button>
-        ))}
+        ) : null)}
       <PendingBanner s={s} director={director} />
       {(unsorted > 0 || s.budget.critical.over || s.budget.high.over) && docs.length > 0 && <OrganiseBanner s={s} director={director} unsorted={unsorted} />}
 
@@ -528,7 +657,6 @@ export function SpecPage({ s, focus }: { s: ProjectState; focus?: string }) {
         <div className="spec-tools-row">
           <input className="spec-search" type="search" placeholder="Search" value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Search the Spec" />
           <label className="spec-sort">
-            <span className="muted small">Sort</span>
             <select value={sort} onChange={(e) => setSort(e.target.value as SortKey)} aria-label="Sort the Spec">
               {SORTS.map((x) => (
                 <option key={x.id} value={x.id}>
@@ -539,14 +667,14 @@ export function SpecPage({ s, focus }: { s: ProjectState; focus?: string }) {
           </label>
           {allTags.length > 0 && (
             <button className={`btn small spec-tags-toggle ${picked.length ? 'on' : ''}`} aria-haspopup="dialog" aria-expanded={tagsOpen} onClick={() => setTagsOpen(true)}>
-              Tags{picked.length > 0 && <span className="spec-tags-n">{picked.length}</span>} <span aria-hidden="true">▾</span>
+              Tags{picked.length > 0 && <span className="badge">{picked.length}</span>} <span aria-hidden="true">▾</span>
             </button>
           )}
         </div>
         {picked.length > 0 && (
           <div className="spec-picked" role="group" aria-label="Filtering by these tags">
             {picked.map((t) => (
-              <button key={t} className="chip tag-chip on" onClick={() => toggleTag(t)} aria-label={`Stop filtering by ${t}`} title={`Stop filtering by ${t}`}>
+              <button key={t} className="chip on" onClick={() => toggleTag(t)} aria-label={`Stop filtering by ${t}`} title={`Stop filtering by ${t}`}>
                 #{t} <span aria-hidden="true">×</span>
               </button>
             ))}
@@ -590,8 +718,8 @@ export function SpecPage({ s, focus }: { s: ProjectState; focus?: string }) {
         )}
         <div className="spec-chapters">
           {moveAction.error && <p className="error-text spec-move-error">{moveAction.error}</p>}
-          {docs.length === 0 && <Empty title="The Spec is empty">The director records what the project should be here as you agree it. You can add your own with Add.</Empty>}
-          {filtering && (sort === 'sections' ? matches.length === 0 : flat.length === 0) && <Empty title="Nothing matches">Try another word or tag.</Empty>}
+          {docs.length === 0 && <Empty title="The Spec is empty" />}
+          {filtering && (sort === 'sections' ? matches.length === 0 : flat.length === 0) && <Empty title="Nothing matches" />}
           {sort === 'priority' && flat.length > 0 && (
             <div className="spec-by-priority">
               <p className={`muted small spec-prio-about ${aboutOpen ? 'open' : ''}`} onClick={() => setAboutOpen(!aboutOpen)}>Open entries, most important first. Drag an entry by its handle to reorder (on a phone, press and hold it); drop it past a tier line to change its level. What you place is pinned: the director may suggest a change but not make it.</p>
@@ -633,9 +761,7 @@ export function SpecPage({ s, focus }: { s: ProjectState; focus?: string }) {
                       <Icon name="chevron" size={16} />
                       <span className="spec-chapter-name">
                         <h2>{looseName}</h2>
-                        {s.sections.length > 0 && <span className="spec-chapter-desc">Entries the director has not placed in a section.</span>}
                       </span>
-                      <span className="spec-chapter-counts">{plural(loose.length, 'entry', 'entries')}</span>
                     </button>
                   </div>
                   {openSecs.has(NONE) && <div className="spec-chapter-body">{loose.map((d) => entry(d))}</div>}
@@ -645,6 +771,8 @@ export function SpecPage({ s, focus }: { s: ProjectState; focus?: string }) {
           )}
         </div>
       </div>
+      </>
+      )}
 
       {editing && <SpecEditor s={s} tree={tree} editing={editing} director={director} onClose={() => setEditing(null)} />}
       {sectionsOpen && <SectionsSheet s={s} tree={tree} onMove={(id) => setMoving({ kind: 'sec', id })} onClose={() => setSectionsOpen(false)} />}
@@ -739,7 +867,7 @@ function OrganiseBanner({ s, director, unsorted }: { s: ProjectState; director: 
       <p>{what.charAt(0).toUpperCase() + what.slice(1)}.</p>
       {sent ? (
         <p className="doc-told">
-          <Icon name="check" size={14} /> Sent to {director}. Its reply is in the chat with {director}, under General.
+          <Icon name="check" size={16} /> Sent to {director}. Its reply is in the chat with {director}, under General.
         </p>
       ) : (
         <button className="btn small" disabled={busy} onClick={async () => (await run(() => api(`/api/projects/${s.project.id}/spec/organise`, { body: {} }))) && setSent(true)}>
@@ -830,7 +958,7 @@ function Tags({ tags, onTag }: { tags: string[]; onTag: (t: string) => void }) {
   return (
     <span className="spec-tags">
       {tags.map((t) => (
-        <button key={t} className="spec-tag" onClick={() => onTag(t)} title={`Show entries tagged ${t}`}>
+        <button key={t} className="tag tone-blue mono spec-tag-link" onClick={() => onTag(t)} title={`Show entries tagged ${t}`}>
           #{t}
         </button>
       ))}
@@ -963,16 +1091,16 @@ function Entry({
           <div className="row wrap doc-foot">
             {(d.status === 'proposed' || d.status === 'paused') && (
               <button className={`btn ${d.status === 'proposed' ? 'primary' : ''}`} disabled={busy} onClick={() => act('begin')}>
-                <Icon name="play" size={15} /> {d.status === 'paused' ? 'Resume' : 'Begin'}
+                <Icon name="play" size={16} /> {d.status === 'paused' ? 'Resume' : 'Begin'}
               </button>
             )}
             {d.status === 'active' && (
               <button className="btn" disabled={busy} onClick={() => act('stop')}>
-                <Icon name="stop" size={15} /> Stop
+                <Icon name="stop" size={16} /> Stop
               </button>
             )}
             <button className="btn quiet" disabled={busy} onClick={() => onEdit({ doc: d })}>
-              <Icon name="edit" size={15} /> Edit
+              <Icon name="edit" size={16} /> Edit
             </button>
             <DiscussButton s={s} d={d} director={director} />
             <button className="btn quiet" disabled={busy} onClick={onMove}>
@@ -980,13 +1108,13 @@ function Entry({
             </button>
             <span className="spacer" />
             <button className="icon-btn doc-remove" disabled={busy} onClick={remove} aria-label={`Remove ${d.title}`} title="Remove">
-              <Icon name="trash" size={18} />
+              <Icon name="trash" size={20} />
             </button>
           </div>
           {error && <p className="error-text">{error}</p>}
           {told && !error && (
             <p className="doc-told">
-              <Icon name="check" size={14} /> {told}
+              <Icon name="check" size={16} /> {told}
             </p>
           )}
         </div>
@@ -1003,7 +1131,7 @@ function EntryHistory({ s, d, count }: { s: ProjectState; d: Doc; count: number 
   return (
     <details className="spec-history" open={open} onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}>
       <summary>
-        <Icon name="chevron" size={14} /> History
+        <Icon name="chevron" size={16} /> History
         {(count > 0 || d.record_count > 0) && (
           <span className="muted"> · {[count > 0 && countLabel(linkedTasks(s, d.id)), d.record_count > 0 && plural(d.record_count, 'decision or note', 'decisions and notes')].filter(Boolean).join(', ')}</span>
         )}
@@ -1220,7 +1348,7 @@ function SpecEditor({ s, tree, editing, director, onClose }: { s: ProjectState; 
         {known.length > 0 && (
           <div className="spec-tag-suggest">
             {known.map((t) => (
-              <button key={t} className="spec-tag" onClick={() => setForm({ ...form, tags: [...tagList, t].join(', ') })}>
+              <button key={t} className="tag tone-blue mono spec-tag-link" onClick={() => setForm({ ...form, tags: [...tagList, t].join(', ') })}>
                 + #{t}
               </button>
             ))}

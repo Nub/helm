@@ -525,3 +525,32 @@ test('the agent\'s own activity is recorded; what it is sent is not', async () =
   addEvent(ag, 'tool', { name: 'Bash' });
   assert.ok(db.get('SELECT active_at FROM agents WHERE id = ?', ag.id)!.active_at > 0);
 });
+
+test('System › Disk Clean up: the plan is clean_artifacts\' dry run, confirming removes exactly it, held work is skipped with why', async () => {
+  const { cleanupPlan, runCleanup } = await import('./diskclean.ts');
+  wt('done2', 'done2');
+  wt('dirty2', 'dirty2');
+  file(join(WT, 'dirty2', 'src', 'a.ts'), 'uncommitted');
+  file(join(TMP, 'scratch-2', 'data.bin'));
+  reg(join(WT, 'done2'), 'worktree', finished.id, { branch: 'done2' });
+  reg(join(WT, 'dirty2'), 'worktree', finished.id, { branch: 'dirty2' });
+  reg(join(TMP, 'scratch-2'), 'scratch', finished.id);
+
+  const dry = await usage.cleanArtifacts(project.id, { by: 'test', dryRun: true });
+  const plan = await cleanupPlan(project.id);
+  const folders = plan.remove.filter((i) => i.kind === 'folder');
+  assert.deepEqual(folders.map((i) => i.path).sort(), dry.removed.map((r) => r.path).sort(), 'the plan lists what clean_artifacts would remove');
+  assert.deepEqual(folders.map((i) => i.path).sort(), [join(WT, 'done2'), join(TMP, 'scratch-2')].sort());
+  assert.equal(plan.total, folders.reduce((n, i) => n + (i.bytes ?? 0), 0));
+  const why = plan.skipped.find((s) => s.path === join(WT, 'dirty2'));
+  assert.ok(why, 'the worktree with uncommitted work is listed as skipped');
+  assert.match(why!.reason, /uncommitted|changes|modified/);
+  assert.ok(existsSync(join(WT, 'done2')), 'the plan removes nothing');
+
+  const res = await runCleanup(project.id, { paths: folders.map((i) => i.path), builds: [] });
+  assert.deepEqual(res.remove.map((i) => i.path).sort(), folders.map((i) => i.path).sort(), 'exactly what the plan listed');
+  assert.ok(!existsSync(join(WT, 'done2')) && !existsSync(join(TMP, 'scratch-2')));
+  assert.ok(existsSync(join(WT, 'dirty2', 'src', 'a.ts')), 'held work stays');
+  assert.ok(db.get("SELECT 1 AS x FROM journal WHERE project_id = ? AND title LIKE 'Removed 2 folders%'", project.id), 'journaled');
+  db.run('DELETE FROM artifacts');
+});

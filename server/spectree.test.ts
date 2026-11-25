@@ -148,8 +148,16 @@ test('agent tools: set_section with parent and paths, set_doc with a path, list_
     const r = await list.find((t) => t.name === name)!.handler(args, {});
     return { text: r.content.map((c: any) => c.text).join('\n'), error: !!r.isError };
   };
+  // A section gets sub-sections only once it holds eight entries (speclimits.ts).
+  const seed = (ref: string) => {
+    const id = T.findSection(pid, ref)!.id;
+    for (let i = 0; i < 8; i++) spec.saveDoc(pid, null, { title: `${ref} ${i}`, summary: 's', section_id: id }, AGENT);
+  };
   assert.equal((await call('set_section', { name: 'Combat', description: 'Fighting' })).error, false);
+  assert.ok((await call('set_section', { name: 'Weapons', parent: 'Combat' })).error, 'Combat is still empty');
+  seed('Combat');
   assert.equal((await call('set_section', { name: 'Weapons', parent: 'Combat' })).error, false);
+  seed('Combat / Weapons');
   let r = await call('set_section', { name: 'Ranged', parent: 'Combat / Weapons', description: 'Bows' });
   assert.equal(r.error, false);
   assert.match(r.text, /- Combat \/ Weapons \/ Ranged \(0 entries\) — Bows/);
@@ -157,13 +165,18 @@ test('agent tools: set_section with parent and paths, set_doc with a path, list_
   assert.ok(r.error);
   assert.match(r.text, /at most 3/);
   // A second Ranged elsewhere, by full path; then the bare name is ambiguous.
+  assert.equal((await call('set_section', { name: 'Magic' })).error, false);
+  seed('Magic');
   assert.equal((await call('set_section', { name: 'Magic / Ranged' })).error, false);
   r = await call('set_doc', { title: 'Longbow', summary: 'A bow.', section: 'Ranged' });
   assert.ok(r.error);
   assert.match(r.text, /matches 2 sections/);
   r = await call('set_doc', { title: 'Longbow', summary: 'A bow.', section: 'Weapons / Ranged' });
   assert.equal(r.error, false, r.text);
+  // Two new levels at once: Spells would hold one entry, too few for a sub-section.
   r = await call('set_doc', { title: 'Fireball', summary: 'Hot.', section: 'Magic / Spells / Fire' });
+  assert.match(r.text, /"Magic \/ Spells" would hold 1 entry/);
+  r = await call('set_doc', { title: 'Fireball', summary: 'Hot.', section: 'Magic / Spells' });
   assert.equal(r.error, false, r.text);
   // Moving a section to the top level, then back under Combat.
   r = await call('set_section', { name: 'Magic / Ranged', parent: 'Combat / Weapons' });
@@ -173,9 +186,9 @@ test('agent tools: set_section with parent and paths, set_doc with a path, list_
   assert.equal(r.error, false, r.text);
   assert.match(r.text, /^- Ranged \(0 entries\)$/m);
   const docs = await call('list_docs', {});
-  assert.match(docs.text, /^# Combat \(1 entry\) — Fighting$/m);
+  assert.match(docs.text, /^# Combat \(17 entries\) — Fighting$/m);
   assert.match(docs.text, /^### Combat \/ Weapons \/ Ranged \(1 entry\) — Bows$/m);
-  assert.match(docs.text, /^### Magic \/ Spells \/ Fire \(1 entry\)$/m);
+  assert.match(docs.text, /^## Magic \/ Spells \(1 entry\)$/m);
   const only = await call('list_docs', { section: 'Combat' });
   assert.match(only.text, /Longbow/);
   assert.doesNotMatch(only.text, /Fireball/);

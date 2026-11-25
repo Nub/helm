@@ -33,6 +33,10 @@
  *        same-site, e.g. another service on this host on a different port: script/img tags, link prefetch).
  *        A GET with neither header is a non-browser client (curl) or an old browser; it is allowed, since a
  *        cross-origin page cannot read the response (no CORS headers are ever sent) and GETs change nothing.
+ *
+ * Not decided here: release download links, GET /dl/<token> (dllinks.ts). They are outside the auth guard on purpose
+ * (the user shares them with people who cannot sign in) and need neither the LAN nor a cookie; the token is the
+ * credential. Making or revoking one is an /api call, and goes through the checks above like any other.
  */
 import { networkInterfaces, hostname } from 'node:os';
 import { isIP } from 'node:net';

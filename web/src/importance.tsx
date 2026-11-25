@@ -21,9 +21,9 @@ export function ImportanceTag({ level, pinned, change, compact = false, onlyMove
   return (
     <span className="imp-wrap">
       {!onlyMove && (
-        <span className={`imp-tag imp-l${level} ${compact ? 'compact' : ''}`} title={pinned ? 'Set or placed by you; agents leave it as it is' : `Importance: ${LEVEL[level]}`}>
+        <span className={`tag imp imp-l${level}`} title={pinned ? 'Set or placed by you; agents leave it as it is' : `Importance: ${LEVEL[level]}`}>
           {LEVEL[level]}
-          {pinned && <Icon name="pin" size={11} />}
+          {pinned && <Icon name="pin" size={16} />}
         </span>
       )}
       {change && (
@@ -148,7 +148,7 @@ export function ImportanceLimitsCard({ s }: { s: ProjectState }) {
   return (
     <div className="card form imp-limits">
       <p className="muted small">
-        Critical and High stay scarce so they mean something. Critical may hold the larger of a fixed number and a share of the open items; High a share. The director is refused beyond these; you are only warned. Now: Spec{' '}
+        Now: Spec{' '}
         {s.budget.critical.count}/{s.budget.critical.cap} Critical, {s.budget.high.count}/{s.budget.high.cap} High · Tasks {s.taskBudget.critical.count}/{s.taskBudget.critical.cap} Critical, {s.taskBudget.high.count}/
         {s.taskBudget.high.cap} High.
       </p>
@@ -156,7 +156,7 @@ export function ImportanceLimitsCard({ s }: { s: ProjectState }) {
         <legend>Spec: open entries</legend>
         <div className="row wrap">
           {field('critical_min', 'Critical: at least')}
-          {field('critical_pct', 'Critical: or % of open')}
+          {field('critical_pct', 'Critical: % of open')}
           {field('high_pct', 'High: % of open')}
         </div>
       </fieldset>
@@ -164,7 +164,7 @@ export function ImportanceLimitsCard({ s }: { s: ProjectState }) {
         <legend>Open tasks</legend>
         <div className="row wrap">
           {field('task_critical_min', 'Critical: at least')}
-          {field('task_critical_pct', 'Critical: or % of open')}
+          {field('task_critical_pct', 'Critical: % of open')}
           {field('task_high_pct', 'High: % of open')}
         </div>
       </fieldset>
@@ -186,8 +186,8 @@ export function ImportanceLimitsCard({ s }: { s: ProjectState }) {
 // ---------- one-tap override and tiered ordering ----------
 
 /** The level as a tag the owner can tap to change: tap, then pick. The new level is pinned. */
-export function ImportancePicker({ id, level, pinned, change, compact = false }: { id: string; level: number; pinned: boolean; change?: ImportanceChange; compact?: boolean }) {
-  const [open, setOpen] = useState(false);
+export function ImportancePicker({ id, level, pinned, change, compact = false, startOpen = false }: { id: string; level: number; pinned: boolean; change?: ImportanceChange; compact?: boolean; startOpen?: boolean }) {
+  const [open, setOpen] = useState(startOpen);
   const [warning, setWarning] = useState('');
   const { busy, error, run } = useAction();
   const stop = (e: React.SyntheticEvent) => {
@@ -200,15 +200,15 @@ export function ImportancePicker({ id, level, pinned, change, compact = false }:
     setOpen(false);
   };
   return (
-    <span className="imp-picker" onClick={stop}>
-      <button className="imp-picker-btn" onClick={(e) => (stop(e), setOpen(!open))} aria-expanded={open} aria-label={`Importance ${LEVEL[level]}. Change`}>
+    <span className="imp-picker-wrap" onClick={stop}>
+      <button className="btn bare imp-picker" onClick={(e) => (stop(e), setOpen(!open))} aria-expanded={open} aria-label={`Importance ${LEVEL[level]}. Change`}>
         <ImportanceTag level={level} pinned={pinned} compact={compact} />
       </button>
       {change && <ImportanceTag level={level} change={change} compact onlyMove />}
       {open && (
         <span className="imp-choices" role="group" aria-label="Set importance">
           {[5, 4, 3, 2, 1].map((n) => (
-            <button key={n} className={`imp-tag imp-l${n} ${n === level ? 'current' : ''}`} disabled={busy} onClick={(e) => (stop(e), pick(n))}>
+            <button key={n} className={`btn small imp-choice imp-l${n} ${n === level ? 'on' : ''}`} disabled={busy} onClick={(e) => (stop(e), pick(n))}>
               {LEVEL[n]}
             </button>
           ))}

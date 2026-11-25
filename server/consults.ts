@@ -51,14 +51,14 @@ function waitingLine(kind: string, manager: Row) {
   return kind === 'review' ? `Waiting for review from ${manager.name}` : `Waiting for ${manager.name}'s answer`;
 }
 
-function questionBody(q: QuestionInput): string {
+export function questionBody(q: QuestionInput): string {
   const parts = [q.question.trim()];
   if (q.options?.length) parts.push(`Options:\n${q.options.map((o) => `- ${o.label}${o.detail ? `: ${o.detail}` : ''}`).join('\n')}`);
   if (q.recommendation) parts.push(`Their recommendation: ${q.recommendation}`);
   return parts.join('\n\n');
 }
 
-function reviewBody(r: ReviewInput): string {
+export function reviewBody(r: ReviewInput): string {
   return [
     `What changed: ${r.summary.trim()}`,
     `Where: ${r.where.trim()}`,
@@ -95,7 +95,7 @@ export function fileConsult(asker: Row, manager: Row, taskId: string | null, inp
   const how = asker.quick && input.kind === 'question'
     ? `Answer with answer_helper (ref "${id}"): decide, and say why.${blocking ? ' They have stopped until you answer.' : ' They are carrying on meanwhile.'}`
     : input.kind === 'review'
-      ? `Review it yourself or spawn a reviewer, then answer with message_agent (agent "${asker.id}", reply_to "${id}", verdict "accepted" or "changes_needed"), giving the specifics of what must change.`
+      ? `Review it yourself, then answer with message_agent (agent "${asker.id}", reply_to "${id}", verdict "accepted" or "changes_needed"), giving the specifics of what must change.`
       : `Answer with message_agent (agent "${asker.id}", reply_to "${id}"): decide, and say why.${blocking ? ' They have stopped until you answer.' : ' They are carrying on with other work meanwhile.'}`;
   return { consult: get('SELECT * FROM consults WHERE id = ?', id)!, message: `<${tag} ${attrs}>\n${about}${question}\n\n${how}\n</${tag}>` };
 }

@@ -3,7 +3,9 @@
 //
 //   node scratch.mjs start  [--name N] [--repo DIR] [--port P] [--lan] [--claude none|fake|PATH]
 //                           [--seed empty|demo] [--copy-db FILE] [--fresh] [--build]
-//   node scratch.mjs stop   [--name N]      (idempotent; kills only the process it started)
+//                           [--split]  (runner and web service as two processes, server/runner.ts)
+//   node scratch.mjs stop   [--name N] [--part web|runner]   (idempotent; kills only the processes it started)
+//   node scratch.mjs restart --part web|runner [--name N]    (a split instance: restart one half, keep the other)
 //   node scratch.mjs status [--name N]      (prints the instance as JSON; exit 1 if not running)
 //   node scratch.mjs list                   (every instance this user has, running or not)
 //   node scratch.mjs env    [--name N]      (shell exports for the instance: HUC_URL, HUC_TOKEN, HUC_DIR ...)
@@ -48,20 +50,54 @@ export function readInstance(name) {
   return existsSync(f) ? JSON.parse(readFileSync(f, 'utf8')) : null;
 }
 
-/** True only if pid is alive and is the server we started (its environment names our data dir). */
-function ours(inst) {
-  if (!inst?.pid) return false;
+/** True only if pid is alive and is a server we started (its environment names our data dir). */
+function oursPid(inst, pid) {
+  if (!pid) return false;
   try {
-    process.kill(inst.pid, 0);
+    process.kill(pid, 0);
   } catch {
     return false;
   }
   try {
-    const env = readFileSync(`/proc/${inst.pid}/environ`, 'utf8').split('\0');
+    const env = readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0');
     return env.includes(`HELM_DATA=${inst.data}`);
   } catch {
     return false;
   }
+}
+/** The instance runs: its server, or for a split instance either half. */
+function ours(inst) {
+  return !!inst && (oursPid(inst, inst.pid) || oursPid(inst, inst.runnerPid));
+}
+
+/** Start one process of an instance: 'all' (one process), or the 'web' or 'runner' half of a split one. */
+function spawnPart(inst, env, part) {
+  const logFile = part === 'runner' ? join(inst.dir, 'runner.log') : inst.log;
+  const fd = openSync(logFile, 'a');
+  const child = spawn(process.execPath, ['server/main.ts', part], { cwd: inst.repo, env, detached: true, stdio: ['ignore', fd, fd] });
+  child.unref();
+  return child.pid;
+}
+
+/** Stop one process (and what it spawned: its process group), waiting up to 4 s before SIGKILL. */
+async function killPart(inst, pid) {
+  if (!oursPid(inst, pid)) return;
+  try { process.kill(-pid, 'SIGTERM'); } catch { try { process.kill(pid, 'SIGTERM'); } catch { /* gone */ } }
+  for (let i = 0; i < 40 && oursPid(inst, pid); i++) await new Promise((r) => setTimeout(r, 100));
+  if (oursPid(inst, pid)) try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ }
+}
+
+/** A split instance's runner has a fresh heartbeat (it writes one at start). */
+async function runnerUp(inst, ms) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    try {
+      const h = await (await fetch(`${inst.url}api/health`)).json();
+      if (h.runner?.up && h.runner.mode !== 'all') return true;
+    } catch { /* not yet */ }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return false;
 }
 
 /** The live service's data directories: a scratch server must never use or sit inside them. */
@@ -188,16 +224,16 @@ async function start(o) {
   mkdirSync(env.HELM_FAKE_DIR, { recursive: true });
 
   const logFile = join(dir, 'server.log');
-  const fd = openSync(logFile, 'a');
-  const child = spawn(process.execPath, ['server/main.ts'], { cwd: repo, env, detached: true, stdio: ['ignore', fd, fd] });
-  child.unref();
-
   const url = `http://127.0.0.1:${port}/`;
-  const inst = { name, pid: child.pid, port, host, url, token, repo, dir, data, projects, log: logFile, claude, started: new Date().toISOString() };
+  const split = Boolean(o.split);
+  const inst = { name, pid: 0, port, host, url, token, repo, dir, data, projects, log: logFile, claude, split, env, started: new Date().toISOString() };
+  // Split: the runner first (it migrates and recovers agents), then the web service, which owns the port.
+  if (split) inst.runnerPid = spawnPart(inst, env, 'runner');
+  inst.pid = spawnPart(inst, env, split ? 'web' : 'all');
   writeFileSync(join(dir, 'instance.json'), JSON.stringify(inst, null, 2));
-  if (!(await health(url, 30000))) {
+  if (!(await health(url, 30000)) || (split && !(await runnerUp(inst, 30000)))) {
     await stop({ name, quiet: true });
-    throw new Error(`Server did not become healthy in 30 s. Last log lines:\n${tail(logFile, 20)}`);
+    throw new Error(`Server did not become healthy in 30 s. Last log lines:\n${tail(logFile, 20)}${split ? `\nrunner:\n${tail(join(dir, 'runner.log'), 20)}` : ''}`);
   }
   inst.cookie = await login(url, token);
   writeFileSync(join(dir, 'instance.json'), JSON.stringify(inst, null, 2));
@@ -226,17 +262,34 @@ async function stop(o) {
   if (!inst) say(`no instance "${name}"`);
   else if (!ours(inst)) say(`"${name}" is not running`);
   else {
-    // The server and anything it spawned (fake agents) share the process group we created.
-    try { process.kill(-inst.pid, 'SIGTERM'); } catch { try { process.kill(inst.pid, 'SIGTERM'); } catch { /* gone */ } }
-    for (let i = 0; i < 40 && ours(inst); i++) await new Promise((r) => setTimeout(r, 100));
-    if (ours(inst)) try { process.kill(-inst.pid, 'SIGKILL'); } catch { /* gone */ }
-    say(`stopped "${name}" (pid ${inst.pid})${o.purge ? '' : `; data kept in ${inst.dir}. Add --purge to remove it.`}`);
+    // Each server process and anything it spawned (fake agents) share a process group we created.
+    const part = o.part ? String(o.part) : null;
+    if (part && !inst.split) throw new Error('--part needs an instance started with --split');
+    if (!part || part === 'web') await killPart(inst, inst.pid);
+    if (!part || part === 'runner') await killPart(inst, inst.runnerPid);
+    say(`stopped ${part ? `the ${part} of ` : ''}"${name}" (pid ${part === 'runner' ? inst.runnerPid : inst.pid}${!part && inst.runnerPid ? `, runner ${inst.runnerPid}` : ''})${o.purge || part ? '' : `; data kept in ${inst.dir}. Add --purge to remove it.`}`);
   }
   // Only ever our own folder under ROOT, and only once nothing of ours runs from it.
   if (o.purge && !ours(inst) && existsSync(instDir(name))) {
     rmSync(instDir(name), { recursive: true, force: true });
     say(`removed ${instDir(name)}`);
   }
+}
+
+/** Restart one half of a split instance (the other keeps running), or start a half that was stopped. */
+async function restart(o) {
+  const name = String(o.name ?? defaultName());
+  const inst = readInstance(name);
+  const part = String(o.part ?? '');
+  if (!inst?.split) throw new Error(`"${name}" is not a split instance (start it with --split)`);
+  if (!['web', 'runner'].includes(part)) throw new Error('restart needs --part web or --part runner');
+  const key = part === 'web' ? 'pid' : 'runnerPid';
+  await killPart(inst, inst[key]);
+  inst[key] = spawnPart(inst, inst.env, part);
+  writeFileSync(join(inst.dir, 'instance.json'), JSON.stringify(inst, null, 2));
+  const ok = part === 'web' ? await health(inst.url, 30000) : await runnerUp(inst, 30000);
+  if (!ok) throw new Error(`The ${part} did not come back in 30 s. Last log lines:\n${tail(part === 'web' ? inst.log : join(inst.dir, 'runner.log'), 20)}`);
+  console.log(JSON.stringify({ restarted: part, pid: inst[key] }));
 }
 
 function list() {
@@ -250,6 +303,7 @@ async function main() {
   const cmd = o._[0];
   if (cmd === 'start') return start(o);
   if (cmd === 'stop') return stop(o);
+  if (cmd === 'restart') return restart(o);
   if (cmd === 'list') return list();
   if (cmd === 'status' || cmd === 'env') {
     const name = String(o.name ?? defaultName());

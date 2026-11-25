@@ -1,57 +1,118 @@
 # Helm
 
-A self-hosted dashboard for directing long-lived Claude agent projects from a phone, tablet or desktop.
-A top-level agent (Fable by default) plans and delegates to worker agents (Opus by default); each agent has
-its own resumable session, worklist, progress bar and transcript. Agents post previews, keep a project
-journal, and put decisions and permission requests in your inbox.
+**Run a team of Claude agents from your phone, and see what they built without reading a transcript.**
+
+<p align="center">
+  <img src="docs/screenshots/home-desktop.png" alt="A project's Home: what needs you, what is running, what just finished" width="72%">
+  <img src="docs/screenshots/home-phone.png" alt="The same Home on a phone" width="24%">
+</p>
+
+Helm is a self-hosted dashboard for long-lived agent projects. You talk to one director; it plans the work as
+tasks, starts builder agents for them, and reports back with pictures. You check in from the couch, decide what
+only you can decide, and move on.
+
+## Why Helm
+
+- **Direct many projects from your phone.** Every project has one Home: what needs you, what is running, what
+  just finished. Answer a question or approve a task with one tap.
+- **The Spec leads.** Each project keeps a Spec: what must be true and how it works. Tasks link to the entries
+  they implement, and agents read it before they start.
+- **Show, don't tell.** Agents post screenshots, before/after comparisons, step-by-step guides and charts. You
+  review the result, not the log.
+- **Rules that make work finish.** A task is not done until its check ran, every "Done when" item is met and
+  the result is shown. Helm enforces it, so nothing quietly stalls half-way.
+
+## A tour
+
+### Home
+One screen per project. Requests waiting on you come first, then running tasks with their progress, then the
+work that just finished, each with its best picture.
+
+<img src="docs/screenshots/home-phone.png" alt="Project Home on a phone" width="300">
+
+### Tasks, with status and previews
+Each task shows its brief, its "Done when" list ticking off, the builder's live status line and every preview it
+posted. Interject at any time; the builder picks it up on its next step.
+
+<img src="docs/screenshots/task-desktop.png" alt="A finished task with its previews" width="720">
+
+### The Spec
+What the project should be, in sections you can nest. Each entry has a summary, a body, its history of decisions
+and the tasks that built it. Changes come as cards you apply or decline.
+
+<img src="docs/screenshots/spec-desktop.png" alt="The Spec: purpose, sections and entries" width="720">
+
+### The director chat
+One conversation for the whole project, docked on every page. Talk an idea through; the director turns it into
+tasks, folds it into ones not yet started, or writes it into the Spec.
+
+<img src="docs/screenshots/chat-phone.png" alt="Talking to the director" width="300">
+
+### Compare and guide previews
+A visual change comes as a before/after from the same viewpoint, side by side or with a slider. Anything you
+should try by hand comes as a numbered guide with a screenshot per step.
+
+<img src="docs/screenshots/compare-desktop.png" alt="A before/after compare preview" width="720">
+
+### Dashboards
+Pages of numbers, charts, tables and image galleries that agents keep current. Each tile records the exact
+recipe that produced it and the commit it came from, and goes Stale when a task changes what it depends on.
+
+<img src="docs/screenshots/dashboard-desktop.png" alt="A dashboard gallery of scenes, kept current by agents" width="720">
+
+### Telemetry
+How long tasks take, how much they cost, how often they needed rework, against the period before. Filter by
+project, tier or work mode, and find the slowest and costliest tasks.
+
+<img src="docs/screenshots/telemetry-phone.png" alt="Telemetry: tokens, work time and throughput against the week before" width="300">
+
+### The Ideas board
+A free canvas for notes, links and images, grouped in frames. When a frame is ready, Discuss turns it into a
+conversation with the director.
+
+<img src="docs/screenshots/ideas-desktop.png" alt="The Ideas board" width="720">
+
+### Claude accounts with failover
+Add more than one Claude account. Each project has a primary and ordered fallbacks: when one hits its usage
+limit, agents carry on with the next, sessions intact, and return once the limit resets.
+
+<img src="docs/screenshots/accounts-phone.png" alt="Claude accounts and their weekly use" width="300">
+
+## Quick start
+
+1. Install Node 24 or newer, and sign in to Claude Code on the machine (`claude`, then `/login`).
+2. Get Helm and start it:
+
+       git clone <this repository> helm && cd helm
+       npm install && npm run build && npm start
+
+3. Open the URL it prints, enter the passphrase it prints, and create your first project. Add it to your
+   phone's home screen.
+
+On NixOS, use the flake's module instead (below).
+
+## Running it
 
 Agents run through the Claude Agent SDK using the Claude Code login of the machine Helm runs on.
 
-## Run
-
-    npm install
-    npm run build        # builds the web app into web/dist
-    npm start            # needs Node 24+ (runs the TypeScript server directly)
-
-The server prints its URL and passphrase. Settings live in `~/.helm/config.json`
-(`port`, `token`, `projectsRoot`, `idleSeconds`); data is in `~/.helm/helm.db`, `~/.helm/artifacts` and
-`~/.helm/attachments` (files the user attached to Spec entries, tasks and messages).
-Environment overrides: `HELM_PORT`, `HELM_HOST`, `HELM_TOKEN`, `HELM_DATA`, `HELM_PROJECTS`, `HELM_CLAUDE_PATH`,
-`HELM_DEBUG=1`, `HELM_LAN_NO_LOGIN=1` and `HELM_LAN_ALLOWED_HOSTS` (see below), `HELM_TRUST_PROXY_SIGNIN` (set by the
-NixOS module's `nginx.signedInBy`), `HELM_ATTACH_MAX_MB` (largest attachment, default 50; the module's
-`attachmentMaxMB`) and `HELM_ATTACH_MAX_FILES` (files per upload request, default 10).
+Settings live in `~/.helm/config.json` (`port`, `token`, `projectsRoot`, `idleSeconds`); data is in `~/.helm/helm.db`,
+`~/.helm/artifacts` and `~/.helm/attachments`. Environment overrides: `HELM_PORT`, `HELM_HOST`, `HELM_TOKEN`,
+`HELM_DATA`, `HELM_PROJECTS`, `HELM_CLAUDE_PATH`, `HELM_DEBUG=1`, `HELM_LAN_NO_LOGIN=1` and `HELM_LAN_ALLOWED_HOSTS`
+(below), `HELM_TRUST_PROXY_SIGNIN` (set by the NixOS module's `nginx.signedInBy`), `HELM_ATTACH_MAX_MB` (largest
+attachment, default 50) and `HELM_ATTACH_MAX_FILES` (files per upload, default 10).
 
 **Local network without the passphrase** (`HELM_LAN_NO_LOGIN=1`, off by default). A request gets in without
-signing in only if it comes from a loopback or private address (behind a proxy on loopback: the `X-Real-IP` it
-reports; forwarding headers from any other peer disqualify the request), its `Host` is this machine's own name or
-address with Helm's port (or is listed in `HELM_LAN_ALLOWED_HOSTS`, comma separated, which stops DNS rebinding),
-and it is not a cross-site browser request (`Origin` must match, and is required on POST/PATCH/PUT/DELETE).
-Anything else falls back to the passphrase. The home page then says "Local network, no sign-in". It means
-anyone on the network, and any program on the machine, can drive agents that run commands as Helm's user: use it
-only on a network you trust. The rules and the threat each one addresses are in `server/lan.ts`.
-
-For UI work run `npm run dev` and `npm run dev:web` side by side.
-
-## Layout
-
-- `server/runtime.ts`  agent sessions: start, resume, message routing, permission requests
-- `server/tools.ts`    the tools agents use to report to the dashboard (worklist, previews, inbox, journal, spawn)
-- `server/structure.ts` team templates and the system prompt each role gets
-- `server/api.ts`      HTTP API and the live update stream
-- `web/src`            the React app
-
-- `nix/package.nix`    the Nix package; `nix/module.nix` the NixOS module (`services.helm`)
+signing in only from a loopback or private address, with a `Host` that is this machine's own name or address and
+Helm's port (or listed in `HELM_LAN_ALLOWED_HOSTS`), and not cross-site (`Origin` must match, and is required on
+writes). Anything else falls back to the passphrase. Anyone on the network can then drive agents that run commands
+as Helm's user: use it only on a network you trust. The rules and the threat each one stops are in `server/lan.ts`.
 
 ## NixOS
 
 `flake.nix` exposes `packages.<system>.default` (x86_64-linux, aarch64-linux) and `nixosModules.default`.
-The package builds the web app and ships the server, `web/dist` and production `node_modules`; `bin/helm` runs
-`node server/main.ts`. Dependencies are fetched by their `package-lock.json` integrity hashes (`importNpmLock`),
-so there is no `npmDepsHash` to refresh when dependencies change. The SDK's prebuilt Claude binaries are left
-out (they don't run on NixOS); Helm uses `HELM_CLAUDE_PATH`.
 
     # flake inputs
-    helm.url = "git+ssh://...";   # or git+file:///path/to/helm
+    helm.url = "git+file:///path/to/helm";
     helm.inputs.nixpkgs.follows = "nixpkgs";
 
     # configuration
@@ -63,45 +124,35 @@ out (they don't run on NixOS); Helm uses `HELM_CLAUDE_PATH`.
       nginx = { enable = true; domain = "helm.example.com"; };
     };
 
-It runs as a system service (`systemctl status helm`, `journalctl -u helm`) as that user, with data in
-`~/.helm` by default. Options: `port`, `host`, `dataDir`, `projectsRoot`, `claudePath`, `extraPath` (tools for
-agents), `environment`, `openFirewall`, `lanNoLogin` and `lanAllowedHosts` (above), and for the proxy `nginx.signedInBy` (skip the passphrase for
-requests that passed the gate in `nginx.locationExtraConfig`: nginx sends `X-Helm-Signed-In: 1` there and clears it
-everywhere else, and Helm believes it only from loopback), `nginx.useACMEHost`, `nginx.extraConfig` (server
-level, e.g. a CDN's real-IP rules) and `nginx.locationExtraConfig` (e.g. an `auth_request` gate). The proxy
-streams `/api/stream` unbuffered and limits `/api/login` to 5 a minute per address. Behind HTTPS the session
-cookie is marked `Secure` (from `X-Forwarded-Proto`).
+It runs as a system service as that user, with data in `~/.helm` by default. Options: `port`, `host`, `dataDir`,
+`projectsRoot`, `claudePath`, `extraPath` (tools for agents), `environment`, `openFirewall`, `lanNoLogin` and
+`lanAllowedHosts`, and for the proxy `nginx.signedInBy` (trust a sign-in gate in `nginx.locationExtraConfig`),
+`nginx.useACMEHost`, `nginx.extraConfig` and `nginx.locationExtraConfig`. The proxy streams `/api/stream`
+unbuffered and limits `/api/login` to 5 a minute per address.
 
 ### Live update
 
 With `services.helm.liveUpdate = { enable = true; repo = "/path/to/helm"; }` (`ref` defaults to `release`), Helm
-is updated without a system rebuild:
+updates itself without a system rebuild:
 
-- `helm.service` starts whatever `<dataDir>/live/current` points at, or the packaged build when there is none.
-- `systemctl start helm-update` (or **Update now** on the dashboard's Helm page, reached from "Helm <rev>" at the
-  foot of the sidebar or project list) builds `git+file://<repo>?ref=<ref>#default` as the service user into
-  `<dataDir>/live/generations/gen-N` (nix out-links, so GC roots; the last `keep` = 5 are kept), switches
-  `current` to it, restarts Helm, and waits up to `healthTimeout` (60 s) for `/` and `/api/health` to answer with the
-  new revision. If they do not, it switches back and restarts again. A failed build restarts nothing; building
-  runs beside the live server.
-- `systemctl start helm-rollback` (or **Roll back**) switches to the previous build the same way.
-- Each stage is written to `<dataDir>/live/status.json`, which the dashboard shows; the page survives the restart
-  and reloads itself. `journalctl -u helm-update` has the full story.
-- Agents that were mid-turn when a planned update or rollback restarted Helm are resumed with a note once the new
-  server is healthy. After a crash, a manual restart or a rolled-back update they stay Stopped.
-- A polkit rule lets the service user start exactly those two units and restart `helm.service`, nothing else. That
-  means every agent can replace and restart Helm (they could already run any code as that user).
-- Changes to the module or the NixOS config (options, nginx, PATH packages) still need `nixos-rebuild switch`. To get
-  out of a bad state by hand: `rm <dataDir>/live/current` and restart Helm, which runs the packaged build again.
+- **Update now** on the dashboard's Helm page (or `systemctl start helm-update`) builds the `release` branch,
+  switches to it, restarts Helm and waits for `/api/health` to report the new revision. If it does not, it
+  switches back. A failed build restarts nothing.
+- **Roll back** (or `systemctl start helm-rollback`) switches to the previous build the same way.
+- Agents that were mid-turn when a planned update restarted Helm are resumed once the new server is healthy.
+- To get out of a bad state by hand: `rm <dataDir>/live/current` and restart Helm, which runs the packaged build.
+
+Changes to the module or the NixOS config still need `nixos-rebuild switch`.
 
 ## Deploying a change
 
-With live update on, point the flake input at a `release` branch of your checkout, so work in progress on the main
-branch is never deployed by accident. Deploying is then:
+Point the flake input at a `release` branch of your checkout, so work in progress is never deployed by accident:
 
     git branch -f release <commit>
     # then Update now on the dashboard's Helm page, or:
-    systemctl start helm-update      # no sudo needed (polkit); follow it with journalctl -fu helm-update
+    systemctl start helm-update
 
-Changes to the module itself (nix/module.nix) or to your NixOS configuration still need a system rebuild, from a
-terminal (not from the dashboard: the switch restarts Helm and stops every agent).
+## Working on Helm
+
+See [CLAUDE.md](CLAUDE.md) for the code layout, conventions and checks. For UI work run `npm run dev` and
+`npm run dev:web` side by side.

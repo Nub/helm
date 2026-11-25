@@ -1,10 +1,11 @@
 import { all } from './db.ts';
 import type { Row } from './db.ts';
 import { hostsPromptSection } from './hosts.ts';
-import { SESSION_EXTRAS } from './runtime.ts';
+import { SESSION_EXTRAS } from './agents.ts';
 import { itemsForProject, safeName } from './toolbox.ts';
 import { FINISHED, getAgent, projectStructure } from './store.ts';
 import { buildSystemPrompt } from './structure.ts';
+import { knowledgeForPrompt } from './knowledge.ts';
 import { listHelmTools } from './tools.ts';
 
 // What Setup shows about each role: the instructions Helm would send an agent of that
@@ -24,16 +25,15 @@ export function teamDetails(project: Row) {
       agent = sample;
       parent = sample.parent_id ? getAgent(sample.parent_id) : undefined;
     } else {
-      const spawner = structure.roles.find((r) => r.canSpawn.includes(role.id));
-      // The quick helper role is mostly started by quick_job, from any agent.
-      const quick = role.id === structure.quickRole;
-      agent = { name: `(${role.name} agent's name)`, role_id: role.id, parent_id: isRoot ? null : '(parent)', quick: quick ? 1 : 0 };
-      parent = isRoot ? undefined : { name: quick ? "(the asking agent's name)" : `(${spawner?.name ?? 'Parent'} agent's name)` };
+      // Builders report to the director, who Helm starts them for (dispatch.ts).
+      const director = structure.roles.find((r) => r.id === structure.root);
+      agent = { name: `(${role.name} agent's name)`, role_id: role.id, parent_id: isRoot ? null : '(parent)', quick: 0 };
+      parent = isRoot ? undefined : { name: `(${director?.name ?? 'Parent'} agent's name)` };
     }
     return {
       id: role.id,
       sample: sample ? { id: sample.id, name: sample.name } : null,
-      systemPrompt: buildSystemPrompt(project, structure, role, agent, parent, hostsPromptSection(project.id)),
+      systemPrompt: buildSystemPrompt(project, structure, role, agent, parent, hostsPromptSection(project.id), knowledgeForPrompt(project.id, agent)),
       tools: listHelmTools(structure, role.id, agent.parent_id ?? null, !!agent.quick),
     };
   });

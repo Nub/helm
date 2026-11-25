@@ -1,0 +1,265 @@
+/* Multi-image comparison (multicompare.tsx). Shared classes (segmented, btn, split-tag, compare-frame, slider-*)
+   come from styles.css; this file only adds what the comparison of many images needs. */
+
+.mc {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+  min-width: 0;
+}
+.mc-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.mc-modes {
+  flex: 1 1 320px;
+  max-width: 480px;
+}
+/* Four modes fit a 390 px phone on one line: each tab as wide as its words. */
+.mc .mc-modes button {
+  flex: 1 1 auto;
+  padding: 0 6px;
+  white-space: nowrap;
+}
+@media (max-width: 420px) {
+  .mc .mc-modes button {
+    font-size: 0.8rem;
+  }
+}
+.mc-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+.mc-fit {
+  font-variant-numeric: tabular-nums;
+}
+.mc-fit:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.mc .ann-open-btn {
+  border-color: var(--line-strong);
+  background: var(--surface-2);
+  color: var(--text);
+}
+.mc-note {
+  margin: 0;
+  color: var(--muted);
+}
+.mc-pick {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.mc-chip-btn {
+  max-width: 14em;
+}
+.mc-chip-btn span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Grid */
+/* Each figure is three rows of the grid (label, image, caption), so the images of a row line up whatever the labels. */
+.mc-grid {
+  display: grid;
+  gap: 6px 12px;
+}
+.mc-fig {
+  margin: 0 0 8px;
+  display: grid;
+  grid-row: span 3;
+  grid-template-rows: subgrid;
+  min-width: 0;
+}
+.mc-fig figcaption {
+  align-self: end;
+}
+.mc-fig figcaption {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.mc-fig figcaption .ann-open-btn {
+  flex: none;
+}
+.mc-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 650;
+  font-size: 0.86rem;
+  color: var(--text);
+}
+
+/* Image area: the shared view moves the content inside a frame of the images' shape. */
+.mc-pane-wrap {
+  width: 100%;
+  margin: 0 auto;
+}
+.mc-pane {
+  touch-action: pan-y;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  outline: none;
+}
+.mc-pane:focus-visible {
+  box-shadow: 0 0 0 3px var(--accent);
+}
+.mc-pane.zoomed {
+  touch-action: none;
+  cursor: grab;
+}
+.mc-pane.zoomed:active {
+  cursor: grabbing;
+}
+.mc-pane.slides:not(.zoomed) {
+  cursor: ew-resize;
+}
+.mc-pane.taps:not(.zoomed) {
+  cursor: pointer;
+}
+.mc-content {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+}
+.compare-frame .mc-content img,
+.mc-content canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  max-width: none;
+}
+.mc-diff {
+  image-rendering: pixelated;
+  background: #000;
+}
+.mc-clip {
+  position: absolute;
+  inset: 0;
+}
+.mc-loading,
+.mc-missing {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 8px;
+  text-align: center;
+  color: var(--muted);
+}
+.mc-missing {
+  width: 100%;
+  font-size: 0.85rem;
+}
+
+/* Labels over the image wrap instead of being cut off. */
+.mc .mc-tag {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 0.74rem;
+}
+.mc .mc-tag-wide {
+  max-width: calc(100% - 14px);
+}
+
+/* Slider: which two images */
+.mc-pairs {
+  display: grid;
+  gap: 6px;
+}
+.mc-pair {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.mc-side {
+  flex: none;
+  width: 1.4em;
+  font-weight: 700;
+  color: var(--muted);
+  text-align: center;
+}
+
+/* Label chips: one scrolling row */
+.mc-chips {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding: 2px;
+}
+.mc-chips::-webkit-scrollbar {
+  display: none;
+}
+.mc-chips button {
+  flex: none;
+  max-width: 14em;
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-2, var(--muted));
+  font: inherit;
+  font-size: 0.84rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.mc-chips button span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mc-chips button.on {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-ink, #000);
+}
+.mc-chips button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.mc-captions {
+  margin: 0;
+  display: grid;
+  gap: 8px;
+}
+.mc-captions dd {
+  margin: 2px 0 0;
+}
+
+/* Touch: tap targets of 44 px. */
+@media (pointer: coarse) {
+  .mc-modes button,
+  .mc-chips button,
+  .mc-tools .btn,
+  .mc-tools .ann-open-btn,
+  .mc-pick .btn {
+    min-height: 44px;
+  }
+}
+
+.mc-compact {
+  gap: 6px;
+}
+.mc-compact .mc-modes {
+  flex-basis: 260px;
+}

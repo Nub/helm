@@ -3,7 +3,7 @@
 // The server side (ids, lookup, the find tool) is server/refs.ts.
 
 export const REF_PREFIXES = ['task', 'disc', 'doc', 'pv', 'rp', 'ag', 'att', 'tb', 'host'] as const;
-export const PAGES = ['overview', 'tasks', 'discussions', 'spec', 'previews', 'history', 'setup', 'agents', 'reports', 'hosts', 'toolbox', 'helm'] as const;
+export const PAGES = ['overview', 'tasks', 'discussions', 'spec', 'knowledge', 'dashboards', 'releases', 'ship', 'previews', 'history', 'setup', 'agents', 'reports', 'hosts', 'toolbox', 'helm'] as const;
 export type Page = (typeof PAGES)[number];
 
 const ID = `(?:${REF_PREFIXES.join('|')})_[0-9a-f]{10}`;
@@ -52,15 +52,21 @@ export type RefInfo = {
 export type Resolve = (id: string) => RefInfo | null | undefined;
 
 const PAGE_LABEL: Record<Page, string> = {
-  overview: 'Overview', tasks: 'Tasks', discussions: 'Discussions', spec: 'Spec', previews: 'Previews', history: 'History', setup: 'Setup',
+  overview: 'Overview', tasks: 'Tasks', discussions: 'Discussions', spec: 'Spec', knowledge: 'Knowledge', dashboards: 'Dashboards', releases: 'Releases', ship: 'Ship', previews: 'Previews', history: 'History', setup: 'Setup',
   agents: 'Agents', reports: 'Reports', hosts: 'Hosts', toolbox: 'Toolbox', helm: 'Helm updates',
 };
 /** Pages outside any project. */
 const GLOBAL_PAGES: Page[] = ['hosts', 'toolbox', 'helm'];
+/**
+ * Pages folded into others: where an old [[page:…]] link lands now (Releases a section of Ship, Hosts a section of System, History the journal at
+ * the bottom of Home, Knowledge a section of Setup, Previews on their tasks and found from Home's search).
+ */
+const MOVED: Partial<Record<Page, string>> = { releases: 'ship', hosts: 'system/hosts', toolbox: 'system/tools', previews: 'gallery', history: 'overview/journal', knowledge: 'setup/knowledge' };
 
 export function pageHref(page: Page, projectId: string | null): string | null {
+  if (page === 'hosts' || page === 'toolbox') return `#/${MOVED[page]}`;
   if (GLOBAL_PAGES.includes(page)) return `#/${page}`;
-  return projectId ? `#/p/${encodeURIComponent(projectId)}/${page}` : null;
+  return projectId ? `#/p/${encodeURIComponent(projectId)}/${MOVED[page] ?? page}` : null;
 }
 
 const KIND_WORD: Record<string, string> = {
@@ -92,7 +98,7 @@ export const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', 
 /** Icon per kind: names in ui.tsx's icon set. */
 export const KIND_ICON: Record<string, string> = {
   task: 'tasks', discussion: 'discuss', doc: 'spec', preview: 'previews', report: 'reports', agent: 'agents', attachment: 'file', toolbox: 'toolbox', host: 'hosts',
-  overview: 'overview', tasks: 'tasks', discussions: 'discuss', spec: 'spec', previews: 'previews', history: 'history', setup: 'setup', agents: 'agents', reports: 'reports',
+  overview: 'overview', tasks: 'tasks', discussions: 'discuss', spec: 'spec', knowledge: 'knowledge', dashboards: 'dashboards', releases: 'ship', ship: 'ship', previews: 'previews', history: 'history', setup: 'setup', agents: 'agents', reports: 'reports',
   hosts: 'hosts', helm: 'home',
 };
 const PREFIX_KIND: Record<string, string> = { task: 'task', disc: 'discussion', doc: 'doc', pv: 'preview', rp: 'report', ag: 'agent', att: 'attachment', tb: 'toolbox', host: 'host' };
@@ -117,7 +123,9 @@ export function chipHtml(t: RefToken, env: ChipEnv): string {
   if (r === null) return `<span class="ref ref-missing" title="Not found in Helm">${esc(t.label ?? t.id)}</span>`;
   const other = r.project_id && env.projectId && r.project_id !== env.projectId ? r.project_name : null;
   const state = stateLabel(r.state);
-  const lead = r.thumb ? `<img class="ref-img" src="${esc(r.thumb)}" alt="" loading="lazy">` : icon(r.kind);
+  // One mark per kind, so a discussion is never taken for a task: a task its state dot; a discussion a speech bubble
+  // (and its own colour, styles.css); a Spec entry a document; a preview an image; others their kind's icon or thumbnail.
+  const lead = r.kind === 'task' ? '<span class="ref-dot" aria-hidden="true"></span>' : r.kind === 'preview' || !r.thumb ? icon(r.kind) : `<img class="ref-img" src="${esc(r.thumb)}" alt="" loading="lazy">`;
   const title = t.label ?? r.title;
   return (
     `<a class="ref ref-${r.kind}${r.state ? ` st-${esc(r.state)}` : ''}" href="${esc(r.href)}" title="${esc(`${kindWord(t.id)}: ${r.title}${other ? ` (${other})` : ''}`)}">` +

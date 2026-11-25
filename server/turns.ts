@@ -12,7 +12,7 @@ import { addTaskMessage, getTask } from './tasks.ts';
  */
 export type Trigger = { dialogue: boolean; about: string | null };
 
-const TAG = /^<(agent-report|user-answer|helm-note|task-message|discussion-message|toolbox-question|agent-question|review-request|manager-answer|permission-requests)([^>]*)>/;
+const TAG = /^<(agent-report|user-answer|helm-note|task-message|discussion-message|project-message|toolbox-question|agent-question|review-request|manager-answer|permission-requests)([^>]*)>/;
 const attr = (attrs: string, name: string) => new RegExp(`\\b${name}="([^"]*)"`).exec(attrs)?.[1] ?? null;
 
 export function classifyTrigger(text: string, from: { kind: string } | undefined): Trigger {
@@ -21,6 +21,8 @@ export function classifyTrigger(text: string, from: { kind: string } | undefined
   const [, tag, attrs] = m;
   if (tag === 'task-message') return { dialogue: false, about: attr(attrs, 'task') };
   if (tag === 'discussion-message') return { dialogue: false, about: attr(attrs, 'discussion') };
+  // Another project's director (crossproject.ts): about this side of the thread.
+  if (tag === 'project-message') return { dialogue: false, about: attr(attrs, 'discussion') };
   // Asked on a Toolbox item; the answer goes to the item's thread through propose_tool.
   if (tag === 'toolbox-question') return { dialogue: false, about: null };
   // Between an agent and its manager (consults.ts); the task's thread already shows the pair, so the reply is not added there.
@@ -88,6 +90,8 @@ export function inDialogue(agentId: string, e: Row): boolean {
   if (e.kind === 'inbound') return e.data?.from?.kind === 'user';
   if (e.kind === 'result') {
     if (!e.data?.ok) return true;
+    // Rewritten shorter at Helm's request (brevity.ts): the rewrite is shown instead.
+    if (e.data.replaced) return false;
     if (typeof e.data.dialogue === 'boolean') return e.data.dialogue;
     return isDialogueTurn(turnInbound(agentId, e.id));
   }

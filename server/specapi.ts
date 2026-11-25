@@ -1,13 +1,15 @@
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { get } from './db.ts';
 import type { Row } from './db.ts';
-import { rootAgent, sendToAgent } from './runtime.ts';
+import { rootAgent, sendToAgent, tellDirector } from './agents.ts';
 import { DOC_STATUSES, getProject } from './store.ts';
 import { getTask, moveTask } from './tasks.ts';
 import { NOT_A_KIND, STEERABLE, placeDoc, importanceHistory, setImportance, setImportanceLimits, setImportanceOrder, targetOf, unpinImportance, docHistory, addSection, deleteSection, ensureSectionPath, getDoc, placeSection, normTags, revertDoc, revisions, saveDoc, setSectionOrder, unorganised, updateSection } from './spec.ts';
 import type { DocInput, Editor } from './spec.ts';
-import { sendThreadMessage, tellDirector } from './taskapi.ts';
+import { sendThreadMessage } from './taskapi.ts';
 import { pendingAttachments } from './attachments.ts';
+import { SPEC_MODES, beginSpecWork, decideEntry, getSpecItem, getSpecWork, setSpecWorkStop, specCardView } from './specwork.ts';
+import type { SpecMode } from './specwork.ts';
 import { applyProposal, declineProposal, getProposal, proposalView, startSpecDiscussion } from './specdiscuss.ts';
 
 const OWNER: Editor = { author: 'user', name: 'You' };
@@ -46,8 +48,8 @@ function organiseMessage(projectId: string): string {
       (u.unsectioned || u.unsummarised ? ` Right now ${u.unsectioned} entries have no section and ${u.unsummarised} have no summary.` : ''),
     `- Every entry is one kind now: its summary says what must be true, its text how it works. Where two entries describe the what and the how of the same subject (an old goal and its design), merge them into one entry and keep the other's useful text in it; tell me which you merged.`,
     `- Group entries into a handful of sections (chapters such as "Dashboard" or "Deployment"), each with a one-line description, in a sensible reading order (set_section).`,
-    `- Sections may nest up to three levels (set_section with parent). Where a section holds more than about eight entries or mixes clearly separate subjects, propose subsections; do not nest for its own sake. Moving entries and sections is organisation, not a change of meaning.`,
-    `- Give every entry a summary: one or two sentences that stand on their own in the collapsed view.`,
+    `- Sections may nest up to three levels (set_section with parent). A section without subsections holds at most eight entries and gets subsections only once it holds eight; do not nest for its own sake. Moving entries and sections is organisation, not a change of meaning.`,
+    `- Give every entry a summary: one sentence (at most 30 words) that stands on its own in the collapsed view.`,
     `- Keep tags few and shared: at most three per entry, short ones that cut across sections (for example ios, security, needs-user), none that only repeats the section or title. Merge near-synonyms and drop tags used once with retag, in one call per change.`,
     `- Recalibrate importance to fit the budgets (list_importance, then set_importance in one call): Critical only where the project fails its purpose without it or it blocks most other work, High for what the current phase requires, most entries Medium, each High and Critical with a one-line reason. Leave levels I pinned as they are.`,
     `- Entry text describes the intended result only. Move "where it stands" and progress paragraphs out of the bodies: progress belongs on tasks (status summaries) and in the journal.`,
@@ -245,6 +247,48 @@ export function registerSpecApi(app: FastifyInstance) {
     const project = getProject((req.params as any).id);
     if (!project) return bad(reply, 'No such project', 404);
     return { limits: setImportanceLimits(project.id, (req.body ?? {}) as any) };
+  });
+
+  /**
+   * Spec work (specwork.ts): Review, Revise or Create, each a discussion with the director. A new one starts with the
+   * user's ask as their first message, with the mode's brief for the director; an open one of the mode is resumed.
+   */
+  app.post('/api/projects/:id/spec-work', async (req, reply) => {
+    const project = getProject((req.params as any).id);
+    if (!project) return bad(reply, 'No such project', 404);
+    const b = (req.body ?? {}) as Record<string, any>;
+    if (!SPEC_MODES.includes(b.mode)) return bad(reply, `mode is one of ${SPEC_MODES.join(', ')}.`);
+    const res = await beginSpecWork(project.id, b.mode as SpecMode, { ask: typeof b.ask === 'string' ? b.ask : '', section: typeof b.section === 'string' ? b.section : '', findings: Array.isArray(b.findings) ? b.findings.map(String) : [] });
+    if ('error' in res) return bad(reply, res.error);
+    return { id: res.discussion.id, created: res.created };
+  });
+
+  /** Stop after the current section, or continue (the bar at the top of a Spec work discussion). */
+  app.post('/api/spec-work/:id/:action', async (req, reply) => {
+    const { id, action } = req.params as any;
+    const d = getTask(id);
+    if (!d || !getSpecWork(id)) return bad(reply, 'No such Spec work', 404);
+    if (action !== 'stop' && action !== 'continue') return bad(reply, 'stop or continue', 404);
+    const res = setSpecWorkStop(d, action === 'stop');
+    if ('error' in res) return bad(reply, res.error, 409);
+    await tellDirector(d.project_id, res.note);
+    return { ok: true };
+  });
+
+  /** A findings or proposed-entries card in a Spec work thread. */
+  app.get('/api/spec-cards/:message', async (req, reply) => {
+    const v = specCardView(Number((req.params as any).message));
+    return v ?? bad(reply, 'No such card', 404);
+  });
+
+  /** Accept (written as the user's entry) or drop a proposed entry. The director sees the tally with its next post. */
+  app.post('/api/spec-items/:id/:action', async (req, reply) => {
+    const { id, action } = req.params as any;
+    const item = getSpecItem(id);
+    if (!item) return bad(reply, 'No such item', 404);
+    if (action !== 'accept' && action !== 'drop') return bad(reply, 'accept or drop', 404);
+    const res = decideEntry(item, action === 'accept');
+    return 'error' in res ? bad(reply, res.error, res.code ?? 400) : { ok: true };
   });
 
   /** "Ask the director to organise the Spec": sent as the owner's own message, so it shows in the conversation. */

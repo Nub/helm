@@ -1,7 +1,7 @@
 import { all, get, newId, now, run, tx } from './db.ts';
 import type { Row } from './db.ts';
 import { getAgent, inboxView, onTouch, touchProject } from './store.ts';
-import { notifyRequest, safe } from './notify.ts';
+import { notifyRequest, notifyRequests, safe } from './notify.ts';
 import { createTask, getTask, taskRef } from './tasks.ts';
 import { formatRequestText, splitAction } from './reqformat.ts';
 import type { Author } from './tasks.ts';
@@ -15,13 +15,14 @@ import type { Author } from './tasks.ts';
  *
  * Where a request lands when nothing names a task:
  * - question or action: the asking agent's task; else a new discussion titled from the question.
- * - permission: the requesting agent's task; else that agent's standing "Requests from <name>" discussion
+ * - permission and agent_error: the agent's task; else that agent's standing "Requests from <name>" discussion
  *   (tasks.requests_agent_id), reused while it is open.
  * - structure and any other kind: a new discussion titled from the request.
  */
 
 /** action: something the user must do outside Helm ("To do"), answered Done or Can't / not yet. */
-export type RequestKind = 'question' | 'action' | 'permission' | 'structure';
+/** agent_error: an agent stopped with an error (agenterrors.ts), answered Resume, Ask the director or Close the agent. */
+export type RequestKind = 'question' | 'action' | 'permission' | 'structure' | 'agent_error';
 
 /** The answers an action request takes. */
 export const ACTION_CHOICES = ['Done', "Can't / not yet"] as const;
@@ -93,8 +94,8 @@ export function homeFor(projectId: string, agent: Row | undefined, kind: string,
   if (named) return named;
   const own = agent?.task_id ? getTask(agent.task_id) : undefined;
   const then = !own || askedAt === undefined || own.created_at <= askedAt;
-  if (own && then && own.project_id === projectId && (kind === 'question' || kind === 'action' || kind === 'permission')) return own;
-  if (kind === 'permission' && agent) return standingDiscussion(projectId, agent);
+  if (own && then && own.project_id === projectId && (kind === 'question' || kind === 'action' || kind === 'permission' || kind === 'agent_error')) return own;
+  if ((kind === 'permission' || kind === 'agent_error') && agent) return standingDiscussion(projectId, agent);
   return createTask(projectId, { title: title.slice(0, 160), state: 'open', origin: 'director', kind: 'discussion' }, byAgent(agent));
 }
 
@@ -114,24 +115,113 @@ export function createRequest(input: {
   status?: 'open' | 'director' | 'check';
   /** No phone notification of its own (the disk guard sent one already). */
   silent?: boolean;
-}): { id: string; home: Row } {
+}): { id: string; home: Row; held: boolean } {
+  let held = false;
   const out = tx(() => {
     const agent = input.agentId ? getAgent(input.agentId) : undefined;
     const home = homeFor(input.projectId, agent, input.kind, input.title, input.task);
     const id = newId('in');
+    // Filed by an agent in the middle of its turn: held until the turn ends (releaseHeld), so the user sees only the
+    // final form, in one notification. Permission prompts and agent errors stop work and are never held.
+    held = !!agent && agent.status === 'working' && HOLDABLE.includes(input.kind) && (input.status ?? 'open') === 'open';
     run(
       'INSERT INTO inbox (id, project_id, agent_id, kind, title, body, options, payload, importance, blocking, created_at, task_id, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
       id, input.projectId, input.agentId, input.kind, input.title, input.body,
-      JSON.stringify(input.options ?? []), JSON.stringify(input.payload ?? {}), input.importance, input.blocking ? 1 : 0, now(), home.id, input.status ?? 'open',
+      JSON.stringify(input.options ?? []), JSON.stringify(input.payload ?? {}), input.importance, input.blocking ? 1 : 0, now(), home.id, held ? 'held' : input.status ?? 'open',
     );
-    // New activity: it sorts up among discussions, and a cold one warms.
-    run('UPDATE tasks SET updated_at = ? WHERE id = ?', now(), home.id);
+    // New activity: it sorts up among discussions. A discussion's revisit reminder is not activity (discrevisit.ts).
+    if (!(input.payload as Row | undefined)?.revisit) run('UPDATE tasks SET updated_at = ? WHERE id = ?', now(), home.id);
     return { id, home };
   });
   touchProject(input.projectId);
-  // A phone notification (server/notify.ts); asynchronous, and it cannot fail the request.
-  if (!input.silent) safe(() => notifyRequest(out.id));
-  return out;
+  // A phone notification (server/notify.ts); asynchronous, and it cannot fail the request. A held one is notified
+  // when it is released, with the rest of its turn's.
+  if (!input.silent && !held) safe(() => requestNotices.one(out.id));
+  return { ...out, held };
+}
+
+/** How requests reach the phone (notify.ts); tests replace these. */
+export const requestNotices = { one: (id: string) => notifyRequest(id), many: (ids: string[]) => notifyRequests(ids) };
+
+/** Kinds held until the filing agent's turn ends: what the user answers in their own time. */
+const HOLDABLE: string[] = ['question', 'action', 'structure'];
+
+/**
+ * The agent's turn ended: its held requests are shown now, as they are (their time is when they were shown), with one
+ * phone notification for the lot. Returns their ids.
+ */
+export function releaseHeld(agentId: string): string[] {
+  const rows = all("SELECT id, project_id FROM inbox WHERE agent_id = ? AND status = 'held' ORDER BY created_at", agentId);
+  if (!rows.length) return [];
+  const at = now();
+  tx(() => {
+    for (const r of rows) run("UPDATE inbox SET status = 'open', created_at = ? WHERE id = ? AND status = 'held'", at, r.id);
+  });
+  for (const p of new Set(rows.map((r) => r.project_id as string))) touchProject(p);
+  const ids = rows.map((r) => r.id as string);
+  safe(() => requestNotices.many(ids));
+  return ids;
+}
+
+/** Held requests untouched this long are final: shown even while the agent's turn goes on (a director's runs long). */
+export const QUIET_MS = 3 * 60_000;
+
+/** An agent's held requests none of which was filed, replaced or withdrawn for QUIET_MS: shown now. Timer side. */
+export function releaseQuiet(at = now()): number {
+  const agents = all("SELECT agent_id FROM inbox WHERE status = 'held' GROUP BY agent_id HAVING MAX(created_at) <= ?", at - QUIET_MS);
+  let n = 0;
+  for (const a of agents) n += releaseHeld(a.agent_id).length;
+  return n;
+}
+
+/** Held requests whose agent is no longer mid-turn (its process ended without a result): shown now. Timer side. */
+export function releaseStale(): number {
+  const agents = all("SELECT DISTINCT i.agent_id FROM inbox i LEFT JOIN agents a ON a.id = i.agent_id WHERE i.status = 'held' AND (a.id IS NULL OR a.status != 'working')");
+  let n = 0;
+  for (const a of agents) n += releaseHeld(a.agent_id).length;
+  return n;
+}
+
+/**
+ * Withdraw a request: one not shown yet is dropped as if never filed; one shown is closed as withdrawn with the
+ * reason (the thread shows it). A shown request never changes: to change one, withdraw it and file a new one.
+ * Returns an error, or null.
+ */
+export function withdrawRequest(id: string, reason: string): string | null {
+  const r = get('SELECT * FROM inbox WHERE id = ?', id);
+  if (!r) return `No request ${id}.`;
+  if (r.status === 'held') {
+    tx(() => {
+      run('DELETE FROM inbox WHERE id = ?', id);
+      // A withdrawal touches the agent's other held requests: the quiet spell starts again (releaseQuiet).
+      run("UPDATE inbox SET created_at = ? WHERE agent_id = ? AND status = 'held'", now(), r.agent_id);
+      needsAnswered(id);
+      run('UPDATE proposal_rounds SET request_id = NULL WHERE request_id = ?', id);
+    });
+    return null;
+  }
+  // Answered "not now" with a reminder pending (reminders.ts): withdrawing it cancels the reminder.
+  if (r.status !== 'open') {
+    const rem = get("SELECT id FROM request_reminders WHERE request_id = ? AND status = 'pending'", id);
+    if (!rem) return `Request ${id} is already ${r.status}.`;
+    run("UPDATE request_reminders SET status = 'cancelled', reason = ?, done_at = ? WHERE id = ?", `withdrawn: ${reason}`.slice(0, 200), now(), rem.id);
+    touchProject(r.project_id);
+    return null;
+  }
+  tx(() => {
+    run("UPDATE inbox SET status = 'withdrawn', answer = ?, answered_at = ? WHERE id = ? AND status = 'open'", reason.replace(/\s+/g, ' ').trim().slice(0, 200), now(), id);
+    needsAnswered(id);
+  });
+  touchProject(r.project_id);
+  return null;
+}
+
+/** An open or held request on the task that a new one would repeat: the same kind and title, or the same text. */
+export function repeatedRequest(taskId: string, kind: string, title: string, body: string): Row | undefined {
+  return get(
+    "SELECT * FROM inbox WHERE task_id = ? AND kind = ? AND status IN ('open', 'held') AND (lower(trim(title)) = lower(trim(?)) OR trim(body) = trim(?)) LIMIT 1",
+    taskId, kind, title, body,
+  );
 }
 
 /** For the agent: where its request landed. */
@@ -240,7 +330,7 @@ export function needingResponse(view: (t: Row) => Row, projectId?: string): { pr
 // ---------- what a task needs from the user (update_task needs_from_user) ----------
 
 /** A task's open requests the user answers in words or by doing: questions and to-dos, newest first. */
-const openAsks = (taskId: string) => all("SELECT * FROM inbox WHERE task_id = ? AND status = 'open' AND kind IN ('question', 'action') ORDER BY created_at DESC", taskId);
+const openAsks = (taskId: string) => all("SELECT * FROM inbox WHERE task_id = ? AND status IN ('open', 'held') AND kind IN ('question', 'action') ORDER BY created_at DESC", taskId);
 
 /**
  * Record what a task needs from the user and make sure a request carries it: with a question or to-do already open

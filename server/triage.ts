@@ -1,4 +1,3 @@
-import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { PermissionUpdate } from '@anthropic-ai/claude-agent-sdk';
 import { execFileSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
@@ -12,6 +11,8 @@ import type { Row } from './db.ts';
 import { addEvent, getAgent, getProject, touchProject } from './store.ts';
 import { getTask, taskRef } from './tasks.ts';
 import { notifyRequest, safe } from './notify.ts';
+import { resolvePermission } from './agents.ts';
+import { runnerOnly } from './role.ts';
 
 /**
  * Permission triage: what happens to an agent's permission request (the SDK's canUseTool, runtime.ts) before, or
@@ -58,6 +59,7 @@ export function setTriageHooks(h: Hooks) {
 }
 
 export function waitFor(id: string, signal: AbortSignal): Promise<PermissionDecision> {
+  runnerOnly('waiting on a permission answer (triage.waitFor)');
   return new Promise<PermissionDecision>((resolve) => {
     resolvers.set(id, resolve);
     signal.addEventListener('abort', () => resolve({ allow: false, always: false, message: 'Cancelled.', aborted: true }), { once: true });
@@ -90,9 +92,15 @@ export function settle(id: string, decision: PermissionDecision, record: { statu
   const item = get('SELECT project_id, task_id FROM inbox WHERE id = ?', id)!;
   if (item.task_id) run('UPDATE tasks SET updated_at = ? WHERE id = ?', now(), item.task_id);
   touchProject(item.project_id);
-  // No resolver means the request belonged to a process that has since ended.
-  resolvers.get(id)?.(decision);
+  // Wake the waiting agent: here if this process runs it, otherwise through the runner's queue (server/agents.ts).
+  resolvePermission(id, decision);
   return null;
+}
+
+/** Wake the SDK callback waiting on this request, if this process holds it. No waiter: its process has since ended. */
+export function wakeWaiter(id: string, decision: PermissionDecision) {
+  clearTimer(id);
+  resolvers.get(id)?.(decision);
 }
 
 const byLabel = (by: string) => (by === 'user' ? 'the user' : by === 'director' ? 'the director' : by === 'check' ? 'the independent check' : by);
@@ -153,6 +161,8 @@ const agentCwd = new Map<string, string>();
 export function noteCwd(agentId: string, cwd: string) {
   if (cwd) agentCwd.set(agentId, cwd);
 }
+/** The folder the agent's last tool call ran in, as noted above (runner only; undefined before its first call). */
+export const lastCwd = (agentId: string) => agentCwd.get(agentId);
 
 export function dangerContext(project: Row, agent: Row): DangerContext {
   const onThisMachine = !agent.run_host_id;
@@ -243,6 +253,7 @@ const outbox = new Map<string, { items: string[]; timer: NodeJS.Timeout }>();
 export const BATCH_MS = Number(process.env.HELM_TRIAGE_BATCH_MS ?? 1500);
 
 function enqueue(projectId: string, text: string) {
+  runnerOnly("the director's permission outbox (triage.enqueue)");
   const box = outbox.get(projectId);
   if (box) {
     box.items.push(text);
@@ -259,11 +270,13 @@ function enqueue(projectId: string, text: string) {
 const notices = new Map<string, { request: string; text: string }[]>();
 
 function queueNotice(projectId: string, request: string, text: string) {
+  runnerOnly("the director's permission notices (triage.queueNotice)");
   notices.set(projectId, [...(notices.get(projectId) ?? []), { request, text }]);
 }
 
 /** The pending notices for a project's director as one block (empty when none), and forget them. */
 export function takeNotices(projectId: string): string {
+  runnerOnly("the director's permission notices (triage.takeNotices)");
   const list = notices.get(projectId) ?? [];
   notices.delete(projectId);
   if (!list.length) return '';
@@ -421,6 +434,8 @@ async function modelCheck(requestText: string): Promise<string> {
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), 90_000);
   try {
+    // Loaded here, not at the top: the web service uses this module (settle) but never runs a model.
+    const { query } = await import('@anthropic-ai/claude-agent-sdk');
     const q = query({
       prompt: requestText,
       options: {

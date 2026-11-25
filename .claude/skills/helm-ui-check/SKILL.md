@@ -35,6 +35,11 @@ node "$S/scratch.mjs" start --copy-db /path/to/helm.db  # a consistent copy of a
   that overlaps the live one, binds 127.0.0.1 on a free port (`--lan --port 9000` to reach it from a phone on the
   home network; 9000 is open in the firewall), and `--claude none` (the default) means agents fail to start
   instead of spending real model time.
+- `--split` runs the runner and the web service as two processes (server/runner.ts), as production does with
+  `helm.service` and `helm-web.service`. Use it only when the check is about the split (agents surviving a web restart,
+  commands queued while the runner is down); everything else stays in the default one-process mode.
+  `restart --part web|runner` restarts one half while the other keeps running; `stop --part web|runner` stops one
+  half (start it again with `restart`). The runner logs to `runner.log` next to `server.log`.
 - `--fresh` wipes this instance's data first. `--env K=V` adds a variable (e.g. `HELM_DEBUG=1`).
 - Starting a running instance is a no-op that prints it again.
 
@@ -56,9 +61,11 @@ node "$S/shoot.mjs" --routes '#/,#/p/{project},#/p/{project}/spec' --devices pho
 - `{project}` becomes the first project's id. Routes are the hash routes of the app (`#/p/<id>/tasks/<task id>` ...).
 - One JSON line per shot: `file`, `errors` (page exceptions and console errors; exit code 1 if any) and `audit`:
   horizontal overflow, elements wider than the screen, inputs under 16 px (iOS zooms on focus), tap targets under
-  32 px, fixed and sticky layers. Read the audit as well as the picture.
+  32 px, fixed and sticky layers, `clipped` (text cut off by its box with no ellipsis, line clamp or fade) and `overlaps`
+  (visible text drawn over other text in the page's own flow; sticky bars, sheets, closed <details> and
+  screen-reader-only text are left out). Read the audit as well as the picture.
 - Devices: `phone` (390x844, the size CLAUDE.md asks for), `iphone15` (393x852), `promax` (430x932), `se` (375x667),
-  `ipad` (820x1180), `desktop` (1280x900; reports a mouse, so `(pointer: fine)` features such as drag handles show). Phones render at their real pixel ratio, in home-screen mode with the
+  `ipad` (820x1180), `desktop` (1280x900; reports a mouse, so `(pointer: fine)` features such as drag handles show), `laptop` (1024x768, a mouse too). Phones render at their real pixel ratio, in home-screen mode with the
   notch and home-indicator safe areas applied.
 - `--out DIR` (default `<instance>/shots`), `--full` for the whole page, `--wait MS` after load, `--no-audit`.
 - For a before/after: take the "before" from the base commit in another worktree with `--name before`, the "after"
@@ -93,7 +100,7 @@ Page methods: `go(route)`, `waitFor(selector)`, `shot(path, {full})`, `tap(sel)`
 `press('Enter')`, `swipe(x, y0, y1)`, `keyboard(sel, height)`, `hideKeyboard()`, `audit()`, `eval(fn, ...args)`,
 `front()` (bring the tab forward: the others get visibilitychange to hidden), `back()` (the Back button; a page in the
 back/forward cache returns with pageshow persisted), `send(cdpMethod, params)` for anything else, and `errors`.
-`go()` also takes an absolute `http:`, `data:` or `about:` URL (a stand-in for another site or a sign-in gate). `b.page()` options: `device`, `theme`, `standalone`
+`go()` also takes an absolute `http:`, `data:` or `about:` URL (a stand-in for another site or a sign-in gate). `b.page()` options: `device`, `theme`, `standalone`, `timezone` (an IANA zone the page runs in; `shoot.mjs --tz America/Los_Angeles`)
 (home-screen mode, default on for phones), `keyboard` (the simulated keyboard, default on for phones).
 
 `keyboard()` reports `fieldVisible`, the send button's position and whether it is visible, `fieldFontPx`, and what
@@ -126,10 +133,40 @@ PR=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$HUC_DIR/instan
 curl -s -H "cookie: $C" -H 'content-type: application/json' -d '{"text":"DEMO: start the work."}' "${HUC_URL}api/projects/$PR/message"
 ```
 
-- `DEMO ...`: the director creates an active task, spawns "Login engineer", logs a decision. The engineer works a
+- The director never starts agents: it schedules or starts tasks whose description carries a `FAKE-*` marker, and Helm
+  starts a fresh builder (Builder A, B, …) for each, whose brief quotes that description; the stand-in plays the part
+  the marker names, finishes with complete_task, and Helm settles the task and closes the builder.
+- `DEMO ...`: the director creates an active task and logs a decision; its builder works a
   five-step worklist with Read/Edit/Bash calls in its transcript (about 3.5 s per call), posts a preview and completes.
 - `PLAN ...`: the director creates a planning task and asks the user a question (shows on Needs you).
-- An interjection on the task is relayed to the engineer, which handles it first; a paused task makes it stop.
+- `FAIL ...`: the director creates a task whose builder stops with an error after one step: a
+  usage limit as Claude Code reports it (`FAIL`), or its process exits with code 1 (`FAIL crash`). For agents that stop
+  with an error (Needs you, the Agents badge).
+- `ASK-PERMISSION ...`: the director asks to run `rm -rf build` (a permission prompt, flagged dangerous so it goes to
+  the user), waits for the answer and replies "Permission answer: allow" or "deny".
+- An interjection on the task is relayed to its builder, which handles it first; a paused task makes it stop.
+- Dashboards: make a scratch game repository with `node "$S/dash-repo.mjs" "$HUC_DIR/projects/game"`, open it as a project
+  (`POST /api/projects` with `{"mode":"existing","path":...}`), then New dashboard (or `POST /api/projects/<id>/dashboards`
+  with a description): the director builds a bar chart, a three-picture gallery and an expensive number by running the
+  repository's real recipes, and marks it ready. `DASHWORK forest` (or `cave`, `desert`, `readme`, `profile`) starts a
+  task whose builder changes that one input in a worktree, merges it and refreshes exactly the tiles complete_task names.
+- Releases: on such a repository, send the director `RELEASE-RECIPE` (it proposes a one-bundle recipe with publish
+  steps as a card in the Release recipe discussion; Apply it), Test build on the Releases page (Helm makes a task and a
+  builder makes the bundle from a clean checkout and reports it), then Cut release (`POST /api/projects/<id>/releases`): the director writes the change log,
+  a builder Helm starts builds from a clean checkout and attaches the file, and the director, told it is done, finishes (tag `v<version>`). Answering
+  Publish on the confirmation makes the director publish into the project's `published/` folder.
+- `FANOUT`: four scheduled tasks touching separate files, a builder each (Setup's "Builders at once" at a time). With
+  "Subagents per builder" above 0 the builder of the one in three parts starts three subagents (Agent calls through
+  Helm's PreToolUse hook, `task_started`/`task_progress`/`task_notification`, usage per subagent); at 0 it does them itself. The log's `fan-task` and
+  `fan-complete` lines time it. Set the limit first: `PATCH /api/projects/<id>/settings {"builder_subagents":"0"}`.
+- `WAITS`: two scheduled tasks, a builder each: a two-minute build in the background under a heavy claim on this
+  machine with light work filling the wait, then two heavy jobs at once on two hosts. Add the second host first:
+  `POST /api/hosts {"name":"buildbox","ssh_target":"build@192.0.2.10","projectId":"<id>"}`. The log's `bash-start`,
+  `bash-end` and `waits-complete` lines time it; the task card lists each running command with its host.
+- `QUEUE5`: five small scheduled tasks; Helm starts a builder for each, "Builders at once" at a time.
+- `CONTEXT`: the director's context fills to 85%; Helm's save note gets a knowledge note and a journal entry, then
+  the context is summarised (PreCompact hook, `compact_boundary`) and Helm's two-line note follows. The log's
+  `context-save` and `context-after` lines show it; the Helm page lists the summary.
 - Anything else: the director answers "Noted.". `--env FAKE_SPEED=0.2` makes it five times faster.
 - Its log is `$HUC_DIR/fake/log.txt`. To script other behaviour, copy it and pass `--claude /path/to/your-copy.mjs`.
 

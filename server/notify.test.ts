@@ -354,3 +354,30 @@ test('tests never write an update directory, and a server writes only its own', 
   assert.equal(lu.liveWritable(), false, 'NODE_ENV=test');
   assert.match((await lu.startLiveUpdate('update'))!, /not inside its data directory/);
 });
+
+test('the bell: one "Done" notification for that task whatever the done setting says, then it clears', async () => {
+  reset({ kinds: { needs: true, done: false, away: true, update: true, agent: true, disk: true } });
+  const { setBell } = await import('./bell.ts');
+  const plain = newTask(P.id, 'Not belled');
+  tasks.setTaskState(plain, 'done', DIRECTOR);
+  await sleep(120);
+  assert.equal(take().length, 0, 'done is off: nothing for a task without the bell');
+  const t = newTask(P.id, 'Belled');
+  setBell(t.id, true);
+  assert.equal(db.get('SELECT bell FROM tasks WHERE id = ?', t.id)!.bell, 1);
+  setBell(t.id, false);
+  assert.equal(db.get('SELECT bell FROM tasks WHERE id = ?', t.id)!.bell, 0, 'toggles off');
+  setBell(t.id, true);
+  tasks.setTaskState(tasks.getTask(t.id)!, 'paused', DIRECTOR);
+  await sleep(120);
+  assert.equal(take().length, 0, 'paused by an agent does not ring it');
+  tasks.setTaskState(tasks.getTask(t.id)!, 'active', DIRECTOR);
+  tasks.setTaskState(tasks.getTask(t.id)!, 'done', DIRECTOR);
+  await sleep(120);
+  const got = take();
+  assert.equal(got.length, 1);
+  assert.match(got[0].title, /Done: Belled/);
+  assert.match(got[0].url, new RegExp(`/tasks/${t.id}$`));
+  assert.equal(db.get('SELECT bell FROM tasks WHERE id = ?', t.id)!.bell, 0, 'the bell clears');
+  reset();
+});

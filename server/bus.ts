@@ -10,8 +10,10 @@ export type BusMessage =
   | { type: 'hosts' }
   | { type: 'toolbox' }
   | { type: 'disk' }
+  /** The runner (server/runner.ts) started, stopped or changed build. */
+  | { type: 'runner' }
   | { type: 'project'; projectId: string }
-  | { type: 'event'; projectId: string; agentId: string; event: unknown };
+  | { type: 'event'; projectId: string; agentId: string; event: unknown; loggedAt?: number };
 
 const emitter = new EventEmitter();
 emitter.setMaxListeners(200);

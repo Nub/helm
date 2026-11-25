@@ -1,4 +1,17 @@
 import { execFile } from 'node:child_process';
+import { autoPin } from './pins.ts';
+import { planWindows, tokensByTier, tokensByWho } from './usage.ts';
+import { removeWorkspace, workspacesView } from './hostwork.ts';
+import { activityView } from './activitystats.ts';
+import { pendingReminders, setReminder } from './reminders.ts';
+import { findingStats } from './findingstats.ts';
+import { recordReset } from './telemetryreset.ts';
+import { BUILTINS, USER_NAME, approveWatch, listWatches, setWatch, watchView } from './watches.ts';
+import type { WatchInput } from './watches.ts';
+import { summariesView } from './contextsave.ts';
+import { reduceState } from './historyreduce.ts';
+import { getTiers, setTier } from './tiers.ts';
+import { declaredChecks } from './projectchecks.ts';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -11,27 +24,50 @@ import { decideLan, decideProxySignIn, defaultAllowedHosts } from './lan.ts';
 import type { LanSettings } from './lan.ts';
 import { all, get, newId, now, run, tx } from './db.ts';
 import type { Row } from './db.ts';
-import { allHostViews, attachHost, checkHost, createHost, deleteHost, detachHost, getHost, hostFields, hostsChanged, projectHostViews, updateHost } from './hosts.ts';
-import { answerInbox, closeAgent, interruptAgent, liveCount, rootAgent, sendToAgent } from './runtime.ts';
-import { VERSION, startLiveUpdate, versionInfo } from './liveupdate.ts';
-import { addJournal, addPreview, agentView, deletePreviewFiles, getAgent, getProject, inboxView, listEvents, projectState, projectStructure, projectSummaries, touchProject } from './store.ts';
+import { allHostViews, attachHost, checkHost, createHost, deleteHost, detachHost, getHost, hostFields, hostsChanged, projectHostViews, sampleForPage, updateHost } from './hosts.ts';
+import { periodsOf, telemetryCsv, telemetrySummary } from './telemetry.ts';
+import { focusCached } from './focus.ts';
+import { reworkView } from './rework.ts';
+import type { Filter as TelemetryFilter } from './telemetry.ts';
+import { cancelResume } from './agenterrors.ts';
+import { closeAgent, interruptAgent, liveCount, rootAgent, sendToAgent, tellDirector } from './agents.ts';
+import { answerInbox } from './answers.ts';
+import { askRunner, processRole, runnerStatus } from './runner.ts';
+import { VERSION, endWait, restartAgents, startAdopt, startLiveUpdate, versionInfo } from './liveupdate.ts';
+import { addJournal, addPreview, agentView, deletePreviewFiles, deletePreviewVersionFiles, getAgent, getProject, inboxView, listEvents, projectState, projectStructure, projectSummaries, previewVersions, resolvePreviewId, touchProject } from './store.ts';
+import { unreadThreads } from './crossproject.ts';
 import { DEFAULT_COLD_DAYS, discussionView, filedLinks, listDiscussions, requestHolders } from './discussions.ts';
-import { needingResponse } from './requests.ts';
+import { createRequest, needingResponse } from './requests.ts';
 import { HANDOFF_MESSAGE, handoffInfo, handoffState, markHandoffSeen } from './handoff.ts';
 import { registerReportApi } from './reportapi.ts';
 import { registerAttachmentApi } from './attachmentapi.ts';
 import { registerAnnotationApi } from './annotations.ts';
+import { registerIdeasApi } from './ideasapi.ts';
+import { registerAccountsApi } from './accountsapi.ts';
 import { deleteProjectAttachments, pendingAttachments } from './attachments.ts';
 import { reportSummary } from './reports.ts';
 import { afterDocDeleted, docView, specState } from './spec.ts';
+import { CREATE_QUESTION, hasCode, specWorkState } from './specwork.ts';
 import { registerSpecApi } from './specapi.ts';
-import { registerTaskApi, tellDirector } from './taskapi.ts';
+import { registerSearchApi } from './searchapi.ts';
+import { registerKnowledgeApi } from './knowledgeapi.ts';
+import { registerDashboardApi } from './dashboardapi.ts';
+import { registerReleaseApi } from './releaseapi.ts';
+import { registerDownloadRoutes } from './dllinks.ts';
+import { dashboardSummary } from './dashboards.ts';
+import { releaseSummary } from './releases.ts';
+import { registerTaskApi } from './taskapi.ts';
+import { DEFAULT_MODE, changeMode, isStopped, modeCounts, modeView, resume as resumeProject, stopAll, windDown } from './projectmode.ts';
 import { registerToolboxApi } from './toolboxapi.ts';
 import { listDialogue } from './turns.ts';
 import { STATE_LABEL, USER, createTask, listTasks, setTaskState, unfiledNeedsCount, taskRef, taskView } from './tasks.ts';
-import { APPROVAL_POLICIES, MODELS, TEMPLATES, defaultStructure, stampUserEdit, validateStructure } from './structure.ts';
+import { EFFORTS, MODELS, defaultStructure } from './structure.ts';
 import { teamDetails } from './teamview.ts';
 import { attention } from './taskwatch.ts';
+import { digest } from './digest.ts';
+import { overview } from './overview.ts';
+import { cleanupPlan, runCleanup } from './diskclean.ts';
+import { isOwnHelm } from './ownhelm.ts';
 import { DEFAULT_IDLE_MINUTES, activityProject, extendSession, getPeriod, listPeriods, presenceView, recordOwnerActivity, stepAway } from './sessions.ts';
 import { openConsultViews } from './consults.ts';
 import { ANSWERERS, DEFAULT_TRIAGE_MINUTES, decisionsFor, revokeRule, rulesFor } from './triage.ts';
@@ -39,6 +75,7 @@ import { resolveRefs } from './refs.ts';
 import { contextBlock } from './chatcontext.ts';
 import { diskStatus, healthDisk, saveDiskSettings, tick } from './disk.ts';
 import { diskUsage } from './diskusage.ts';
+import { zoneState } from './clock.ts';
 
 const exec = promisify(execFile);
 
@@ -85,6 +122,8 @@ export function registerApi(app: FastifyInstance) {
   app.addHook('onRequest', async (req, reply) => {
     const url = req.url;
     const open = url.startsWith('/api/login') || url.startsWith('/api/session') || url === '/api/health';
+    // /dl/<token> (dllinks.ts) is deliberately not guarded: a release download link the user made and shared works
+    // without signing in. It serves only release files a live token names, and answers 404 to anything else.
     const guarded = (url.startsWith('/api/') && !open) || url.startsWith('/artifacts/');
     if (guarded && !authed(req) && !viaWithoutCookie(req)) return bad(reply, 'Not signed in', 401);
   });
@@ -112,7 +151,8 @@ export function registerApi(app: FastifyInstance) {
   app.get('/api/session', async (req) => {
     const via = viaWithoutCookie(req) ?? (authed(req) ? 'cookie' : null);
     const signedInBy = via === 'sso' && config.trustProxySignIn !== '1' ? config.trustProxySignIn : null;
-    return { authed: via !== null, via, signedInBy };
+    // Signed in: the time zone state too, so the page reports its zone only when it differs (server/clock.ts).
+    return { authed: via !== null, via, signedInBy, ...(via !== null ? { timeZone: zoneState() } : {}) };
   });
 
   app.post('/api/login', async (req, reply) => {
@@ -134,11 +174,59 @@ export function registerApi(app: FastifyInstance) {
 
   // Unauthenticated, for the update script's health check: it waits until the new build reports its own revision.
   // disk: { level: 'ok' | 'warning' | 'critical', full } (server/disk.ts); added later, so readers must not need it.
-  app.get('/api/health', async () => ({ ok: true, rev: VERSION.rev, disk: healthDisk() }));
+  // `runner`: the process that runs agents (server/runner.ts); in one process, this one. The update script checks its
+  // revision after an update that restarts it, and waits for `working` to reach 0 before a deferred restart.
+  app.get('/api/health', async () => {
+    const r = runnerStatus();
+    // working: agents mid-turn, and messages queued for agents the runner has not taken yet (they start turns).
+    return { ok: true, rev: VERSION.rev, disk: healthDisk(), runner: { mode: r.mode, up: r.up, rev: r.rev, hash: r.hash, working: r.working + r.pending } };
+  });
 
+  /** The runner's state for the dashboard: up or restarting, its build, agents mid-turn, commands waiting for it. */
+  app.get('/api/runner', async () => runnerStatus());
+  /** The plan's usage windows as the runner last saw them (usage.ts): Home and the Helm page show one line each. */
+  app.get('/api/plan', async () => ({ windows: planWindows(), by_tier: tokensByTier(), by_who: tokensByWho(), summaries: summariesView(null, 8), finding: findingStats() }));
+  /** A project's declared checks and its latest full runs (projectchecks.ts), for the Helm page. */
+  app.get('/api/projects/:id/checks', async (req) => {
+    const id = (req.params as any).id;
+    return { declared: declaredChecks(id), runs: all('SELECT id, commit_sha AS commit, status, failed_check, since_tasks, started_at, finished_at FROM check_runs WHERE project_id = ? ORDER BY id DESC LIMIT 10', id) };
+  });
+  /** Work tiers (tiers.ts): one table for the install, set by the user only. by_tier: tokens each tier used. */
+  app.get('/api/tiers', async () => ({ tiers: getTiers(), models: MODELS, efforts: EFFORTS, by_tier: tokensByTier() }));
+  app.put('/api/tiers/:id', async (req, reply) => {
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    const error = setTier((req.params as any).id, String(b.model ?? ''), String(b.effort ?? ''), MODELS.map((m) => m.id), EFFORTS);
+    if (error) return bad(reply, error);
+    return { tiers: getTiers() };
+  });
+
+  // Watches (watches.ts): the page's list, and the user's add, change, pause and remove.
+  app.get('/api/projects/:id/watches', async (req) => ({ watches: listWatches((req.params as any).id), builtins: Object.entries(BUILTINS).map(([id, b]) => ({ id, label: b.label, unit: b.unit })) }));
+  app.post('/api/projects/:id/watches', async (req, reply) => {
+    const res = setWatch((req.params as any).id, (req.body ?? {}) as WatchInput, USER_NAME, true);
+    if ('error' in res) return bad(reply, res.error);
+    return { watch: res.watch ? watchView(res.watch) : null };
+  });
+  /** The user approves a watch's command as it is now. */
+  app.post('/api/projects/:id/watches/:wid/approve', async (req, reply) => {
+    const w = get('SELECT project_id FROM watches WHERE id = ?', (req.params as any).wid);
+    if (!w || w.project_id !== (req.params as any).id) return bad(reply, 'No such watch', 404);
+    const err = approveWatch((req.params as any).wid);
+    return err ? bad(reply, err) : { ok: true };
+  });
   app.get('/api/disk/status', async () => diskStatus());
   // The Disk page: free space, and what projects, worktrees, registered folders, Helm, Nix and /tmp take (server/diskusage.ts).
-  app.get('/api/disk', async () => ({ status: diskStatus(), usage: await diskUsage() }));
+  app.get('/api/disk', async () => ({ status: diskStatus(), usage: await diskUsage(), history: reduceState() }));
+  // System › Disk's Clean up for one project (server/diskclean.ts): without confirm, what would go and what stays;
+  // with confirm (the paths and test builds the plan listed), removes exactly those.
+  app.post('/api/projects/:id/disk/clean', async (req, reply) => {
+    const id = (req.params as any).id;
+    if (!getProject(id)) return bad(reply, 'No such project', 404);
+    const c = (req.body as any)?.confirm;
+    if (!c) return cleanupPlan(id);
+    const list = (v: unknown) => (Array.isArray(v) ? v.map(String) : []);
+    return runCleanup(id, { paths: list(c.paths), builds: list(c.builds) });
+  });
   app.post('/api/disk/refresh', async () => {
     void tick();
     return { status: diskStatus(), usage: await diskUsage(true) };
@@ -150,21 +238,50 @@ export function registerApi(app: FastifyInstance) {
     return diskStatus();
   });
 
-  app.get('/api/version', async () => versionInfo());
+  app.get('/api/version', async () => versionInfo(runnerStatus()));
+
+  // "Don't restart": end a restart of the agents (or the first deploy's switch) that waits for them; nothing rolls back.
+  // "Switch to two services now": Helm still runs as one process though the system defines the two services.
+  app.post('/api/version/adopt', async (_req, reply) => {
+    const error = await startAdopt();
+    if (error) return bad(reply, error, 409);
+    return versionInfo(runnerStatus());
+  });
+
+  app.post('/api/version/end-wait', async (_req, reply) => {
+    const error = await endWait();
+    if (error) return bad(reply, error, 409);
+    return versionInfo(runnerStatus());
+  });
+
+  // "Restart agents now" during an update that waits for them, or apply a changed system configuration when idle.
+  app.post('/api/version/restart-agents', async (_req, reply) => {
+    const error = await restartAgents();
+    if (error) return bad(reply, error, 409);
+    return versionInfo(runnerStatus());
+  });
 
   for (const kind of ['update', 'rollback'] as const) {
     app.post(`/api/version/${kind}`, async (_req, reply) => {
       const error = await startLiveUpdate(kind);
       if (error) return bad(reply, error, 409);
-      return versionInfo();
+      return versionInfo(runnerStatus());
     });
   }
 
   // ---------- live updates ----------
 
+  // Open streams end when the server stops (preClose): browsers reconnect to the next one at once. Left open, they would
+  // hold the stop for its whole timeout, and a web-only update would take that long instead of a second.
+  const streams = new Set<import('node:http').ServerResponse>();
+  app.addHook('preClose', async () => {
+    for (const res of streams) res.end();
+    streams.clear();
+  });
   app.get('/api/stream', (req, reply) => {
     reply.hijack();
     const res = reply.raw;
+    streams.add(res);
     res.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-cache, no-transform',
@@ -177,13 +294,13 @@ export function registerApi(app: FastifyInstance) {
     req.raw.on('close', () => {
       clearInterval(ping);
       unsubscribe();
+      streams.delete(res);
     });
   });
 
   // ---------- reference data ----------
 
   app.get('/api/meta', async () => ({
-    templates: TEMPLATES,
     models: MODELS,
     projectsRoot: config.projectsRoot,
     home: homedir(),
@@ -216,10 +333,31 @@ export function registerApi(app: FastifyInstance) {
 
   // Every task and discussion awaiting the user's response, across projects, grouped by project (the top bar's
   // "Needs you"). The same rows the Tasks and Discussions lists show; count is the number of open requests.
+  // The global Home (web/src/overview.tsx): a card per project and the digest across them.
+  app.get('/api/overview', async () => overview());
+  // The global Gallery (web/src/gallery.tsx): every preview's latest version across projects, newest first, with its
+  // project and task; a big page's content is left out (its thumbnail is a text card from the title).
+  app.get('/api/gallery', async () => ({
+    items: all(
+      `SELECT p.id, p.project_id, p.agent_id, p.kind, p.title, p.caption, p.file, CASE WHEN length(p.content) > 20000 THEN NULL ELSE p.content END AS content, p.created_at, p.task_id, p.version,
+         pr.name AS project_name, t.title AS task_title
+       FROM previews p JOIN projects pr ON pr.id = p.project_id AND pr.archived = 0 LEFT JOIN tasks t ON t.id = p.task_id
+       ORDER BY p.created_at DESC LIMIT 300`,
+    ),
+  }));
   app.get('/api/needs', async () => needingResponse((t) => (t.kind === 'discussion' ? discussionView(t) : taskView(t))));
 
   // The open requests themselves, as the inbox listed them; kept for anything still asking for this path.
+  // Deferred requests' reminders (reminders.ts): change when one comes, or stop it.
+  app.post('/api/reminders/:id', async (req, reply) => {
+    const when = String(((req.body ?? {}) as { when?: unknown }).when ?? '');
+    if (!['hour', 'tomorrow', 'session', 'never'].includes(when)) return bad(reply, 'when is hour, tomorrow, session or never.');
+    const err = setReminder((req.params as { id: string }).id, when as 'hour');
+    return err ? bad(reply, err) : { ok: true };
+  });
+
   app.get('/api/inbox', async () => ({
+    deferred: pendingReminders(),
     items: all(
       "SELECT inbox.*, projects.name AS project_name, agents.name AS agent_name FROM inbox JOIN projects ON projects.id = inbox.project_id LEFT JOIN agents ON agents.id = inbox.agent_id WHERE inbox.status = 'open' AND projects.archived = 0 ORDER BY inbox.blocking DESC, inbox.importance DESC, inbox.created_at",
     ).map(inboxView),
@@ -266,17 +404,17 @@ export function registerApi(app: FastifyInstance) {
     const already = get('SELECT id FROM projects WHERE path = ? AND archived = 0', path);
     if (already) return bad(reply, 'That folder is already a Helm project.');
 
-    const template = TEMPLATES.find((t) => t.id === body.templateId);
-    const structure = template ? structuredClone(template.structure) : defaultStructure();
-    structure.template = template?.id ?? TEMPLATES[0].id;
-    if (APPROVAL_POLICIES.includes((body as any).approval)) structure.approval = (body as any).approval;
+    // Every project has a director and Helm's builders (dispatch.ts): no team to choose.
+    const structure = defaultStructure();
     const id = newId('pr');
     run(
       // A new project goes to the end of the list.
-      'INSERT INTO projects (id, name, path, description, phase, autonomy, structure, position, created_at, updated_at, permission_answerer) VALUES (?,?,?,?,?,?,?,(SELECT COALESCE(MAX(position), 0) + 1 FROM projects),?,?,?)',
+      'INSERT INTO projects (id, name, path, description, phase, autonomy, structure, position, created_at, updated_at, permission_answerer, mode, mode_since) VALUES (?,?,?,?,?,?,?,(SELECT COALESCE(MAX(position), 0) + 1 FROM projects),?,?,?,?,?)',
       id, name, path, '', 'Setup', AUTONOMY.includes(body.autonomy ?? '') ? body.autonomy : 'auto', JSON.stringify(structure), now(), now(),
       // New projects have the director answer routine permission requests; older ones keep asking the user (db.ts).
       ANSWERERS.includes((body as any).permission_answerer) ? (body as any).permission_answerer : 'director',
+      // New projects run only what the user schedules (projectmode.ts); older ones keep Autopilot (the column's default).
+      DEFAULT_MODE, now(),
     );
     // Its history starts now: there is nothing older to group into sessions.
     run('UPDATE projects SET sessions_backfilled = 1 WHERE id = ?', id);
@@ -290,6 +428,10 @@ export function registerApi(app: FastifyInstance) {
     const root = rootAgent(project);
     const brief = (body.brief ?? '').trim();
     if (brief) await sendToAgent(root.id, brief, { kind: 'user', name: 'You' });
+    // A folder brought in with code and no Spec: the director asks once whether to build one (specwork.ts).
+    if (body.mode !== 'new' && hasCode(readdirSync(path))) {
+      createRequest({ projectId: id, agentId: root.id, kind: 'question', title: CREATE_QUESTION.title, body: CREATE_QUESTION.body, options: [{ label: CREATE_QUESTION.yes }, { label: 'Not now', defer: true }], payload: { act: { kind: 'spec_create', target: id, option: CREATE_QUESTION.yes } }, importance: 3, blocking: false });
+    }
     bus.publish({ type: 'projects' });
     return { id };
   });
@@ -297,10 +439,59 @@ export function registerApi(app: FastifyInstance) {
   /** What reference chips show: GET /api/refs?ids=task_x,doc_y (see server/refs.ts). */
   app.get('/api/refs', async (req) => resolveRefs(String((req.query as any)?.ids ?? '').split(',').map((s) => s.trim()).filter(Boolean)));
 
+  /**
+   * The project's state is the heaviest read (every task's view, ~100 ms on a large project) and every open page asks
+   * for it after each change. Computed once per change: kept, serialized, until a stream message for the project (or
+   * one for all projects) says it changed, and at most STATE_TTL_MS for what only time changes (presence, stalls).
+   * The cache drops entries before the stream reaches browsers (this subscriber was added first), so their refetch
+   * always gets the new state.
+   */
+  const STATE_TTL_MS = 5_000;
+  const stateCache = new Map<string, { at: number; json: string }>();
+  bus.subscribe((m) => {
+    if (m.type === 'event') return; // transcript rows: agent changes come with a project message of their own
+    if ('projectId' in m) stateCache.delete(m.projectId);
+    else stateCache.clear();
+  });
   app.get('/api/projects/:id', async (req, reply) => {
     const id = (req.params as any).id as string;
+    const hit = stateCache.get(id);
+    if (hit && Date.now() - hit.at < STATE_TTL_MS) return reply.type('application/json').send(hit.json);
+    const at = Date.now();
+    const body = projectStateView(id);
+    if (!body) return bad(reply, 'No such project', 404);
+    const json = JSON.stringify(body);
+    stateCache.set(id, { at, json });
+    return reply.type('application/json').send(json);
+  });
+  const projectStateView = (id: string) => {
     const state = projectState(id);
-    return state ? { ...state, coldDaysDefault: DEFAULT_COLD_DAYS, idleMinutesDefault: DEFAULT_IDLE_MINUTES, presence: presenceView(id), attention: attention(id), docs: state.docs.map(docView), ...specState(id), handoff: handoffState(state.project), tasks: listTasks(id), discussions: listDiscussions(id), request_holders: requestHolders(id), request_records: all('SELECT id, title, state, inbox_archive FROM tasks WHERE project_id = ? AND (requests_agent_id IS NOT NULL OR inbox_archive = 1) ORDER BY inbox_archive, updated_at DESC', id), filed: filedLinks(id), hosts: projectHostViews(id), reports: reportSummary(id), consults: openConsultViews(id) } : bad(reply, 'No such project', 404);
+    return state ? { ...state, coldDaysDefault: DEFAULT_COLD_DAYS, idleMinutesDefault: DEFAULT_IDLE_MINUTES, presence: presenceView(id), mode: modeView(id), attention: attention(id), docs: state.docs.map(docView), ...specState(id), specWork: specWorkState(id), handoff: handoffState(state.project), tasks: listTasks(id), discussions: listDiscussions(id), request_holders: requestHolders(id), xthreads: unreadThreads(id), request_records: all('SELECT id, title, state, inbox_archive FROM tasks WHERE project_id = ? AND (requests_agent_id IS NOT NULL OR inbox_archive = 1) ORDER BY inbox_archive, updated_at DESC', id), filed: filedLinks(id), hosts: projectHostViews(id), reports: reportSummary(id), consults: openConsultViews(id), dashboards: dashboardSummary(id), releases: releaseSummary(id), own_helm: isOwnHelm(getProject(id)?.path) } : null;
+  };
+
+  /**
+   * The project's mode (projectmode.ts), changed only here, by the user: set (mode: running, queue_only, winding_down
+   * or stopped; agents: which of the interrupted agents resume when leaving Stopped, default all), or the older
+   * wind_down, stop and resume. GET gives what a change would affect, for the confirmations.
+   */
+  app.get('/api/projects/:id/mode', async (req, reply) => {
+    const id = (req.params as any).id as string;
+    if (!getProject(id)) return bad(reply, 'No such project', 404);
+    return { ...modeView(id), counts: modeCounts(id) };
+  });
+  app.post('/api/projects/:id/mode', async (req, reply) => {
+    const id = (req.params as any).id as string;
+    if (!getProject(id)) return bad(reply, 'No such project', 404);
+    const b = (req.body ?? {}) as Record<string, any>;
+    const note = typeof b.note === 'string' ? b.note : '';
+    const err =
+      b.action === 'set' ? await changeMode(id, b.mode, note, b.agents)
+      : b.action === 'wind_down' ? await windDown(id, note)
+      : b.action === 'stop' ? await stopAll(id, note)
+      : b.action === 'resume' ? await resumeProject(id, b.agents)
+      : 'Say what to do: set (with mode), wind_down, stop or resume.';
+    if (err) return bad(reply, err, 409);
+    return modeView(id);
   });
 
   app.patch('/api/projects/:id', async (req, reply) => {
@@ -309,10 +500,6 @@ export function registerApi(app: FastifyInstance) {
     if (!project) return bad(reply, 'No such project', 404);
     const body = (req.body ?? {}) as Record<string, any>;
     // Check everything before writing anything, so a bad field leaves the project as it was.
-    if (body.structure !== undefined) {
-      const err = validateStructure(body.structure);
-      if (err) return bad(reply, err);
-    }
     if (body.session_idle_minutes !== undefined && body.session_idle_minutes !== null && !(Number.isInteger(body.session_idle_minutes) && body.session_idle_minutes >= 5 && body.session_idle_minutes <= 720)) {
       return bad(reply, 'A session ends after a whole number of minutes from 5 to 720, or empty for the default.');
     }
@@ -325,7 +512,6 @@ export function registerApi(app: FastifyInstance) {
       return bad(reply, 'Cold after must be a whole number of days from 1 to 365, or empty for the default.');
     }
     tx(() => {
-      if (body.structure !== undefined) run('UPDATE projects SET structure = ? WHERE id = ?', JSON.stringify(stampUserEdit(projectStructure(project), body.structure, now())), id);
       if (body.cold_days !== undefined) run('UPDATE projects SET cold_days = ? WHERE id = ?', body.cold_days, id);
       if (body.session_idle_minutes !== undefined) run('UPDATE projects SET session_idle_minutes = ? WHERE id = ?', body.session_idle_minutes, id);
       if (body.permission_answerer !== undefined) run('UPDATE projects SET permission_answerer = ? WHERE id = ?', body.permission_answerer, id);
@@ -367,7 +553,8 @@ export function registerApi(app: FastifyInstance) {
     const id = (req.params as any).id as string;
     if (!getProject(id)) return bad(reply, 'No such project', 404);
     const q = req.query as { before?: string; limit?: string };
-    return { periods: listPeriods(id, { before: q.before ? Number(q.before) : undefined, limit: q.limit ? Number(q.limit) : undefined }), presence: presenceView(id) };
+    // digest: Home's "since you were last here" (server/digest.ts), with the first page only.
+    return { periods: listPeriods(id, { before: q.before ? Number(q.before) : undefined, limit: q.limit ? Number(q.limit) : undefined }), presence: presenceView(id), ...(q.before ? {} : { digest: digest(id) }) };
   });
 
   /** One session or away period with everything attributed to it. */
@@ -388,7 +575,12 @@ export function registerApi(app: FastifyInstance) {
   /** Read-only: per role, the instructions Helm generates and the helm tools it gets. */
   app.get('/api/projects/:id/team', async (req, reply) => {
     const project = getProject((req.params as any).id);
-    return project ? teamDetails(project) : bad(reply, 'No such project', 404);
+    if (!project) return bad(reply, 'No such project', 404);
+    // What agents get is the runner's to say: split, its build may be older than this web service's (server/runner.ts).
+    if (processRole() !== 'web') return { ...teamDetails(project), from: null };
+    const answer = await askRunner<ReturnType<typeof teamDetails>>('team-details', { projectId: project.id });
+    if (answer) return { ...answer, from: 'runner' };
+    return { ...teamDetails(project), from: 'dashboard', runnerRev: runnerStatus().rev, dashboardRev: VERSION.rev };
   });
 
   /** Removes the project from Helm. The folder on disk is left alone. */
@@ -396,7 +588,10 @@ export function registerApi(app: FastifyInstance) {
     const id = (req.params as any).id as string;
     if (!getProject(id)) return bad(reply, 'No such project', 404);
     for (const a of all('SELECT id FROM agents WHERE project_id = ?', id)) await closeAgent(a.id, 'closed');
-    for (const p of all('SELECT * FROM previews WHERE project_id = ?', id)) deletePreviewFiles(p);
+    for (const p of all('SELECT * FROM previews WHERE project_id = ?', id)) {
+      deletePreviewFiles(p);
+      deletePreviewVersionFiles(p.id);
+    }
     run('DELETE FROM projects WHERE id = ?', id);
     deleteProjectAttachments(id);
     bus.publish({ type: 'projects' });
@@ -464,7 +659,8 @@ export function registerApi(app: FastifyInstance) {
     if ('error' in files) return bad(reply, files.error);
     if (!text && !files.rows.length) return bad(reply, 'Empty message');
     await sendToAgent(agent.id, text, { kind: 'user', name: 'You' }, files.rows);
-    return { ok: true };
+    // Stopped: only the director answers; a message to another agent waits for Resume (projectmode.ts).
+    return { ok: true, held: isStopped(agent.project_id) && !!agent.parent_id };
   });
 
   app.post('/api/agents/:id/stop', async (req, reply) => {
@@ -481,6 +677,14 @@ export function registerApi(app: FastifyInstance) {
     return { ok: true };
   });
 
+  // A resume scheduled for when a usage limit resets (agenterrors.ts): cancelled, its entry goes back under Needs you.
+  app.post('/api/agents/:id/cancel-resume', async (req, reply) => {
+    const agent = getAgent((req.params as any).id);
+    if (!agent) return bad(reply, 'No such agent', 404);
+    const err = cancelResume(agent.id);
+    return err ? bad(reply, err) : { ok: true };
+  });
+
   app.post('/api/agents/:id/close', async (req, reply) => {
     const agent = getAgent((req.params as any).id);
     if (!agent) return bad(reply, 'No such agent', 404);
@@ -488,12 +692,66 @@ export function registerApi(app: FastifyInstance) {
     return { ok: true };
   });
 
+  // ---------- telemetry (install-wide: the user's page only; directors see their own project through a tool) ----------
+
+  const telemetryFilter = (q: Record<string, any>): TelemetryFilter => ({
+    project: typeof q.project === 'string' && q.project ? q.project : null,
+    tier: typeof q.tier === 'string' && q.tier ? q.tier : null,
+    mode: typeof q.mode === 'string' && q.mode ? q.mode : null,
+    period: q.period === 'week' ? 'week' : 'day',
+    // Every view counts from each project's last reset (telemetryreset.ts) unless all=1 ("Show all time").
+    allTime: q.all === '1',
+  });
+  app.get('/api/telemetry', async (req) => telemetrySummary(telemetryFilter((req.query ?? {}) as Record<string, any>)));
+  // Start the views fresh, for one project or all (no project): recorded, nothing deleted.
+  app.post('/api/telemetry/reset', async (req, reply) => {
+    const project = (req.body as any)?.project;
+    if (project != null && (typeof project !== 'string' || !getProject(project))) return bad(reply, 'No such project', 404);
+    const r = recordReset(project || null, 'user');
+    bus.publish({ type: 'projects' });
+    return { ok: true, reset: r };
+  });
+  // What agents spend their time on (activitystats.ts): per project unless combine=1, filters who and tier.
+  app.get('/api/telemetry/activity', async (req) => {
+    const q = (req.query ?? {}) as Record<string, string | undefined>;
+    return { projects: activityView({ project: q.project || null, who: q.who || null, tier: q.tier || null, combine: q.combine === '1', allTime: q.all === '1' }) };
+  });
+  // Rework, repeats and unused speed (rework.ts), per project.
+  app.get('/api/telemetry/rework', async (req) => {
+    const q = (req.query ?? {}) as Record<string, string | undefined>;
+    return { projects: reworkView(q.project || null, periodsOf(q.period === 'week' ? 'week' : 'day'), q.all === '1') };
+  });
+  // Focus (focus.ts): where time to ship goes beyond the work, last 7 days, ranked; one project or all.
+  app.get('/api/telemetry/focus', async (req) => {
+    const q = (req.query ?? {}) as Record<string, string | undefined>;
+    return focusCached({ project: q.project || null, allTime: q.all === '1' });
+  });
+  // The page's tokens by tier and time finding code, each project from its last reset unless all=1.
+  app.get('/api/telemetry/extra', async (req) => {
+    const all_ = ((req.query ?? {}) as Record<string, string | undefined>).all === '1';
+    return { by_tier: tokensByTier(undefined, !all_), finding: findingStats(!all_) };
+  });
+  app.get('/api/telemetry.csv', async (req, reply) => {
+    reply.header('content-type', 'text/csv; charset=utf-8');
+    reply.header('content-disposition', 'attachment; filename="helm-telemetry.csv"');
+    return telemetryCsv(telemetryFilter((req.query ?? {}) as Record<string, any>));
+  });
+
   // ---------- hosts ----------
 
   app.get('/api/hosts', async () => ({
     hosts: allHostViews(),
+    workspaces: workspacesView(),
     projects: all('SELECT id, name FROM projects WHERE archived = 0 ORDER BY position, created_at'),
   }));
+
+  /** Remove a job's workspace on its host (hostwork.ts: only ever inside Helm's root there). */
+  app.delete('/api/host-workspaces/:id', async (req, reply) => {
+    const err = await removeWorkspace((req.params as any).id);
+    if (err) return bad(reply, err, err.startsWith('No such') ? 404 : 400);
+    bus.publish({ type: 'hosts' });
+    return { ok: true };
+  });
 
   /** Add a host; with projectId it is attached to that project at once. */
   app.post('/api/hosts', async (req, reply) => {
@@ -534,6 +792,9 @@ export function registerApi(app: FastifyInstance) {
     deleteHost(host);
     return { ok: true };
   });
+
+  /** The open Hosts page's heartbeat: a live sample of every host, at most every 15 s (hosts.ts sampleForPage). */
+  app.post('/api/hosts/sample', async () => ({ sampled: sampleForPage() }));
 
   app.post('/api/hosts/:id/check', async (req, reply) => {
     const host = getHost((req.params as any).id);
@@ -677,9 +938,17 @@ export function registerApi(app: FastifyInstance) {
     const p = get('SELECT * FROM previews WHERE id = ?', (req.params as any).id);
     if (!p) return bad(reply, 'No such preview', 404);
     deletePreviewFiles(p);
+    deletePreviewVersionFiles(p.id);
     run('DELETE FROM previews WHERE id = ?', p.id);
     touchProject(p.project_id);
     return { ok: true };
+  });
+
+  /** A preview's versions, oldest first (the last is the latest); an old id grouped into it resolves to it. */
+  app.get('/api/previews/:id/versions', async (req, reply) => {
+    const id = resolvePreviewId((req.params as any).id);
+    const versions = id ? previewVersions(id) : null;
+    return versions ? { id, versions } : bad(reply, 'No such preview', 404);
   });
 
   app.post('/api/projects/:id/journal', async (req, reply) => {
@@ -696,6 +965,8 @@ export function registerApi(app: FastifyInstance) {
     const project = getProject((req.params as any).id);
     if (!project) return bad(reply, 'No such project', 404);
     const res = addPreview(project, null, (req.body ?? {}) as any);
+    // The For review rule applies to a preview from any path (pins.ts reviewNow).
+    if (!('error' in res)) autoPin(res.id);
     return 'error' in res ? bad(reply, res.error) : res;
   });
 
@@ -704,6 +975,14 @@ export function registerApi(app: FastifyInstance) {
   registerToolboxApi(app);
   registerReportApi(app);
   registerSpecApi(app);
+  registerSearchApi(app);
+  registerKnowledgeApi(app);
+  registerDashboardApi(app);
+  registerReleaseApi(app);
+  // Public, without the session (see the guard above): release download links.
+  registerDownloadRoutes(app);
   registerAttachmentApi(app);
   registerAnnotationApi(app);
+  registerIdeasApi(app);
+  registerAccountsApi(app);
 }

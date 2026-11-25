@@ -1,8 +1,14 @@
 import { all, get, newId, now, run, tx } from './db.ts';
+import { idleButBusy } from './busy.ts';
+import { queueReviewNote } from './merge.ts';
 import type { Row } from './db.ts';
 import { touchProject } from './store.ts';
-import { activeMs } from './tasks.ts';
+import { taskTimes } from './worktime.ts';
 import { checkStalls } from './taskwatch.ts';
+import { releaseQuiet, releaseStale } from './requests.ts';
+import { clockText, spanText, zoneAbbr } from './clock.ts';
+import { autoSchedules, checkAtRest, holdsNewWork, isStopped, modeOf, presenceAttr } from './projectmode.ts';
+import { runnerOnly } from './role.ts';
 
 /**
  * Sessions: windows of time when the owner was working with the director, detected from what they do through the
@@ -32,7 +38,9 @@ export function idleMs(project: Row): number {
 }
 
 type Notify = (projectId: string, text: string) => Promise<void> | void;
-let notify: Notify = () => {};
+// Set at startup in every process that records owner activity: the runner (its session timer) and the web service
+// (the API records activity and stepping away). Unset in the web service it would drop the notes silently.
+let notify: Notify = () => runnerOnly('a session note to the director before setSessionNotifier');
 /** How sessions tell the director things (taskapi.ts tellDirector, set at startup to avoid an import cycle). */
 export function setSessionNotifier(fn: Notify) {
   notify = fn;
@@ -42,7 +50,7 @@ export const notifyDirector = (projectId: string, text: string) => notify(projec
 
 // ---------- formatting ----------
 
-export const clockText = (ts: number) => new Date(ts).toLocaleString('en-GB', { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+export { clockText };
 export function durationText(ms: number): string {
   const m = Math.max(0, Math.round(ms / 60000));
   if (m < 60) return `${m} min`;
@@ -83,8 +91,10 @@ export const isAway = (projectId: string) => !openSession(projectId);
 /** The small tag each message to the director carries (runtime.ts sendToAgent). */
 export function presenceTag(projectId: string): string {
   const p = presence(projectId);
-  if (p.state === 'session') return `<presence user="here" session-since="${clockText(p.since!)}"/>`;
-  return p.since ? `<presence user="away" since="${clockText(p.since)}" for="${durationText(now() - p.since)}"/>` : `<presence user="away"/>`;
+  // The project's mode while it is not running (projectmode.ts): project="winding down", "at rest" or "stopped".
+  const mode = presenceAttr(projectId);
+  if (p.state === 'session') return `<presence user="here" session-since="${clockText(p.since!)}" tz="${zoneAbbr(now())}"${mode}/>`;
+  return p.since ? `<presence user="away" since="${clockText(p.since)}" for="${durationText(now() - p.since)}" tz="${zoneAbbr(now())}"${mode}/>` : `<presence user="away" tz="${zoneAbbr(now())}"${mode}/>`;
 }
 
 /** What the header shows: presence plus, while away, how much the director has running and queued. */
@@ -95,7 +105,8 @@ export function presenceView(projectId: string) {
     ...p,
     running: n("SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND kind = 'task' AND state = 'active'"),
     queued: n("SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND kind = 'task' AND state = 'scheduled'"),
-    working: n("SELECT COUNT(*) AS n FROM agents WHERE project_id = ? AND status = 'working'"),
+    // Agents between turns with work in hand count too (busy.ts), as the agent views show them.
+    working: n("SELECT COUNT(*) AS n FROM agents WHERE project_id = ? AND status = 'working'") + idleButBusy(projectId),
   };
 }
 
@@ -139,8 +150,10 @@ export function stepAway(projectId: string): boolean {
   return true;
 }
 
-function endSession(s: Row, reason: 'idle' | 'stepped_away', endedAt: number) {
-  run('UPDATE sessions SET ended_at = ?, ended_reason = ? WHERE id = ?', endedAt, reason, s.id);
+/** Exported for the tests. */
+export function endSession(s: Row, reason: 'idle' | 'stepped_away', endedAt: number) {
+  // Only once: the runner's session timer and the web service's API can both find the same session to end.
+  if (!Number(run('UPDATE sessions SET ended_at = ?, ended_reason = ? WHERE id = ? AND ended_at IS NULL', endedAt, reason, s.id).changes)) return;
   run('UPDATE projects SET away_nudges = 0, away_nudged_at = ? WHERE id = ?', endedAt, s.project_id);
   const detail = periodDetail(s.project_id, s.started_at, sessionTo(endedAt));
   const trivial = s.actions <= 1;
@@ -149,14 +162,19 @@ function endSession(s: Row, reason: 'idle' | 'stepped_away', endedAt: number) {
   touchProject(s.project_id);
   const work = queuedWork(s.project_id);
   const how = reason === 'stepped_away' ? `The user said they are stepping away (${clockText(endedAt)})` : `The user has been inactive since ${clockText(endedAt)}, so their session (from ${clockText(s.started_at)}) has ended`;
-  const carry = work.total
+  const mode = modeOf(s.project_id);
+  const carry = holdsNewWork(s.project_id)
+    ? `The project is ${mode === 'stopped' ? 'stopped: nothing runs until the user resumes it' : mode === 'at_rest' ? 'at rest: nothing new starts' : 'finishing up: finish what is Active, start nothing new'}.`
+    : mode === 'queue_only'
+    ? work.total ? `You are working alone now. ${work.text} The project is in Queue only: take scheduled tasks in order and schedule nothing yourself.` : 'The project is in Queue only and nothing is scheduled: stay idle.'
+    : work.total
     ? `You are working alone now: follow the rules for working while the user is away. ${work.text} Keep the agreed work moving in queue order.`
     : 'Nothing agreed is waiting to be done, so unless something already running needs you, there is nothing to start: stay idle.';
   // A session with one trivial action and nothing queued is not worth a turn: the next message's presence tag says it.
   if (trivial && !work.total) return;
   void notify(
     s.project_id,
-    `${how}. ${trivial ? '' : `Write a short summary of that session with summarize_session (period "session"): what the user asked and decided, what was started and finished, and what is waiting on them; a few sentences they can skim next time. Summarise this session only (${clockText(s.started_at)}–${clockText(endedAt)}); what Helm recorded in it:\n${factsText(detail)}\n`}${carry}`,
+    `${how}. ${trivial ? '' : `Write a short summary of that session with summarize_session (period "session"): what the user asked and decided, what was started and finished, and what is waiting on them; a few sentences they can skim next time. Summarise this session only (${spanText(s.started_at, endedAt)}); what Helm recorded in it:\n${factsText(detail)}\n`}${carry}`,
   );
 }
 
@@ -189,8 +207,22 @@ export function sessionTick(at = now()) {
   for (const s of all('SELECT s.*, p.session_idle_minutes FROM sessions s JOIN projects p ON p.id = s.project_id WHERE s.ended_at IS NULL')) {
     if (at - s.last_activity_at >= idleMs(s)) endSession(s, 'idle', s.last_activity_at);
   }
-  for (const p of all('SELECT * FROM projects WHERE archived = 0')) maybeNudge(p, at);
+  for (const p of all('SELECT * FROM projects WHERE archived = 0')) {
+    maybeNudge(p, at);
+    // A wind down whose last work ended without a status change noticing it (projectmode.ts).
+    // Queue only: the queue that emptied without a status change noticing it, told once.
+    if (p.mode === 'winding_down' || p.mode === 'queue_only') void checkAtRest(p.id).catch(() => {});
+    // Tasks not running that look like the same or adjoining work: one note to the director when that set changed, at
+    // most once a day (merge.ts). Not while the project is stopped.
+    if (!isStopped(p.id)) {
+      const review = queueReviewNote(p.id, at);
+      if (review) void notify(p.id, review);
+    }
+  }
   checkStalls(at);
+  // Requests held for a turn that ended without a result (the process died): shown now (requests.ts).
+  releaseStale();
+  releaseQuiet(at);
 }
 
 let timer: NodeJS.Timeout | null = null;
@@ -205,10 +237,13 @@ export function stopSessionTimer() {
 
 // ---------- carrying on while away ----------
 
-/** Agreed work that could be picked up: scheduled, waiting and active tasks with no open request to the user. */
+/**
+ * Agreed work that could be picked up: scheduled, waiting and active tasks with no open request to the user. Waiting
+ * ones only on Autopilot: in Queue only the director never lines them up.
+ */
 function queuedWork(projectId: string): { total: number; text: string } {
   const rows = all(
-    `SELECT state, COUNT(*) AS n FROM tasks t WHERE project_id = ? AND kind = 'task' AND state IN ('active','scheduled','waiting')
+    `SELECT state, COUNT(*) AS n FROM tasks t WHERE project_id = ? AND kind = 'task' AND state IN ('active','scheduled'${autoSchedules(projectId) ? ",'waiting'" : ''})
        AND NOT EXISTS (SELECT 1 FROM inbox i WHERE i.task_id = t.id AND i.status = 'open') GROUP BY state`,
     projectId,
   );
@@ -224,6 +259,8 @@ function queuedWork(projectId: string): { total: number; text: string } {
  */
 function maybeNudge(project: Row, at: number) {
   if (openSession(project.id)) return;
+  // Finishing up, at rest or stopped: nothing new is taken from the queue (projectmode.ts). Queue only counts no Waiting work.
+  if (holdsNewWork(project.id)) return;
   const since = Math.max(project.away_nudged_at ?? 0, lastClosed(project.id)?.ended_at ?? 0);
   if (!since || at - since < AWAY_NUDGE_MS) return;
   const root = get("SELECT * FROM agents WHERE project_id = ? AND parent_id IS NULL AND status != 'closed' ORDER BY created_at LIMIT 1", project.id);
@@ -238,7 +275,7 @@ function maybeNudge(project: Row, at: number) {
   run('UPDATE projects SET away_nudged_at = ?, away_nudges = ? WHERE id = ?', at, nudges + 1, project.id);
   void notify(
     project.id,
-    `The user is still away and nothing is running. ${work.text} Take the next one in queue order (schedule a waiting task yourself if the scheduled queue is empty), or, if each is blocked on the user, make sure that is asked on the task and stay idle.`,
+    `The user is still away and nothing is running. ${work.text} Take the next one in queue order${autoSchedules(project.id) ? ' (schedule a waiting task yourself if the scheduled queue is empty)' : ''}, or, if each is blocked on the user, make sure that is asked on the task and stay idle.`,
   );
 }
 
@@ -294,12 +331,13 @@ export function periodDetail(projectId: string, from: number, to: number) {
   }
   owner.sort((a, b) => a.ts - b.ts);
 
-  const taskCols = 'id, title, state, origin, origin_note, started_at, finished_at, active_ms, active_since, created_at';
+  const taskCols = 'id, project_id, title, state, origin, origin_note, started_at, finished_at, active_ms, active_since, created_at, became_task_at';
   const range = [projectId, from, to];
   const created = all(`SELECT ${taskCols} FROM tasks WHERE project_id = ? AND kind = 'task' AND created_at >= ? AND created_at < ? ORDER BY created_at`, ...range);
   const started = all(`SELECT ${taskCols} FROM tasks WHERE project_id = ? AND kind = 'task' AND started_at >= ? AND started_at < ? ORDER BY started_at`, ...range);
   const finished = all(`SELECT ${taskCols} FROM tasks WHERE project_id = ? AND kind = 'task' AND state = 'done' AND finished_at >= ? AND finished_at < ? ORDER BY finished_at`, ...range).map(
-    (t): Row => ({ ...t, took_ms: activeMs(t, t.finished_at) }),
+    // What it took: work time, never time it waited on the user (worktime.ts); null when unknown.
+    (t): Row => ({ ...t, took_ms: taskTimes(t).workMs }),
   );
   const stateChanges = Number(get('SELECT COUNT(*) AS n FROM task_states s JOIN tasks t ON t.id = s.task_id WHERE t.project_id = ? AND s.at >= ? AND s.at < ?', ...range)?.n ?? 0);
   const previews = all('SELECT id, kind, title, task_id, agent_id, created_at FROM previews WHERE project_id = ? AND created_at >= ? AND created_at < ? ORDER BY created_at', ...range);
@@ -312,7 +350,7 @@ export function periodDetail(projectId: string, from: number, to: number) {
   const requests = all('SELECT id, kind, title, status, task_id, created_at, answered_at FROM inbox WHERE project_id = ? AND created_at >= ? AND created_at < ? ORDER BY created_at', ...range);
   const discussionsOpened = all("SELECT id, title, state, created_at FROM tasks WHERE project_id = ? AND kind = 'discussion' AND inbox_archive = 0 AND requests_agent_id IS NULL AND created_at >= ? AND created_at < ? ORDER BY created_at", ...range);
   const discussionsSettled = all(
-    "SELECT t.id, t.title, m.created_at FROM task_messages m JOIN tasks t ON t.id = m.task_id WHERE t.project_id = ? AND m.created_at >= ? AND m.created_at < ? AND m.kind = 'state' AND m.body LIKE '%settled this discussion%' ORDER BY m.created_at",
+    "SELECT t.id, t.title, m.created_at FROM task_messages m JOIN tasks t ON t.id = m.task_id WHERE t.project_id = ? AND m.created_at >= ? AND m.created_at < ? AND m.kind = 'state' AND (m.body LIKE '%closed this discussion%' OR m.body LIKE '%settled this discussion%') ORDER BY m.created_at",
     ...range,
   );
   return {
@@ -464,7 +502,7 @@ export function writeSummary(projectId: string, period: 'session' | 'away', summ
     if (!s) return 'There is no ended session to summarise.';
     run("UPDATE sessions SET summary = ?, summary_by = 'director', summary_at = ? WHERE id = ?", summary, now(), s.id);
     touchProject(projectId);
-    return `Saved the summary of the session ${clockText(s.started_at)}–${clockText(s.ended_at ?? now())}.`;
+    return `Saved the summary of the session ${spanText(s.started_at, s.ended_at ?? now())}.`;
   }
   const s = id
     ? get('SELECT * FROM sessions WHERE id = ? AND project_id = ?', id.replace(/^away_/, ''), projectId)
@@ -475,7 +513,7 @@ export function writeSummary(projectId: string, period: 'session' | 'away', summ
   if (!target || !prev) return 'There is no ended away period to summarise: the user has not come back since they left. Write it when you are told they are back.';
   run("UPDATE sessions SET away_summary = ?, away_summary_by = 'director', away_summary_at = ? WHERE id = ?", summary, now(), target.id);
   touchProject(projectId);
-  return `Saved the summary of the away period ${clockText(prev.ended_at)}–${clockText(target.started_at)}.`;
+  return `Saved the summary of the away period ${spanText(prev.ended_at, target.started_at)}.`;
 }
 
 // ---------- which requests are the owner's activity ----------

@@ -1,9 +1,11 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ApiError, api, useLive } from './api';
-import type { Host, HostClaim, ProjectState } from './api';
-import { Empty, Icon, Markdown, Progress, Sheet, Tag, ago, href, useAction } from './ui';
+import type { Host, HostClaim, HostUsed, HostWorkspace, ProjectState } from './api';
+import { Clamp, Empty, Icon, Progress, Sheet, Tag, href, useAction, PageHeader } from './ui';
+import { Menu } from './tasks';
+import { fullDateTime } from './time';
 
-type HostsData = { hosts: Host[]; projects: { id: string; name: string }[] };
+type HostsData = { hosts: Host[]; projects: { id: string; name: string }[]; workspaces?: HostWorkspace[] };
 
 const sshCommand = (h: Host) => `ssh ${h.port ? `-p ${h.port} ` : ''}${h.ssh_target}`;
 const testCommand = (h: Host) => `ssh -o BatchMode=yes ${h.port ? `-p ${h.port} ` : ''}${h.ssh_target} true`;
@@ -34,19 +36,41 @@ export function HostState({ h }: { h: Host }) {
   );
 }
 
-/** Load average against core count, as a small meter. */
-function Load({ h }: { h: Host }) {
-  if (h.check_state !== 'online' || !h.load) return null;
-  const one = Number(h.load.split(' ')[0]);
-  const pct = h.cpus ? Math.min(100, Math.round((one / h.cpus) * 100)) : null;
+/** "16.8 of 32 GB". */
+const gb = (n: number) => (n >= 100e9 ? Math.round(n / 1e9).toString() : (n / 1e9).toFixed(1).replace(/\.0$/, ''));
+const usedText = (u: HostUsed | null) => (u ? `${gb(u.used)} of ${gb(u.total)} GB` : '—');
+const usedPct = (u: HostUsed | null) => (u && u.total > 0 ? Math.round((u.used / u.total) * 100) : null);
+
+/** One thin meter: label, bar, value on the right; amber from 85 %, red from 95 %. */
+function Meter({ label, pct, text, title }: { label: string; pct: number | null; text: string; title?: string }) {
+  const tone = pct == null ? '' : pct >= 95 ? 'crit' : pct >= 85 ? 'warn' : '';
   return (
-    <div className="host-load" title={`Load averages (1, 5, 15 min): ${h.load}`}>
-      <span className="muted small">Load</span>
-      {pct !== null && <Progress value={pct} tone={pct >= 90 ? 'hot' : ''} />}
-      <span className="mono small">
-        {one.toFixed(2)}
-        {h.cpus ? ` / ${h.cpus} cores` : ''}
+    <div className={`host-meter ${tone}`} title={title}>
+      <span className="muted small host-meter-l">{label}</span>
+      <span className="host-meter-bar">
+        <span style={{ width: `${pct ?? 0}%` }} />
       </span>
+      <span className="mono small host-meter-v">{text}</span>
+    </div>
+  );
+}
+
+/** CPU, RAM, each GPU and its VRAM, and the disk of the Helm root, from the last sample (server/hoststats.ts). */
+function Meters({ h }: { h: Host }) {
+  if (h.check_state !== 'online') return null;
+  const s = h.stats;
+  const one = h.load ? h.load.split(' ')[0] : '';
+  return (
+    <div className="host-meters">
+      <Meter label="CPU" pct={s?.cpu ?? null} text={s?.cpu != null ? `${s.cpu}%${one ? ` · load ${one}` : ''}` : one ? `load ${one}` : '—'} title={h.load ? `Load averages (1, 5, 15 min): ${h.load}${h.cpus ? ` on ${h.cpus} cores` : ''}` : undefined} />
+      <Meter label="RAM" pct={usedPct(s?.mem ?? null)} text={usedText(s?.mem ?? null)} />
+      {(s?.gpus ?? []).map((g, i) => (
+        <div key={i} className="host-meter-pair">
+          <Meter label={(s?.gpus.length ?? 0) > 1 ? `GPU ${i + 1}` : 'GPU'} pct={g.util} text={g.util != null ? `${g.util}%` : '—'} />
+          <Meter label="VRAM" pct={usedPct(g.mem)} text={usedText(g.mem)} />
+        </div>
+      ))}
+      <Meter label="Disk" pct={usedPct(s?.disk ?? null)} text={usedText(s?.disk ?? null)} title="The volume of the Helm work root (or home)" />
     </div>
   );
 }
@@ -67,31 +91,69 @@ function ClaimRow({ c, showProject = true }: { c: HostClaim; showProject?: boole
         )}
         <span className="claim-activity">{c.activity}</span>
       </span>
-      <span className="mono small muted claim-time" title={`Since ${new Date(c.created_at).toLocaleString()}`}>
+      <span className="mono small muted claim-time" title={`Since ${fullDateTime(c.created_at)}`}>
         {heldFor(c.created_at)}
       </span>
     </li>
   );
 }
 
-function HostCard({ h, onEdit }: { h: Host; onEdit: () => void }) {
+const size = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e6 ? `${Math.round(b / 1e6)} MB` : `${Math.round(b / 1e3)} kB`);
+
+/** A host's kept job workspaces and build slots (server/hostwork.ts): size and age, with Remove (only ever inside Helm's root there). */
+function Workspaces({ list }: { list: HostWorkspace[] }) {
   const { busy, error, run } = useAction();
+  if (!list.length) return null;
+  return (
+    <>
+      <ul className="host-workspaces">
+        {list.map((w) => (
+          <li key={w.id} className="row">
+            <span className="grow">
+              <span className="one-line mono small">{w.slot ? 'Build slot' : w.name}</span>
+              <span className="muted small one-line">
+                {w.project ?? 'project'} · {w.state === 'active' ? 'in use' : w.slot ? 'kept' : w.state === 'failed' ? 'failed, kept a day' : w.state} · {heldFor(w.ended_at ?? w.created_at)}
+                {w.bytes != null ? ` · ${size(w.bytes)}` : ''}
+              </span>
+            </span>
+            <button
+              className="btn small quiet"
+              disabled={busy || (!!w.slot && w.state === 'active')}
+              onClick={() => confirm(w.slot ? `Remove the build slot of ${w.project ?? 'this project'}? Its kept build output goes; the next job builds from scratch.` : `Remove the workspace ${w.name}? Its files on the host go.`) && run(() => api(`/api/host-workspaces/${w.id}`, { method: 'DELETE' }))}
+            >
+              Remove
+            </button>
+          </li>
+        ))}
+      </ul>
+      {error && <p className="error-text small">{error}</p>}
+    </>
+  );
+}
+
+function HostCard({ h, onEdit, workspaces = [] }: { h: Host; onEdit: () => void; workspaces?: HostWorkspace[] }) {
+  const { error, run } = useAction();
   const busyNow = h.claims.length > 0;
   return (
     <article className={`card host-card ${busyNow ? 'host-busy' : ''}`}>
       <header className="host-head">
-        <div className="row wrap">
-          <h3 className="host-name">{h.name}</h3>
-          {h.is_local ? <Tag tone="host-tag">This machine</Tag> : null}
-          {h.exclusive ? <Tag tone="tone-accent host-tag">One at a time</Tag> : null}
-          <span className="spacer" />
+        <div className="row host-head-row">
+          <div className="row wrap grow">
+            <h3 className="host-name">{h.name}</h3>
+            {h.is_local ? <Tag tone="plain">This machine</Tag> : null}
+            {h.exclusive ? <Tag tone="tone-accent plain">One at a time</Tag> : null}
+          </div>
           <HostState h={h} />
+          <Menu
+            label={`More actions for ${h.name}`}
+            items={[{ label: 'Edit', onSelect: onEdit }, !h.is_local && !h.checking && { label: 'Check now', onSelect: () => void run(() => api(`/api/hosts/${h.id}/check`, { body: {} })) }]}
+          />
         </div>
-        {!h.is_local && <p className="mono small muted one-line">{sshCommand(h)}</p>}
-        {h.purpose && <p className="host-purpose">{h.purpose}</p>}
+        {h.purpose && <p className="host-purpose muted small one-line" title={h.purpose}>{h.purpose}</p>}
+        {h.notes && <Clamp text={h.notes} lines={1} />}
       </header>
 
-      <Load h={h} />
+      <Meters h={h} />
 
       {h.check_state === 'login' && (
         <div className="host-problem">
@@ -110,60 +172,14 @@ function HostCard({ h, onEdit }: { h: Host; onEdit: () => void }) {
         </div>
       )}
 
-      {h.notes.trim() && (
-        <details className="host-notes">
-          <summary>Notes for agents</summary>
-          <Markdown text={h.notes} />
-        </details>
+      {h.claims.length > 0 && (
+        <ul className="claim-list">
+          {h.claims.map((c) => (
+            <ClaimRow key={c.id} c={c} />
+          ))}
+        </ul>
       )}
-
-      <div className="host-now">
-        <p className="host-sub">On it now</p>
-        {h.claims.length ? (
-          <ul className="claim-list">
-            {h.claims.map((c) => (
-              <ClaimRow key={c.id} c={c} />
-            ))}
-          </ul>
-        ) : (
-          <p className="muted small">Nobody. Idle.</p>
-        )}
-      </div>
-
-      <footer className="host-foot">
-        <span className="small host-projects">
-          {h.is_local ? (
-            <span className="muted">Every project</span>
-          ) : h.projects.length ? (
-            <>
-              <span className="muted">Used by </span>
-              {h.projects.map((p, i) => (
-                <span key={p.id}>
-                  {i > 0 && ', '}
-                  <a href={href('p', p.id, 'overview')}>{p.name}</a>
-                </span>
-              ))}
-            </>
-          ) : (
-            <span className="muted">Not attached to a project</span>
-          )}
-        </span>
-        <span className="host-actions">
-          {!h.is_local && (
-            <span className="muted small" title={h.checked_at ? new Date(h.checked_at).toLocaleString() : ''}>
-              {h.checking ? 'checking…' : h.checked_at ? `checked ${ago(h.checked_at)}` : ''}
-            </span>
-          )}
-          {!h.is_local && (
-            <button className="btn small quiet" disabled={busy || h.checking} onClick={() => run(() => api(`/api/hosts/${h.id}/check`, { body: {} }))}>
-              Check now
-            </button>
-          )}
-          <button className="btn small" onClick={onEdit}>
-            <Icon name="edit" size={14} /> Edit
-          </button>
-        </span>
-      </footer>
+      <Workspaces list={workspaces} />
       {error && <p className="error-text">{error}</p>}
     </article>
   );
@@ -177,6 +193,12 @@ export function HostForm({ host, projects, projectId, onClose }: { host: Host | 
   const [purpose, setPurpose] = useState(host?.purpose ?? '');
   const [notes, setNotes] = useState(host?.notes ?? '');
   const [exclusive, setExclusive] = useState(!!host?.exclusive);
+  const [workRoot, setWorkRoot] = useState(host?.work_root ?? '~/.helm-work');
+  const [workEnv, setWorkEnv] = useState(host?.work_env ?? '');
+  const [workSetup, setWorkSetup] = useState(host?.work_setup ?? '');
+  const [workCaches, setWorkCaches] = useState(host?.work_caches ?? '');
+  const [workKeep, setWorkKeep] = useState(host?.work_keep ?? '');
+  const [platform, setPlatform] = useState(host?.platform ?? 'linux');
   const [attached, setAttached] = useState<string[]>(host ? host.projects.map((p) => p.id) : projectId ? [projectId] : []);
   const { busy, error, run } = useAction();
   const local = !!host?.is_local;
@@ -189,7 +211,12 @@ export function HostForm({ host, projects, projectId, onClose }: { host: Host | 
         purpose,
         notes,
         exclusive,
-        ...(local ? {} : { ssh_target: target.trim(), port: port.trim() || null }),
+        work_root: workRoot,
+        work_env: workEnv,
+        work_setup: workSetup,
+        work_caches: workCaches,
+        work_keep: workKeep,
+        ...(local ? {} : { ssh_target: target.trim(), port: port.trim() || null, platform }),
       };
       let id = host?.id;
       if (id) await api(`/api/hosts/${id}`, { method: 'PATCH', body });
@@ -238,6 +265,14 @@ export function HostForm({ host, projects, projectId, onClose }: { host: Host | 
               Port
               <input value={port} onChange={(e) => setPort(e.target.value.replace(/\D/g, ''))} placeholder="22" inputMode="numeric" />
             </label>
+            <label className="host-platform">
+              System
+              <select value={platform} onChange={(e) => setPlatform(e.target.value as typeof platform)}>
+                <option value="linux">Linux</option>
+                <option value="macos">macOS</option>
+                <option value="windows">Windows</option>
+              </select>
+            </label>
           </div>
         )}
         <label>
@@ -251,6 +286,30 @@ export function HostForm({ host, projects, projectId, onClose }: { host: Host | 
         <label className="check">
           <input type="checkbox" checked={exclusive} onChange={(e) => setExclusive(e.target.checked)} /> One agent at a time (a single test device, a licence)
         </label>
+        <fieldset>
+          <legend>Clean workspaces</legend>
+          <p className="muted small">Each job gets a fresh folder under this root, with the project's code and no login profile: only what is set here reaches it.</p>
+          <label>
+            Root on the host
+            <input className="mono" value={workRoot} onChange={(e) => setWorkRoot(e.target.value)} placeholder="~/.helm-work" autoCapitalize="off" spellCheck={false} />
+          </label>
+          <label>
+            Add to PATH <span className="muted">(one folder per line)</span>
+            <textarea className="mono" rows={2} value={workEnv} onChange={(e) => setWorkEnv(e.target.value)} placeholder="~/.cargo/bin" spellCheck={false} />
+          </label>
+          <label>
+            Setup line <span className="muted">(run before each command)</span>
+            <input className="mono" value={workSetup} onChange={(e) => setWorkSetup(e.target.value)} placeholder="source /opt/toolchain/env.sh" spellCheck={false} />
+          </label>
+          <label>
+            Shared caches <span className="muted">(variables, one per line)</span>
+            <textarea className="mono" rows={2} value={workCaches} onChange={(e) => setWorkCaches(e.target.value)} placeholder="CARGO_HOME" spellCheck={false} />
+          </label>
+          <label>
+            Build folders kept between jobs <span className="muted">(one per line; each project gets one reused folder)</span>
+            <textarea className="mono" rows={2} value={workKeep} onChange={(e) => setWorkKeep(e.target.value)} placeholder="CARGO_TARGET_DIR=target" spellCheck={false} />
+          </label>
+        </fieldset>
         {projects && !local && projects.length > 0 && (
           <fieldset>
             <legend>Projects that can use it</legend>
@@ -273,7 +332,7 @@ export function HostForm({ host, projects, projectId, onClose }: { host: Host | 
           <span className="spacer" />
           {host && !local && (
             <button className="btn danger quiet" disabled={busy} onClick={remove}>
-              <Icon name="trash" size={15} /> Remove
+              <Icon name="trash" size={16} /> Remove
             </button>
           )}
         </div>
@@ -286,39 +345,34 @@ export function HostForm({ host, projects, projectId, onClose }: { host: Host | 
 
 export function HostsPage() {
   const { data, error } = useLive<HostsData>('/api/hosts', (m) => m.type === 'hosts' || m.type === 'projects');
+  // Live meters while this page is open and visible: a sample about every 15 s (server/hosts.ts sampleForPage). Nothing
+  // samples for it on the server, so closing or hiding the page stops it.
+  useEffect(() => {
+    const tick = () => document.visibilityState === 'visible' && void api('/api/hosts/sample', { body: {} }).catch(() => {});
+    tick();
+    const t = setInterval(tick, 15_000);
+    return () => clearInterval(t);
+  }, []);
   const [editing, setEditing] = useState<Host | 'new' | null>(null);
   if (error && !data) return <Empty title="Could not load hosts">{error}</Empty>;
   if (!data) return <div className="loading">Loading…</div>;
   const remote = data.hosts.filter((h) => !h.is_local);
-  const inUse = data.hosts.filter((h) => h.claims.length).length;
-  const down = remote.filter((h) => h.check_state === 'offline' || h.check_state === 'login').length;
 
   return (
     <section className="hosts-page">
-      <div className="section-head">
-        <div>
-          <h1 className="page-title">Hosts</h1>
-          <p className="muted small">
-            {data.hosts.length} {data.hosts.length === 1 ? 'machine' : 'machines'} · {inUse} in use
-            {down > 0 ? ` · ${down} need attention` : ''}
-          </p>
-        </div>
-        <button className="btn primary" onClick={() => setEditing('new')}>
+      <PageHeader title="Hosts">
+        <button className="btn small" onClick={() => setEditing('new')}>
           <Icon name="plus" size={16} /> Add host
         </button>
-      </div>
+      </PageHeader>
 
       {remote.length === 0 && (
-        <Empty title="Only this machine so far">
-          Hosts are other machines your projects can use: a build box, a machine with a GPU, a phone or tablet attached for testing. Agents keep running here and work on them over SSH, claiming a host
-          with a line saying what they are doing so you can see who is on which machine. Helm uses the SSH keys and <span className="mono">~/.ssh/config</span> of the account it runs as and stores no
-          passwords. Before adding one, check that this works from that account: <code>ssh -o BatchMode=yes user@host true</code>
-        </Empty>
+        <Empty title="Only this machine so far" />
       )}
 
       <div className="host-grid">
         {data.hosts.map((h) => (
-          <HostCard key={h.id} h={h} onEdit={() => setEditing(h)} />
+          <HostCard key={h.id} h={h} onEdit={() => setEditing(h)} workspaces={(data.workspaces ?? []).filter((w) => w.host_id === h.id)} />
         ))}
       </div>
 
@@ -342,15 +396,15 @@ export function ProjectHostsSetup({ s }: { s: ProjectState }) {
   return (
     <>
       <h2>Hosts</h2>
-      <p className="muted">
-        Other machines this project's agents may use over SSH. Hosts are shared across projects; manage them all on the <a href={href('hosts')}>Hosts page</a>.
+      <p className="small">
+        <a href={href('system', 'hosts')}>All hosts</a>
       </p>
       <div className="card">
         <ul className="setup-hosts">
           {s.hosts.map((h) => (
             <li key={h.id} className="row wrap">
               <span className="grow">
-                <strong>{h.name}</strong> {h.exclusive ? <Tag tone="tone-accent host-tag">One at a time</Tag> : null}
+                <strong>{h.name}</strong> {h.exclusive ? <Tag tone="tone-accent plain">One at a time</Tag> : null}
                 <span className="muted small one-line">{h.is_local ? 'This machine, always available' : `${sshCommand(h)}${h.purpose ? ` · ${h.purpose}` : ''}`}</span>
               </span>
               <HostState h={h} />
@@ -402,7 +456,7 @@ export function ProjectHostsSetup({ s }: { s: ProjectState }) {
           )}
           <span className="spacer" />
           <button className="btn small" onClick={() => setAdding(true)}>
-            <Icon name="plus" size={14} /> New host
+            <Icon name="plus" size={16} /> New host
           </button>
         </div>
         {error && <p className="error-text">{error}</p>}
@@ -425,9 +479,9 @@ export function HostBadges({ agentId, s }: { agentId: string; s: ProjectState })
     if (!home) return null;
     return (
       <span className="host-badges">
-        <span className="host-badge" title={`Runs on ${home.name}`}>
-          <Icon name="hosts" size={12} />
-          <span className="host-badge-name">{home.name}</span>
+        <span className="tag plain host-claim" title={`Runs on ${home.name}`}>
+          <Icon name="hosts" size={16} />
+          <span className="host-claim-name">{home.name}</span>
         </span>
       </span>
     );
@@ -435,9 +489,9 @@ export function HostBadges({ agentId, s }: { agentId: string; s: ProjectState })
   return (
     <span className="host-badges">
       {held.map(({ h, c }) => (
-        <span key={c.id} className="host-badge held" title={`On ${h.name}: ${c.activity}`}>
-          <Icon name="hosts" size={12} />
-          <span className="host-badge-name">{h.name}</span>
+        <span key={c.id} className="tag plain tone-blue host-claim" title={`On ${h.name}: ${c.activity}`}>
+          <Icon name="hosts" size={16} />
+          <span className="host-claim-name">{h.name}</span>
         </span>
       ))}
     </span>
